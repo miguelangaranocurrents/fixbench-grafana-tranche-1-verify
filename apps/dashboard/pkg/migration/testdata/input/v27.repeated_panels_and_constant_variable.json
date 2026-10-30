@@ -1,0 +1,61 @@
+{
+  "title": "V27 Repeated Panels and Constant Variable Migration Test Dashboard",
+  "schemaVersion": 26,
+  "panels": [
+    {
+      "id": 1,
+      "type": "graph",
+      "repeatPanelId": "panel1"
+    },
+    {
+      "id": 2,
+      "type": "graph",
+      "title": "Normal Panel"
+    },
+    {
+      "id": 7,
+      "type": "graph",
+      "title": "Panel with falsy repeatByRow",
+      "repeatByRow": false
+    },
+    {
+      "id": 8,
+      "type": "graph",
+      "title": "Panel with falsy repeatPanelId",
+      "repeatPanelId": 0
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Row with repeated panels",
+      "panels": [
+        {
+          "id": 5,
+          "type": "graph",
+          "repeatPanelId": "panel2"
+        },
+        {
+          "id": 6,
+          "type": "graph",
+          "title": "Normal nested panel"
+        },
+        {
+          "id": 9,
+          "type": "graph",
+          "title": "Nested panel with falsy repeatPanelId",
+          "repeatPanelId": 0
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "constant_var",
+        "type": "constant",
+        "query": "default_value",
+        "hide": 0
+      }
+    ]
+  }
+} 

@@ -1,0 +1,197 @@
+import { uniqBy } from 'lodash';
+import { useCallback } from 'react';
+
+import { useDispatch } from 'app/types/store';
+import { type RuleHealth } from 'app/types/unified-alerting';
+import {
+  type GrafanaPromRuleGroupDTO,
+  type PromAlertingRuleState,
+  type PromRuleDTO,
+  type PromRuleGroupDTO,
+} from 'app/types/unified-alerting-dto';
+
+import { GRAFANA_RULES_SOURCE_NAME } from '../utils/datasource';
+
+import { type WithNotificationOptions, alertingApi } from './alertingApi';
+import { normalizeRuleGroup } from './prometheus';
+
+export interface PromRulesResponse<TRuleGroup> {
+  status: string;
+  data: {
+    groups: TRuleGroup[];
+    groupNextToken?: string;
+  };
+  errorType?: string;
+  error?: string;
+}
+
+type PromRulesOptions = WithNotificationOptions<{
+  ruleSource: { uid: string };
+  namespace?: string;
+  groupName?: string;
+  ruleName?: string;
+  groupLimit?: number;
+  excludeAlerts?: boolean;
+  groupNextToken?: string;
+}>;
+
+export type GrafanaPromRulesOptions = Omit<PromRulesOptions, 'ruleSource' | 'namespace' | 'excludeAlerts'> & {
+  folderUid?: string;
+  dashboardUid?: string;
+  datasources?: string[];
+  panelId?: number;
+  limitAlerts?: number;
+  ruleLimit?: number;
+  contactPoint?: string;
+  health?: RuleHealth[];
+  state?: PromAlertingRuleState[];
+  title?: string;
+  searchGroupName?: string;
+  searchFolder?: string;
+  type?: 'alerting' | 'recording';
+  ruleMatchers?: string[];
+  plugins?: 'hide' | 'only';
+};
+
+/** A label set on an alert rule. */
+export interface RuleLabel {
+  key: string;
+  value: string;
+}
+
+/**
+ * Distinct labels set on the rules in a response. Internal `__` keys and blank values are left out, and so are
+ * templates like `{{ $labels.team }}`, which only resolve per alert instance.
+ * Exported for unit tests; consumers go through the `getGrafanaRuleLabels` query.
+ */
+export function toRuleLabels(response: PromRulesResponse<GrafanaPromRuleGroupDTO>): RuleLabel[] {
+  const labels = response.data.groups
+    .flatMap((group) => group.rules)
+    .flatMap((rule) => Object.entries(rule.labels ?? {}))
+    .filter(([key, value]) => !key.startsWith('__') && value.trim() !== '' && !value.includes('{{'))
+    .map(([key, value]) => ({ key, value }));
+  return uniqBy(labels, ({ key, value }) => JSON.stringify([key, value]));
+}
+
+export const prometheusApi = alertingApi.injectEndpoints({
+  endpoints: (build) => ({
+    getGroups: build.query<PromRulesResponse<PromRuleGroupDTO<PromRuleDTO>>, PromRulesOptions>({
+      query: ({
+        ruleSource,
+        namespace,
+        groupName,
+        ruleName,
+        groupLimit,
+        excludeAlerts,
+        groupNextToken,
+        notificationOptions,
+      }) => {
+        if (ruleSource.uid === GRAFANA_RULES_SOURCE_NAME) {
+          throw new Error('Please use getGrafanaGroups endpoint for grafana rules');
+        }
+        return {
+          url: `api/prometheus/${ruleSource.uid}/api/v1/rules`,
+          params: {
+            file: namespace, // Mimir
+            'file[]': namespace, // Prometheus
+            rule_group: groupName, // Mimir
+            'rule_group[]': groupName, // Prometheus
+            rule_name: ruleName, // Mimir
+            'rule_name[]': ruleName, // Prometheus
+            exclude_alerts: excludeAlerts?.toString(),
+            group_limit: groupLimit?.toFixed(0),
+            group_next_token: groupNextToken,
+          },
+          notificationOptions,
+        };
+      },
+      transformResponse: (response: PromRulesResponse<PromRuleGroupDTO<PromRuleDTO>>) => {
+        return { ...response, data: { ...response.data, groups: response.data.groups.map(normalizeRuleGroup) } };
+      },
+    }),
+    getGrafanaGroups: build.query<PromRulesResponse<GrafanaPromRuleGroupDTO>, GrafanaPromRulesOptions>({
+      query: ({
+        folderUid,
+        groupName,
+        ruleName,
+        contactPoint,
+        health,
+        state,
+        type,
+        groupLimit,
+        ruleLimit,
+        limitAlerts,
+        groupNextToken,
+        title,
+        datasources,
+        searchGroupName,
+        searchFolder,
+        dashboardUid,
+        ruleMatchers,
+        plugins,
+      }) => ({
+        url: `api/prometheus/grafana/api/v1/rules`,
+        params: {
+          folder_uid: folderUid,
+          rule_group: groupName,
+          rule_name: ruleName,
+          receiver_name: contactPoint,
+          health: health,
+          state: state,
+          rule_type: type,
+          limit_alerts: limitAlerts,
+          rule_limit: ruleLimit?.toFixed(0),
+          group_limit: groupLimit?.toFixed(0),
+          group_next_token: groupNextToken,
+          datasource_uid: datasources,
+          'search.rule_name': title,
+          'search.rule_group': searchGroupName,
+          'search.folder': searchFolder,
+          dashboard_uid: dashboardUid,
+          rule_matcher: ruleMatchers,
+          plugins: plugins,
+        },
+      }),
+      providesTags: (_result, _error, { folderUid, groupName, ruleName }) => {
+        const folderKey = folderUid ?? '__any__';
+        const groupKey = groupName ?? '__any__';
+        const ruleKey = ruleName ?? '__any__';
+        return [{ type: 'GrafanaPrometheusGroups', id: `grafana/${folderKey}/${groupKey}/${ruleKey}` }];
+      },
+    }),
+    // Labels on every Grafana alert rule in the org; empty when there are none.
+    getGrafanaRuleLabels: build.query<RuleLabel[], void>({
+      query: () => ({
+        url: `api/prometheus/grafana/api/v1/rules`,
+        // Recording rules never fire, so they're left out. So are alert instances and queries, which labels don't need.
+        params: { rule_type: 'alerting', limit_alerts: 0, compact: true },
+        notificationOptions: { showErrorAlert: false },
+      }),
+      transformResponse: toRuleLabels,
+      // Rule labels rarely change, so they're kept for 10 minutes. Saving a rule clears them sooner.
+      providesTags: ['CombinedAlertRule'],
+      keepUnusedDataFor: 600,
+    }),
+  }),
+});
+
+export function usePopulateGrafanaPrometheusApiCache() {
+  const dispatch = useDispatch();
+
+  const populateGroupsResponseCache = useCallback(
+    (groups: GrafanaPromRuleGroupDTO[]) => {
+      dispatch(
+        prometheusApi.util.upsertQueryEntries(
+          groups.map((group) => ({
+            endpointName: 'getGrafanaGroups',
+            arg: { folderUid: group.folderUid, groupName: group.name, limitAlerts: 0 },
+            value: { data: { groups: [group] }, status: 'success' },
+          }))
+        )
+      );
+    },
+    [dispatch]
+  );
+
+  return { populateGroupsResponseCache };
+}

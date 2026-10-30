@@ -1,0 +1,122 @@
+// Copyright (c) 2017 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { css } from '@emotion/css';
+import cx from 'clsx';
+import * as React from 'react';
+
+import { type GrafanaTheme2 } from '@grafana/data';
+import { useStyles2 } from '@grafana/ui';
+
+const getStyles = (theme: GrafanaTheme2) => ({
+  ScrubberHandleExpansion: cx(
+    css({
+      label: 'ScrubberHandleExpansion',
+      cursor: 'col-resize',
+      fillOpacity: 0,
+      fill: theme.colors.accent.main,
+    }),
+    'scrubber-handle-expansion'
+  ),
+  ScrubberHandle: cx(
+    css({
+      label: 'ScrubberHandle',
+      cursor: 'col-resize',
+      fill: theme.colors.text.secondary,
+    }),
+    'scrubber-handle'
+  ),
+  ScrubberLine: cx(
+    css({
+      label: 'ScrubberLine',
+      pointerEvents: 'none',
+      stroke: theme.colors.text.secondary,
+    }),
+    'scrubber-line'
+  ),
+  ScrubberDragging: css({
+    label: 'ScrubberDragging',
+    '& .scrubber-handle-expansion': {
+      fillOpacity: 1,
+    },
+    '& .scrubber-handle': {
+      fill: theme.colors.accent.main,
+    },
+    '& > .scrubber-line': {
+      stroke: theme.colors.accent.main,
+    },
+  }),
+  ScrubberHandles: css({
+    label: 'ScrubberHandles',
+    '&:hover > .scrubber-handle-expansion': {
+      fillOpacity: 1,
+    },
+    '&:hover > .scrubber-handle': {
+      fill: theme.colors.accent.main,
+    },
+    '&:hover + .scrubber.line': {
+      stroke: theme.colors.accent.main,
+    },
+  }),
+});
+
+export type ScrubberProps = {
+  isDragging: boolean;
+  position: number;
+  onMouseDown: (evt: React.MouseEvent<SVGGElement>) => void;
+  onMouseEnter: (evt: React.MouseEvent<SVGGElement>) => void;
+  onMouseLeave: (evt: React.MouseEvent<SVGGElement>) => void;
+};
+
+export default function Scrubber({ isDragging, onMouseDown, onMouseEnter, onMouseLeave, position }: ScrubberProps) {
+  const xPercent = `${position * 100}%`;
+  const styles = useStyles2(getStyles);
+  const className = cx({ [styles.ScrubberDragging]: isDragging });
+  return (
+    <g className={className} data-testid="scrubber-component">
+      <g
+        data-testid="scrubber-component-g"
+        className={styles.ScrubberHandles}
+        onMouseDown={onMouseDown}
+        onMouseEnter={onMouseEnter}
+        onMouseLeave={onMouseLeave}
+      >
+        {/* handleExpansion is only visible when `isDragging` is true */}
+        <rect
+          data-testid="scrubber-component-rect-1"
+          x={xPercent}
+          className={styles.ScrubberHandleExpansion}
+          style={{ transform: `translate(-4.5px)` }}
+          width="9"
+          height="20"
+        />
+        <rect
+          data-testid="scrubber-component-rect-2"
+          x={xPercent}
+          className={styles.ScrubberHandle}
+          style={{ transform: `translate(-1.5px)` }}
+          width="3"
+          height="20"
+        />
+      </g>
+      <line
+        className={styles.ScrubberLine}
+        y2="100%"
+        x1={xPercent}
+        x2={xPercent}
+        data-testid="scrubber-component-line"
+      />
+    </g>
+  );
+}

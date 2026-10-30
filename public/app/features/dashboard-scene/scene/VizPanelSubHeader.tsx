@@ -1,0 +1,216 @@
+import { type Unsubscribable } from 'rxjs';
+
+import { FlagKeys, getFeatureFlagClient, useFlagPerPanelNonApplicableDrilldowns } from '@grafana/runtime/internal';
+import {
+  type SceneComponentProps,
+  type SceneObjectState,
+  SceneObjectBase,
+  sceneGraph,
+  AdHocFiltersVariable,
+  GroupByVariable,
+  SceneQueryRunner,
+  VizPanel,
+} from '@grafana/scenes';
+import { type DataSourceRef } from '@grafana/schema';
+
+import { verifyDrilldownApplicability } from '../utils/drilldownUtils';
+import { getDatasourceFromQueryRunner } from '../utils/getDatasourceFromQueryRunner';
+
+import { PanelNonApplicableDrilldownsSubHeader } from './PanelNonApplicableDrilldownsSubHeader';
+
+interface ApplicabilitySupportHelperState {
+  datasource: DataSourceRef | null;
+  applicabilityEnabled?: boolean;
+}
+
+export interface VizPanelSubHeaderState extends SceneObjectState {
+  supportsApplicability?: boolean;
+  /**
+   * Mirrors the panel's loaded {@link PanelPlugin.hideNonApplicableFilters}. The plugin
+   * is loaded asynchronously, so this is tracked as scene state (rather than read directly
+   * from `getPlugin()` at render time) to make the subheader re-render once it resolves.
+   */
+  pluginHidesNonApplicableFilters?: boolean;
+}
+
+export class VizPanelSubHeader extends SceneObjectBase<VizPanelSubHeaderState> {
+  static Component = VizPanelSubHeaderRenderer;
+
+  private _adHocVar?: AdHocFiltersVariable;
+  private _groupByVar?: GroupByVariable;
+
+  private _adHocSub?: Unsubscribable;
+  private _groupBySub?: Unsubscribable;
+
+  private _queryRunnerDatasource?: DataSourceRef | null;
+
+  constructor(state: Partial<VizPanelSubHeaderState>) {
+    super(state);
+
+    this.addActivationHandler(this._onActivate);
+  }
+
+  private _onActivate = () => {
+    if (!this.parent || !(this.parent instanceof VizPanel)) {
+      throw new Error('VizPanelSubHeader can be used only with VizPanel');
+    }
+
+    if (getFeatureFlagClient().getBooleanValue(FlagKeys.PerPanelNonApplicableDrilldowns, false)) {
+      this.subscribeToDrilldownVariableChanges();
+    }
+
+    const panel = this.parent;
+
+    // The plugin may already be resolved (e.g. cached from a previous panel of the same
+    // type) by the time we get here, in which case no further panel state change will
+    // happen to trigger the subscription below - so check it once up front too.
+    this.updatePluginHidesNonApplicableFilters(panel);
+    const panelSub = panel.subscribeToState(() => {
+      this.updatePluginHidesNonApplicableFilters(panel);
+    });
+
+    return () => {
+      panelSub.unsubscribe();
+      this._groupBySub?.unsubscribe();
+      this._adHocSub?.unsubscribe();
+    };
+  };
+
+  private updatePluginHidesNonApplicableFilters(panel: VizPanel) {
+    this.setState({ pluginHidesNonApplicableFilters: panel.getPlugin()?.hideNonApplicableFilters === true });
+  }
+
+  private subscribeToDrilldownVariableChanges() {
+    const vars = sceneGraph.getVariables(this);
+    const queryRunner = this.getQueryRunner();
+
+    this._adHocVar = vars.state.variables.find((variable) => variable instanceof AdHocFiltersVariable);
+    this._groupByVar = vars.state.variables.find((variable) => variable instanceof GroupByVariable);
+    this._queryRunnerDatasource = queryRunner ? getDatasourceFromQueryRunner(queryRunner) : undefined;
+
+    this.setDrilldownApplicabilitySupportHelper();
+
+    this._subs.add(
+      queryRunner?.subscribeToState((n, p) => {
+        if (n.datasource !== p.datasource || n.queries !== p.queries) {
+          this._queryRunnerDatasource = getDatasourceFromQueryRunner(queryRunner);
+
+          this.setDrilldownApplicabilitySupportHelper();
+        }
+      })
+    );
+
+    this._subs.add(
+      vars.subscribeToState((n) => {
+        this._adHocVar = n.variables.find((variable) => variable instanceof AdHocFiltersVariable);
+        this._groupByVar = n.variables.find((variable) => variable instanceof GroupByVariable);
+
+        this.refreshDrilldownVarsSubscriptions();
+      })
+    );
+
+    this._adHocSub = this._adHocVar?.subscribeToState((n, p) => {
+      if (n.datasource !== p.datasource || n.applicabilityEnabled !== p.applicabilityEnabled) {
+        this.setDrilldownApplicabilitySupportHelper({
+          datasource: n.datasource,
+          applicabilityEnabled: n.applicabilityEnabled,
+        });
+      }
+    });
+
+    this._groupBySub = this._groupByVar?.subscribeToState((n, p) => {
+      if (n.datasource !== p.datasource || n.applicabilityEnabled !== p.applicabilityEnabled) {
+        this.setDrilldownApplicabilitySupportHelper(undefined, {
+          datasource: n.datasource,
+          applicabilityEnabled: n.applicabilityEnabled,
+        });
+      }
+    });
+  }
+
+  private refreshDrilldownVarsSubscriptions() {
+    if (this._groupByVar) {
+      this._groupBySub?.unsubscribe();
+      this._groupBySub = this._groupByVar?.subscribeToState((n, p) => {
+        if (n.datasource !== p.datasource || n.applicabilityEnabled !== p.applicabilityEnabled) {
+          this.setDrilldownApplicabilitySupportHelper(undefined, {
+            datasource: n.datasource,
+            applicabilityEnabled: n.applicabilityEnabled,
+          });
+        }
+      });
+    }
+
+    if (this._adHocVar) {
+      this._adHocSub?.unsubscribe();
+      this._adHocSub = this._adHocVar?.subscribeToState((n, p) => {
+        if (n.datasource !== p.datasource || n.applicabilityEnabled !== p.applicabilityEnabled) {
+          this.setDrilldownApplicabilitySupportHelper({
+            datasource: n.datasource,
+            applicabilityEnabled: n.applicabilityEnabled,
+          });
+        }
+      });
+    }
+  }
+
+  private setDrilldownApplicabilitySupportHelper(
+    adHocData?: ApplicabilitySupportHelperState,
+    groupByData?: ApplicabilitySupportHelperState
+  ) {
+    this.setState({
+      supportsApplicability:
+        verifyDrilldownApplicability(
+          this,
+          this._queryRunnerDatasource,
+          adHocData?.datasource ?? this._adHocVar?.state.datasource ?? null,
+          adHocData?.applicabilityEnabled ?? this._adHocVar?.state.applicabilityEnabled ?? false
+        ) ||
+        verifyDrilldownApplicability(
+          this,
+          this._queryRunnerDatasource,
+          groupByData?.datasource ?? this._groupByVar?.state.datasource ?? null,
+          groupByData?.applicabilityEnabled ?? this._groupByVar?.state.applicabilityEnabled ?? false
+        ),
+    });
+  }
+
+  public getQueryRunner() {
+    const panel = this.parent;
+    const dataObject = panel ? sceneGraph.getData(panel) : undefined;
+    const queryRunner = dataObject?.state.$data;
+
+    if (!queryRunner || !(queryRunner instanceof SceneQueryRunner)) {
+      return null;
+    }
+
+    return queryRunner;
+  }
+}
+
+function VizPanelSubHeaderRenderer({ model }: SceneComponentProps<VizPanelSubHeader>) {
+  const { supportsApplicability, pluginHidesNonApplicableFilters } = model.useState();
+  const variables = sceneGraph.getVariables(model);
+  const adhocFiltersVar = variables.state.variables.find((variable) => variable instanceof AdHocFiltersVariable);
+  const groupByVar = variables.state.variables.find((variable) => variable instanceof GroupByVariable);
+  const queryRunner = model.getQueryRunner();
+  const perPanelNonApplicableDrilldownsEnabled = useFlagPerPanelNonApplicableDrilldowns();
+
+  if (
+    !queryRunner ||
+    !perPanelNonApplicableDrilldownsEnabled ||
+    pluginHidesNonApplicableFilters ||
+    !supportsApplicability
+  ) {
+    return null;
+  }
+
+  return (
+    <PanelNonApplicableDrilldownsSubHeader
+      key={`${adhocFiltersVar ? '1' : '0'}|${groupByVar ? '1' : '0'}`}
+      filtersVar={adhocFiltersVar}
+      groupByVar={groupByVar}
+      queryRunner={queryRunner}
+    />
+  );
+}

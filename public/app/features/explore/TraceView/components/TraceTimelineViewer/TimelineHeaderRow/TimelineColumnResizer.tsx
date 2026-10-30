@@ -1,0 +1,199 @@
+// Copyright (c) 2017 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { css } from '@emotion/css';
+import cx from 'clsx';
+import { useEffect, useEffectEvent, useRef, useState, type CSSProperties } from 'react';
+
+import { type GrafanaTheme2 } from '@grafana/data';
+import { useStyles2 } from '@grafana/ui';
+
+import type TNil from '../../types/TNil';
+import DraggableManager from '../../utils/DraggableManager/DraggableManager';
+import { type DraggableBounds, type DraggingUpdate } from '../../utils/DraggableManager/types';
+
+export const getStyles = (theme: GrafanaTheme2) => ({
+  TimelineColumnResizer: css({
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  }),
+  wrapper: css({
+    bottom: 0,
+    position: 'absolute',
+    top: 0,
+  }),
+  dragger: css({
+    borderLeft: '2px solid transparent',
+    cursor: 'col-resize',
+    height: '5000px',
+    marginLeft: '-1px',
+    position: 'absolute',
+    top: 0,
+    width: '1px',
+    zIndex: 10,
+    '&:hover': {
+      borderLeft: `2px solid ${theme.colors.border.strong}`,
+    },
+    '&::before': {
+      position: 'absolute',
+      top: 0,
+      bottom: 0,
+      left: '-8px',
+      right: 0,
+      content: '" "',
+    },
+  }),
+  draggerDragging: css({
+    background: theme.colors.accent.subtleBackground,
+    width: 'unset',
+    '&::before': {
+      left: -2000,
+      right: -2000,
+    },
+  }),
+  draggerDraggingLeft: css({
+    borderLeft: `2px solid ${theme.colors.accent.border}`,
+    borderRight: `1px solid ${theme.colors.border.strong}`,
+  }),
+  draggerDraggingRight: css({
+    borderLeft: `1px solid ${theme.colors.border.strong}`,
+    borderRight: `2px solid ${theme.colors.accent.border}`,
+  }),
+  gripIcon: css({
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    '&::before, &::after': {
+      // A drag affordance, so it needs to read as a control rather than a divider —
+      // the border tokens are too low-contrast at 1px to be seen.
+      borderRight: `1px solid ${theme.colors.text.secondary}`,
+      content: '" "',
+      height: '9px',
+      position: 'absolute',
+      right: '9px',
+      top: '25px',
+    },
+    '&::after': {
+      right: '5px',
+    },
+  }),
+  gripIconDragging: css({
+    '&::before, &::after': {
+      borderRight: `1px solid ${theme.colors.accent.borderEmphasis}`,
+    },
+  }),
+});
+
+export type TimelineColumnResizerProps = {
+  min: number;
+  max: number;
+  onChange: (newSize: number) => void;
+  position: number;
+  columnResizeHandleHeight: number;
+};
+
+export default function TimelineColumnResizer({
+  min,
+  max,
+  onChange,
+  position,
+  columnResizeHandleHeight,
+}: TimelineColumnResizerProps) {
+  const [dragPosition, setDragPosition] = useState<number | TNil>(null);
+  const rootElmRef = useRef<HTMLDivElement>(null);
+
+  // The manager captures its callbacks once at construction, so these have to keep a stable
+  // identity while still seeing the latest props. They only ever run from mouse handlers.
+  const getDraggingBounds = useEffectEvent((): DraggableBounds => {
+    if (!rootElmRef.current) {
+      throw new Error('invalid state');
+    }
+    const { left: clientXLeft, width } = rootElmRef.current.getBoundingClientRect();
+    return {
+      clientXLeft,
+      width,
+      maxValue: max,
+      minValue: min,
+    };
+  });
+
+  const handleDragUpdate = useEffectEvent(({ value }: DraggingUpdate) => {
+    setDragPosition(value);
+  });
+
+  const handleDragEnd = useEffectEvent(({ manager, value }: DraggingUpdate) => {
+    manager.resetBounds();
+    setDragPosition(null);
+    onChange(value);
+  });
+
+  const [dragManager] = useState(
+    () =>
+      new DraggableManager({
+        getBounds: getDraggingBounds,
+        onDragEnd: handleDragEnd,
+        onDragMove: handleDragUpdate,
+        onDragStart: handleDragUpdate,
+      })
+  );
+
+  useEffect(() => () => dragManager.dispose(), [dragManager]);
+
+  const styles = useStyles2(getStyles);
+  const gripStyle = { left: `${position * 100}%` };
+  let draggerStyle: CSSProperties;
+  let isDraggingLeft = false;
+  let isDraggingRight = false;
+
+  if (dragManager.isDragging() && rootElmRef.current && dragPosition != null) {
+    isDraggingLeft = dragPosition < position;
+    isDraggingRight = dragPosition > position;
+    // Draw a highlight from the current dragged position back to the original
+    // position, e.g. highlight the change. Draw the highlight via `left` and
+    // `right` css styles (simpler than using `width`).
+    const draggerLeft = `${Math.min(position, dragPosition) * 100}%`;
+    // subtract 1px for draggerRight to deal with the right border being off
+    // by 1px when dragging left
+    const draggerRight = `calc(${(1 - Math.max(position, dragPosition)) * 100}% - 1px)`;
+    draggerStyle = { left: draggerLeft, right: draggerRight };
+  } else {
+    draggerStyle = gripStyle;
+  }
+  draggerStyle.height = columnResizeHandleHeight;
+
+  const isDragging = isDraggingLeft || isDraggingRight;
+  return (
+    <div className={styles.TimelineColumnResizer} ref={rootElmRef} data-testid="TimelineColumnResizer">
+      <div
+        className={cx(styles.gripIcon, isDragging && styles.gripIconDragging)}
+        style={gripStyle}
+        data-testid="TimelineColumnResizer--gripIcon"
+      />
+      <div
+        aria-hidden
+        className={cx(
+          styles.dragger,
+          isDragging && styles.draggerDragging,
+          isDraggingRight && styles.draggerDraggingRight,
+          isDraggingLeft && styles.draggerDraggingLeft
+        )}
+        onMouseDown={dragManager.handleMouseDown}
+        style={draggerStyle}
+        data-testid="TimelineColumnResizer--dragger"
+      />
+    </div>
+  );
+}

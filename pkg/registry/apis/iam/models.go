@@ -1,0 +1,134 @@
+package iam
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/registry/rest"
+
+	"github.com/grafana/authlib/types"
+
+	"github.com/grafana/grafana/pkg/configprovider"
+	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/infra/tracing"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/authinfo"
+	iamauthorizer "github.com/grafana/grafana/pkg/registry/apis/iam/authorizer"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/display"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/externalgroupmapping"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/legacy"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/resourcepermission"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/serviceaccount"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/sso"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/team"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/teambinding"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/user"
+	"github.com/grafana/grafana/pkg/registry/apis/iam/userpermissions"
+	"github.com/grafana/grafana/pkg/services/accesscontrol"
+	"github.com/grafana/grafana/pkg/services/apiserver/builder"
+	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+	settingsvc "github.com/grafana/grafana/pkg/services/setting"
+	"github.com/grafana/grafana/pkg/services/ssosettings"
+	"github.com/grafana/grafana/pkg/storage/legacysql/dualwrite"
+	"github.com/grafana/grafana/pkg/storage/unified/resource"
+)
+
+var _ builder.APIGroupBuilder = (*IdentityAccessManagementAPIBuilder)(nil)
+var _ builder.APIGroupRouteProvider = (*IdentityAccessManagementAPIBuilder)(nil)
+var _ builder.APIGroupValidation = (*IdentityAccessManagementAPIBuilder)(nil)
+var _ builder.APIGroupMutation = (*IdentityAccessManagementAPIBuilder)(nil)
+
+// RoleStorageBackend uses the resource.StorageBackend interface to provide storage for custom roles.
+// Used by wire to identify the storage backend for custom roles.
+type RoleStorageBackend interface{ resource.StorageBackend }
+
+// ExternalGroupMappingStorageBackend uses the resource.StorageBackend interface to provide storage for external group mappings.
+// Used by wire to identify the storage backend for external group mappings.
+type ExternalGroupMappingStorageBackend interface{ resource.StorageBackend }
+
+// This is used just so wire has something unique to return
+type IdentityAccessManagementAPIBuilder struct {
+	// Stores
+	store legacy.LegacyIdentityStore
+
+	userLegacyStore            *user.LegacyStore
+	saLegacyStore              *serviceaccount.LegacyStore
+	legacyTeamStore            *team.LegacyStore
+	externalGroupReconciler    legacy.ExternalGroupReconciler
+	teamBindingLegacyStore     *teambinding.LegacyBindingStore
+	authInfoLegacyStore        *authinfo.LegacyStore
+	ssoLegacyStore             *sso.LegacyStore
+	roleApiInstaller           RoleApiInstaller
+	globalRoleApiInstaller     GlobalRoleApiInstaller
+	teamLBACApiInstaller       TeamLBACApiInstaller
+	resourcePermissionsStorage resource.StorageBackend
+	mappers                    *resourcepermission.MappersRegistry
+	roleBindingsApiInstaller   RoleBindingApiInstaller
+
+	// Required for resource permissions authorization
+	// fetches resources parent folders
+	resourceParentProvider iamauthorizer.ParentProvider
+
+	// Access Control
+	authorizer authorizer.Authorizer
+	// legacyAccessClient is used for the identity apis, we need to migrate to the access client
+	legacyAccessClient types.AccessClient
+	// accessClient is used for the core role apis
+	accessClient types.AccessClient
+	// zClient is used to populate Zanzana with:
+	// - roles
+	// - permissions
+	// - assignments
+	zClient zanzana.Client
+	// Buffered channel to limit the amount of concurrent writes to Zanzana
+	zTickets chan bool
+
+	reg    prometheus.Registerer
+	logger log.Logger
+
+	dual                              dualwrite.Service
+	unified                           resource.ResourceClient
+	userSearchClient                  *dualwrite.Selector[user.SearchBackend]
+	teamSearchClient                  *dualwrite.Selector[team.SearchBackend]
+	userSearchHandler                 *user.SearchHandler
+	teamSearchHandler                 *team.SearchHandler
+	resourcePermissionsSearchHandler  *resourcepermission.ResourcePermissionsSearchHandler
+	externalGroupMappingSearchHandler externalgroupmapping.SearchHandler
+
+	teamGroupsHandlerProvider externalgroupmapping.TeamGroupsHandlerProvider
+
+	// non-k8s api route
+	display         *display.DisplayHandler
+	userPermissions *userpermissions.Handler
+	// ssoLoginConfig serves the pre-auth login-config singleton. Constructed in
+	// RegisterAPIService; its route is gated by the resolved IAM features in
+	// GetAPIRoutes. Nil in the standalone NewAPIService path.
+	ssoLoginConfig *sso.LoginConfigHandler
+
+	// ac is used for legacy permission checks in role bindings.
+	// nil where only k8s-mapped permissions are supported.
+	ac accesscontrol.AccessControl
+
+	// Not set for multi-tenant deployment for now
+	sso ssosettings.Service
+
+	tracing tracing.Tracer
+
+	// Getters for existence validation during TeamBinding create
+	teamGetter rest.Getter
+	userGetter rest.Getter
+
+	cfgProvider    configprovider.ConfigProvider
+	settingService settingsvc.Service
+	// ssoSettingsClient backs the SSOSetting kind's MTSettingsStore (reads +
+	// writes to setting.grafana.app). Built in RegisterAPIService when the
+	// kind's storage mode engages MT-Settings.
+	ssoSettingsClient settingsvc.Service
+
+	features Features
+
+	apiConfig Config
+}
+
+// Config holds IAM-specific configuration
+type Config struct {
+	SingleOrganization bool
+}

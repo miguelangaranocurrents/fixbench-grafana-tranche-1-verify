@@ -1,0 +1,177 @@
+package expr
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/grafana/dataplane/sdata"
+	"github.com/grafana/dataplane/sdata/numeric"
+	"github.com/grafana/dataplane/sdata/reader"
+	"github.com/grafana/dataplane/sdata/timeseries"
+	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"github.com/grafana/grafana/pkg/expr/mathexp"
+	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/infra/tracing"
+	"github.com/grafana/grafana/pkg/services/featuremgmt"
+	"go.opentelemetry.io/otel/attribute"
+)
+
+func shouldUseDataplane(frames data.Frames, logger log.Logger, disable bool) (dt data.FrameType, b bool, e error) {
+	if disable {
+		return
+	}
+	dt = data.FrameTypeUnknown
+	if len(frames) == 0 {
+		return data.FrameTypeUnknown, true, nil
+	}
+
+	firstFrame := frames[0]
+	if firstFrame == nil {
+		return
+	}
+
+	if firstFrame.Meta == nil {
+		return
+	}
+
+	if firstFrame.Meta.Type == "" {
+		return
+	}
+
+	if firstFrame.Meta.TypeVersion.IsZero() {
+		return
+	}
+
+	dt, err := reader.CanReadBasedOnMeta(frames)
+	if err != nil {
+		if _, ok := errors.AsType[*sdata.VersionWarning](err); ok {
+			logger.Warn("Attempting to read mismatched version dataplane data", "error", err, "datatype", dt)
+			return dt, true, nil
+		}
+		// TODO: Remove as more confidence is gained in dataplane data handling and return the error
+		logger.Warn("Dataplane data detected but falling back to old processing due to error",
+			"error", err)
+
+		return dt, false, err
+	}
+	return dt, true, nil
+}
+
+func handleDataplaneFrames(ctx context.Context, tracer tracing.Tracer, features featuremgmt.FeatureToggles, t data.FrameType, frames data.Frames) (mathexp.Results, error) {
+	_, span := tracer.Start(ctx, "SSE.HandleDataPlaneData")
+	defer span.End()
+	span.SetAttributes(attribute.String("dataplane.type", string(t)))
+
+	switch t.Kind() {
+	case data.KindUnknown:
+		return mathexp.Results{Values: mathexp.Values{mathexp.NoData{}.New()}}, nil
+	case data.KindTimeSeries:
+		return handleDataplaneTimeseries(frames)
+	case data.KindNumeric:
+		//nolint:staticcheck // not yet migrated to OpenFeature
+		sortMetrics := !features.IsEnabled(ctx, featuremgmt.FlagDisableNumericMetricsSortingInExpressions)
+		return handleDataplaneNumeric(frames, sortMetrics)
+	default:
+		return mathexp.Results{}, fmt.Errorf("kind %s (type %s) not supported by server side expressions", t.Kind(), t)
+	}
+}
+
+func handleDataplaneTimeseries(frames data.Frames) (mathexp.Results, error) {
+	dps, err := timeseries.CollectionReaderFromFrames(frames)
+	if err != nil {
+		return mathexp.Results{}, err
+	}
+	sc, err := dps.GetCollection(false)
+	if err != nil {
+		return mathexp.Results{}, err
+	}
+	if sc.NoData() {
+		noData := mathexp.NoData{}.New()
+		if len(dps.Frames()) == 1 {
+			// If single frame form of nodata, copy the frame to pass through metadata
+			noData.Frame = dps.Frames()[0]
+		}
+		return mathexp.Results{Values: mathexp.Values{noData}}, nil
+	}
+	res := mathexp.Results{}
+	res.Values = make([]mathexp.Value, 0, len(sc.Refs))
+	for _, s := range sc.Refs {
+		newSeries, err := mathexp.NewSeriesFromRef(sc.RefID, s)
+		if err != nil {
+			return res, err
+		}
+		res.Values = append(res.Values, newSeries)
+	}
+
+	return res, nil
+}
+
+func handleDataplaneNumeric(frames data.Frames, sortMetrics bool) (mathexp.Results, error) {
+	dn, err := numeric.CollectionReaderFromFrames(frames)
+	if err != nil {
+		return mathexp.Results{}, err
+	}
+	nc, err := dn.GetCollection(false)
+	if err != nil {
+		return mathexp.Results{}, err
+	}
+	if nc.NoData() {
+		noData := mathexp.NoData{}.New()
+		if len(dn.Frames()) == 1 {
+			// If single frame form of nodata, copy the frame to pass through metadata
+			noData.Frame = dn.Frames()[0]
+		}
+		return mathexp.Results{Values: mathexp.Values{noData}}, nil
+	}
+	if sortMetrics {
+		sortNumericMetricRefs(nc.Refs)
+	}
+	res := mathexp.Results{}
+	res.Values = make([]mathexp.Value, 0, len(nc.Refs))
+	for _, n := range nc.Refs {
+		newNum, err := mathexp.NumberFromRef(nc.RefID, n)
+		if err != nil {
+			return res, err
+		}
+		res.Values = append(res.Values, newNum)
+	}
+
+	return res, nil
+}
+
+// sortNumericMetricRefs orders refs exactly as numeric.SortNumericMetricRef does, but builds
+// each label string once instead of on every comparison.
+func sortNumericMetricRefs(refs []numeric.MetricRef) {
+	type keyedRef struct {
+		ref       numeric.MetricRef
+		name      string
+		hasLabels bool
+		labels    string
+	}
+	keyed := make([]keyedRef, len(refs))
+	for i, r := range refs {
+		keyed[i] = keyedRef{ref: r, name: r.GetMetricName()}
+		if l := r.GetLabels(); l != nil {
+			keyed[i].hasLabels = true
+			keyed[i].labels = l.String()
+		}
+	}
+	sort.SliceStable(keyed, func(i, j int) bool {
+		a, b := &keyed[i], &keyed[j]
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		if !a.hasLabels {
+			return true
+		}
+		if !b.hasLabels {
+			return false
+		}
+		return a.labels < b.labels
+	})
+	for i := range keyed {
+		refs[i] = keyed[i].ref
+	}
+}

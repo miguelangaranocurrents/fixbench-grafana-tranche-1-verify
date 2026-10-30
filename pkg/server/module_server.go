@@ -1,0 +1,708 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"sync"
+
+	"github.com/gorilla/mux"
+	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/ring"
+	ringclient "github.com/grafana/dskit/ring/client"
+	"github.com/grafana/dskit/services"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/urfave/cli/v2"
+	"go.opentelemetry.io/otel"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/grafana/grafana/pkg/api"
+	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/infra/nats"
+	"github.com/grafana/grafana/pkg/infra/tracing"
+	"github.com/grafana/grafana/pkg/modules"
+	grafanarouter "github.com/grafana/grafana/pkg/router"
+	"github.com/grafana/grafana/pkg/services/apiserver/standalone"
+	"github.com/grafana/grafana/pkg/services/authz"
+	"github.com/grafana/grafana/pkg/services/authz/zanzana/server/reconciler"
+	zStore "github.com/grafana/grafana/pkg/services/authz/zanzana/store"
+	"github.com/grafana/grafana/pkg/services/featuremgmt"
+	"github.com/grafana/grafana/pkg/services/frontend"
+	"github.com/grafana/grafana/pkg/services/grpcserver"
+	"github.com/grafana/grafana/pkg/services/hooks"
+	"github.com/grafana/grafana/pkg/services/licensing"
+	"github.com/grafana/grafana/pkg/setting"
+	"github.com/grafana/grafana/pkg/storage/unified"
+	"github.com/grafana/grafana/pkg/storage/unified/resource"
+	resourcekv "github.com/grafana/grafana/pkg/storage/unified/resource/kv"
+	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+	"github.com/grafana/grafana/pkg/storage/unified/search/builders"
+	"github.com/grafana/grafana/pkg/storage/unified/search/embed/embedder"
+	embedderprovider "github.com/grafana/grafana/pkg/storage/unified/search/embed/embedder/provider"
+	"github.com/grafana/grafana/pkg/storage/unified/search/rerank"
+	rerankprovider "github.com/grafana/grafana/pkg/storage/unified/search/rerank/provider"
+	"github.com/grafana/grafana/pkg/storage/unified/search/vector"
+	"github.com/grafana/grafana/pkg/storage/unified/sql"
+)
+
+// SearchSupport bundles the document builder supplier with the dashboard
+// stats instance it was built from, so both can be shared by the
+// storage-server module.
+type SearchSupport struct {
+	DocBuilders    resource.DocumentBuilderSupplier
+	DashboardStats builders.DashboardStats
+}
+
+// NewModule returns an instance of a ModuleServer, responsible for managing
+// dskit modules (services).
+func NewModule(opts Options,
+	apiOpts api.ServerOptions,
+	features featuremgmt.FeatureToggles,
+	cfg *setting.Cfg,
+	storageMetrics *resource.StorageMetrics,
+	indexMetrics *resource.BleveIndexMetrics,
+	vectorMetrics *resource.VectorMetrics,
+	reg prometheus.Registerer,
+	promGatherer prometheus.Gatherer,
+	tracer tracing.Tracer, // Ensures tracing is initialized
+	license licensing.Licensing,
+	moduleRegisterer ModuleRegisterer,
+	kvStore resourcekv.KV,
+	experimentalKV *resource.ExperimentalKVOptions, // Optional alternative KV for flagged use-cases; nil in OSS
+	hooksService *hooks.HooksService,
+	storeProvider zStore.StoreProvider,
+	reconcileCRDs []schema.GroupVersionResource,
+	reconcilerState reconciler.StateStore,
+) (*ModuleServer, error) {
+	s, err := newModuleServer(opts, apiOpts, features, cfg, storageMetrics, indexMetrics, vectorMetrics, reg, promGatherer, tracer, license, moduleRegisterer, kvStore, experimentalKV, hooksService, storeProvider, reconcileCRDs, reconcilerState)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.init(); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+func newModuleServer(opts Options,
+	apiOpts api.ServerOptions,
+	features featuremgmt.FeatureToggles,
+	cfg *setting.Cfg,
+	storageMetrics *resource.StorageMetrics,
+	indexMetrics *resource.BleveIndexMetrics,
+	vectorMetrics *resource.VectorMetrics,
+	reg prometheus.Registerer,
+	promGatherer prometheus.Gatherer,
+	tracer tracing.Tracer,
+	license licensing.Licensing,
+	moduleRegisterer ModuleRegisterer,
+	kvStore resourcekv.KV,
+	experimentalKV *resource.ExperimentalKVOptions,
+	hooksService *hooks.HooksService,
+	storeProvider zStore.StoreProvider,
+	reconcileCRDs []schema.GroupVersionResource,
+	reconcilerState reconciler.StateStore,
+) (*ModuleServer, error) {
+	rootCtx, shutdownFn := context.WithCancel(context.Background())
+
+	searchClient, err := unified.NewStorageApiSearchClient(cfg, features)
+	if err != nil {
+		shutdownFn()
+		return nil, fmt.Errorf("failed to create storage api search client: %w", err)
+	}
+
+	s := &ModuleServer{
+		opts:             opts,
+		apiOpts:          apiOpts,
+		context:          rootCtx,
+		shutdownFn:       shutdownFn,
+		shutdownFinished: make(chan struct{}),
+		log:              log.New("base-server"),
+		features:         features,
+		cfg:              cfg,
+		pidFile:          opts.PidFile,
+		version:          opts.Version,
+		commit:           opts.Commit,
+		buildBranch:      opts.BuildBranch,
+		storageMetrics:   storageMetrics,
+		indexMetrics:     indexMetrics,
+		vectorMetrics:    vectorMetrics,
+		promGatherer:     promGatherer,
+		registerer:       reg,
+		tracer:           tracer,
+		license:          license,
+		moduleRegisterer: moduleRegisterer,
+		kvStore:          kvStore,
+		experimentalKV:   experimentalKV,
+		hooksService:     hooksService,
+		searchClient:     searchClient,
+		healthNotifier:   NewHealthNotifier(),
+		storeProvider:    storeProvider,
+		reconcileCRDs:    reconcileCRDs,
+		reconcilerState:  reconcilerState,
+	}
+
+	return s, nil
+}
+
+// ModuleServer is responsible for managing the lifecycle of dskit services. The
+// ModuleServer has the minimal set of dependencies to launch dskit services,
+// but it can be used to launch the entire Grafana server.
+type ModuleServer struct {
+	opts    Options
+	apiOpts api.ServerOptions
+
+	features         featuremgmt.FeatureToggles
+	context          context.Context
+	shutdownFn       context.CancelFunc
+	log              log.Logger
+	cfg              *setting.Cfg
+	shutdownOnce     sync.Once
+	shutdownFinished chan struct{}
+	isInitialized    bool
+	mtx              sync.Mutex
+	storageBackend   resource.StorageBackend
+	kvStore          resourcekv.KV
+	experimentalKV   *resource.ExperimentalKVOptions
+	watchExpiry      resource.WatchExpiry
+	blobBackend      resource.BlobSupport
+	natsPublisher    nats.Publisher
+	natsSubscriber   nats.Subscriber
+	vectorBackend    vector.VectorBackend
+	embedder         *embedder.Embedder
+	reranker         *rerank.Reranker
+	searchClient     resourcepb.ResourceIndexClient
+	storageMetrics   *resource.StorageMetrics
+	indexMetrics     *resource.BleveIndexMetrics
+	vectorMetrics    *resource.VectorMetrics
+	license          licensing.Licensing
+
+	pidFile     string
+	version     string
+	commit      string
+	buildBranch string
+
+	promGatherer prometheus.Gatherer
+	registerer   prometheus.Registerer
+	tracer       tracing.Tracer
+
+	MemberlistKVConfig         kv.Config
+	httpServerRouter           *mux.Router
+	searchServerRing           *ring.Ring
+	searchServerRingClientPool *ringclient.Pool
+
+	// grpcService a shared gRPC service/server used by modules to register their gRPC endpoints.
+	grpcService *grpcserver.DSKitService
+
+	// moduleRegisterer allows registration of modules provided by other builds (e.g. enterprise).
+	moduleRegisterer ModuleRegisterer
+	hooksService     *hooks.HooksService
+
+	// storeProvider creates OpenFGA datastores for the Zanzana server.
+	storeProvider zStore.StoreProvider
+
+	// reconcileCRDs is the list of namespaced CRDs the MT reconciler translates
+	// into Zanzana tuples when running as a standalone zanzana-server module.
+	reconcileCRDs []schema.GroupVersionResource
+
+	// reconcilerState is where the MT reconciler records which namespaces it
+	// has reconciled. Nil in OSS builds, which have no SQL store to record to.
+	reconcilerState reconciler.StateStore
+
+	// healthNotifier is shared between the InstrumentationServer and the OperatorServer
+	// so that operators can signal readiness to the /readyz endpoint.
+	healthNotifier *HealthNotifier
+
+	// StorageServiceOptions allows injecting extra sql.ServiceOption values into the
+	// StorageServer and SearchServer module registrations. This is intended for tests.
+	StorageServiceOptions []sql.ServiceOption
+}
+
+// init initializes the server and its services.
+func (s *ModuleServer) init() error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if s.isInitialized {
+		return nil
+	}
+	s.isInitialized = true
+
+	if err := s.writePIDFile(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Run initializes and starts services. This will block until all services have
+// exited. To initiate shutdown, call the Shutdown method in another goroutine.
+func (s *ModuleServer) Run() error {
+	defer close(s.shutdownFinished)
+
+	if err := s.init(); err != nil {
+		return err
+	}
+
+	s.notifySystemd("READY=1")
+	s.log.Debug("Waiting on services...")
+
+	m := modules.New(s.log, s.cfg.Target)
+
+	// only run the instrumentation server module if were not running a module that already contains an http server
+	m.RegisterInvisibleModule(modules.InstrumentationServer, func() (services.Service, error) {
+		if m.IsModuleEnabled(modules.All) || m.IsModuleEnabled(modules.Core) || m.IsModuleEnabled(modules.FrontendServer) {
+			return services.NewBasicService(nil, nil, nil).WithName(modules.InstrumentationServer), nil
+		}
+		return s.initInstrumentationServer()
+	})
+
+	m.RegisterInvisibleModule(modules.GRPCServer, func() (services.Service, error) {
+		var err error
+		s.grpcService, err = grpcserver.ProvideDSKitService(s.cfg, otel.Tracer("grpc-server"), s.registerer, modules.GRPCServer)
+		if err != nil {
+			return nil, err
+		}
+		return s.grpcService, nil
+	})
+
+	m.RegisterInvisibleModule(modules.NATS, s.initNATSModule)
+
+	storageServicesEnabled := s.cfg.StorageServicesEnabled() || routerNeedsWritableStorageBackend(s.cfg, m.IsModuleEnabled(modules.Router))
+	m.RegisterInvisibleModule(modules.UnifiedBackend, s.initUnifiedBackendModule(storageServicesEnabled))
+
+	m.RegisterInvisibleModule(modules.UnifiedVectorBackend, s.initUnifiedVectorBackend(m.IsModuleEnabled(modules.StorageServer)))
+
+	m.RegisterModule(modules.MemberlistKV, s.initMemberlistKV)
+	m.RegisterModule(modules.SearchServerRing, s.initSearchServerRing)
+	m.RegisterModule(modules.SearchServerDistributor, func() (services.Service, error) {
+		svc, err := resource.ProvideSearchDistributorServer(otel.Tracer("index-server-distributor"), s.cfg, s.searchServerRing, s.searchServerRingClientPool, s.grpcService)
+		if err != nil {
+			return nil, err
+		}
+		// The Kubernetes readiness probe reads the aggregate health status. This is
+		// the only probe registered for this target, so it decides pod readiness.
+		s.grpcService.Health.Register(
+			grpcserver.HealthProbeFunc(func(ctx context.Context) (bool, error) {
+				if svc.State() != services.Running {
+					return false, nil
+				}
+				return svc.CheckHealth(ctx)
+			}),
+			resourcepb.ResourceIndex_ServiceDesc.ServiceName,
+			resourcepb.ManagedObjectIndex_ServiceDesc.ServiceName,
+		)
+		return svc, nil
+	})
+
+	m.RegisterModule(modules.Core, func() (services.Service, error) {
+		return NewService(s.cfg, s.opts, s.apiOpts)
+	})
+
+	m.RegisterModule(modules.StorageServer, s.initStorageServerModule)
+
+	m.RegisterModule(modules.SearchServer, s.initSearchServerModule)
+
+	m.RegisterModule(modules.ZanzanaServer, s.initZanzanaServerModule)
+
+	m.RegisterModule(modules.FrontendServer, func() (services.Service, error) {
+		return frontend.ProvideFrontendService(s.cfg, s.features, s.promGatherer, s.registerer, s.license, s.hooksService)
+	})
+
+	m.RegisterModule(modules.Router, s.initRouterModule)
+
+	m.RegisterModule(modules.OperatorServer, s.initOperatorServer)
+
+	m.RegisterModule(modules.All, nil)
+
+	// Register modules provided by other builds (e.g. enterprise).
+	s.moduleRegisterer.RegisterModules(m, s)
+
+	return m.Run(s.context)
+}
+
+func (s *ModuleServer) initRouterModule() (services.Service, error) {
+	loader, err := s.provideRoutesLoader()
+	if err != nil {
+		return nil, fmt.Errorf("creating routes loader: %w", err)
+	}
+	routerSvc, err := grafanarouter.ProvideService(s.cfg, s.features, loader, s.registerer)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := routerSvc.RegisterTargetRoutes(s.httpServerRouter, s.healthNotifier); err != nil {
+		return nil, err
+	}
+
+	// Some editions' loaders own a background lifecycle of their own (e.g.
+	// informers watching a remote apiserver to feed Notify's wake signal).
+	// Run it alongside the router service under one module so it starts and
+	// stops with the router rather than leaking independently of it.
+	lifecycle, ok := loader.(services.Service)
+	if !ok {
+		return routerSvc, nil
+	}
+	return newCompositeService(routerSvc, lifecycle)
+}
+
+// newCompositeService runs several dskit services under one, so a module
+// that needs more than one background lifecycle can still register as a
+// single services.Service. A failure in any of them fails the composite;
+// starting awaits all healthy, stopping awaits all stopped.
+func newCompositeService(svcs ...services.Service) (*services.BasicService, error) {
+	manager, err := services.NewManager(svcs...)
+	if err != nil {
+		return nil, fmt.Errorf("composing services: %w", err)
+	}
+	failureWatcher := services.NewFailureWatcher()
+	failureWatcher.WatchManager(manager)
+
+	stop := func(_ error) error {
+		// Close waits for listener callbacks, so keep receiving failures after running exits.
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			for range failureWatcher.Chan() {
+			}
+		}()
+		err := services.StopManagerAndAwaitStopped(context.Background(), manager)
+		failureWatcher.Close()
+		<-drained
+		return err
+	}
+
+	return services.NewBasicService(
+		func(ctx context.Context) error {
+			if err := services.StartManagerAndAwaitHealthy(ctx, manager); err != nil {
+				// BasicService does not call its stopping hook after startup failure.
+				_ = stop(err)
+				return err
+			}
+			return nil
+		},
+		func(ctx context.Context) error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case err := <-failureWatcher.Chan():
+				return err
+			}
+		},
+		stop,
+	), nil
+}
+
+func (s *ModuleServer) initNATSModule() (services.Service, error) {
+	// The embedded server relies on DB-backed peer discovery that is not wired
+	// in module mode (no sqlStore is injected here), so only external NATS is
+	// supported. Fail fast rather than fall through to ProvideServer, which would
+	// reject the nil sqlStore anyway, so operators get a mode-specific message.
+	if s.cfg.NATS.Enabled && s.cfg.NATS.Embedded() {
+		return nil, fmt.Errorf("embedded NATS is not supported in module mode; configure [nats] mode=external")
+	}
+	natsServer, err := nats.ProvideServer(s.cfg, nil, s.registerer)
+	if err != nil {
+		return nil, err
+	}
+	// The publisher establishes its connection when this service starts; in
+	// external mode the embedded server is inert. Returning it as the module
+	// service also drains the connection on shutdown.
+	natsCfg := nats.ProvideNATSConfig(s.cfg, natsServer)
+	publisher := nats.ProvidePublisher(natsCfg, s.registerer)
+	s.natsPublisher = publisher
+
+	// Off by default: only the publisher runs. Both the direct notifier and the
+	// shadow (testing) consume from the bus, so either one requires a subscriber;
+	// run it under a manager with the publisher to drain both on shutdown.
+	if !s.cfg.NATS.NotifierShadow && !s.cfg.NATS.Notifier {
+		return publisher, nil
+	}
+	subscriber := nats.ProvideSubscriber(natsCfg, s.registerer)
+	s.natsSubscriber = subscriber
+	group, err := newCompositeService(publisher, subscriber)
+	if err != nil {
+		return nil, err
+	}
+	return group.WithName(modules.NATS), nil
+}
+
+func (s *ModuleServer) initUnifiedBackendModule(storageServicesEnabled bool) func() (services.Service, error) {
+	return func() (services.Service, error) {
+		if s.watchExpiry == nil {
+			s.watchExpiry = resource.NewWatchExpiry()
+		}
+		if s.storageBackend == nil {
+			// If storage server not being used, disable GC, pruner, and RV manager
+			disableStorageServices := !storageServicesEnabled
+			eDB, err := sql.ProvideResourceDB(s.cfg, nil)
+			if err != nil {
+				return nil, err
+			}
+			kvStore := s.kvStore
+			if kvStore == nil {
+				kvStore, err = sql.ProvideKV(s.cfg, eDB)
+				if err != nil {
+					return nil, err
+				}
+			}
+			opts := append([]sql.StorageBackendOption{sql.WithVectorBackend(s.vectorBackend)},
+				unified.NatsStorageBackendOptions(s.cfg, s.natsPublisher, s.natsSubscriber, s.watchExpiry)...)
+			if s.experimentalKV != nil {
+				opts = append(opts, sql.WithExperimentalKV(s.experimentalKV))
+			}
+			s.storageBackend, err = sql.NewStorageBackend(s.cfg, eDB, s.registerer, s.storageMetrics, disableStorageServices, kvStore, nil, opts...)
+			if err != nil {
+				return nil, err
+			}
+			if s.cfg.EnableSQLKVBackend && kvStore != nil {
+				s.blobBackend = resource.NewKVBlobSupport(kvStore)
+			}
+		}
+		if backendService, ok := s.storageBackend.(services.Service); ok {
+			return backendService, nil
+		}
+		return services.NewIdleService(nil, nil).WithName(modules.UnifiedBackend), nil
+	}
+}
+
+func (s *ModuleServer) initStorageServerModule() (services.Service, error) {
+	// Only set docBuilders and indexMetrics if enable_search is true
+	var docBuilders resource.DocumentBuilderSupplier
+	var dashboardStats builders.DashboardStats
+	var indexMetrics *resource.BleveIndexMetrics
+	if s.cfg.EnableSearch {
+		s.log.Warn("Support for 'enable_search' config with 'storage-server' target is deprecated and will be removed in a future release. Please use the 'search-server' target instead.")
+		// The document builders and the vector backfiller share one
+		// stats instance; building them from one graph also avoids
+		// registering the sprinkles metrics twice.
+		support, err := InitializeSearchSupport(s.cfg, s.features, s.tracer, s.registerer)
+		if err != nil {
+			return nil, err
+		}
+		docBuilders = support.DocBuilders
+		dashboardStats = support.DashboardStats
+		indexMetrics = s.indexMetrics
+	} else if s.cfg.VectorIndexingEnabled {
+		// The vector backfiller views filter needs dashboard stats.
+		var err error
+		dashboardStats, err = InitializeDashboardStats(s.cfg, s.features, s.tracer, s.registerer)
+		if err != nil {
+			return nil, err
+		}
+	}
+	serviceOptions := s.unifiedServiceOptions()
+	if dashboardStats != nil {
+		serviceOptions = append(serviceOptions, sql.WithDashboardStats(dashboardStats))
+	}
+	svc, err := sql.ProvideUnifiedStorageGrpcService(s.cfg, s.features, s.log, s.registerer, docBuilders, s.storageMetrics, indexMetrics, s.vectorMetrics, s.searchServerRing, s.MemberlistKVConfig, s.httpServerRouter, s.storageBackend, s.vectorBackend, s.embedder, s.reranker, s.searchClient, s.grpcService, serviceOptions...)
+	if err != nil {
+		return nil, err
+	}
+	s.grpcService.Health.Register(grpcserver.HealthProbeFunc(func(ctx context.Context) (bool, error) {
+		if svc.State() != services.Running {
+			return false, nil
+		}
+		return svc.CheckHealth(ctx)
+	}),
+		resourcepb.ResourceStore_ServiceDesc.ServiceName,
+		resourcepb.ResourceStats_ServiceDesc.ServiceName,
+		resourcepb.ResourceIndex_ServiceDesc.ServiceName,
+		resourcepb.ManagedObjectIndex_ServiceDesc.ServiceName,
+		resourcepb.BlobStore_ServiceDesc.ServiceName,
+		resourcepb.BlobStoreStreaming_ServiceDesc.ServiceName,
+		resourcepb.BulkStore_ServiceDesc.ServiceName,
+		resourcepb.Diagnostics_ServiceDesc.ServiceName,
+		resourcepb.Quotas_ServiceDesc.ServiceName,
+	)
+	return svc, nil
+}
+
+func (s *ModuleServer) initZanzanaServerModule() (services.Service, error) {
+	reconcilerState := s.reconcilerState
+	if reconcilerState == nil {
+		// Builds are free not to put a SQL store in the module server graph, so
+		// that targets which don't need a database don't open one. Zanzana does
+		// need one, so build it here, where only this target pays for it.
+		var err error
+		reconcilerState, err = InitializeZanzanaReconcilerState(s.cfg, s.features, s.tracer)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return authz.ProvideZanzanaService(s.cfg, s.features, s.registerer, s.storeProvider, s.reconcileCRDs, reconcilerState)
+}
+
+func (s *ModuleServer) unifiedServiceOptions() []sql.ServiceOption {
+	return append(slices.Clone(s.StorageServiceOptions), sql.WithWatchExpiry(s.watchExpiry), sql.WithBlobBackend(s.blobBackend))
+}
+
+func (s *ModuleServer) initSearchServerModule() (services.Service, error) {
+	support, err := InitializeSearchSupport(s.cfg, s.features, s.tracer, s.registerer)
+	if err != nil {
+		return nil, err
+	}
+	serviceOptions := s.unifiedServiceOptions()
+	svc, err := sql.ProvideSearchGRPCService(s.cfg, s.features, s.log, s.registerer, support.DocBuilders, s.indexMetrics, s.vectorMetrics, s.searchServerRing, s.MemberlistKVConfig, s.httpServerRouter, s.storageBackend, s.vectorBackend, s.embedder, s.reranker, s.grpcService, serviceOptions...)
+	if err != nil {
+		return nil, err
+	}
+	s.grpcService.Health.Register(grpcserver.HealthProbeFunc(func(ctx context.Context) (bool, error) {
+		if svc.State() != services.Running {
+			return false, nil
+		}
+		return svc.CheckHealth(ctx)
+	}),
+		resourcepb.ResourceIndex_ServiceDesc.ServiceName,
+		resourcepb.ManagedObjectIndex_ServiceDesc.ServiceName,
+		resourcepb.Diagnostics_ServiceDesc.ServiceName,
+	)
+	return svc, nil
+}
+
+// initUnifiedVectorBackend constructs the shared vector backend + embedder
+// values that StorageServer and SearchServer modules consume.
+func (s *ModuleServer) initUnifiedVectorBackend(storageServerEnabled bool) func() (services.Service, error) {
+	return func() (services.Service, error) {
+		if s.vectorBackend == nil {
+			vb, err := vector.InitVectorBackend(s.context, s.cfg, storageServerEnabled)
+			if err != nil {
+				return nil, err
+			}
+			s.vectorBackend = vb
+		}
+		if s.embedder == nil {
+			e, err := embedderprovider.ProvideEmbedder(s.cfg, s.vectorMetrics)
+			if err != nil {
+				return nil, err
+			}
+			s.embedder = e
+		}
+		if s.reranker == nil {
+			r, err := rerankprovider.ProvideReranker(s.cfg, s.vectorMetrics)
+			if err != nil {
+				return nil, err
+			}
+			s.reranker = r
+		}
+		return services.NewIdleService(nil, nil).WithName(modules.UnifiedVectorBackend), nil
+	}
+}
+
+func (s *ModuleServer) initOperatorServer() (services.Service, error) {
+	operatorName := os.Getenv("GF_OPERATOR_NAME")
+	if operatorName == "" {
+		s.log.Debug("GF_OPERATOR_NAME environment variable empty or unset, can't start operator")
+		return nil, nil
+	}
+
+	for _, op := range GetRegisteredOperators() {
+		if op.Name == operatorName {
+			return services.NewBasicService(
+				nil,
+				func(ctx context.Context) error {
+					cliContext := cli.NewContext(&cli.App{}, nil, nil)
+					deps := OperatorDependencies{
+						BuildInfo: standalone.BuildInfo{
+							Version:     s.version,
+							Commit:      s.commit,
+							BuildBranch: s.buildBranch,
+						},
+						CLIContext:     cliContext,
+						Config:         s.cfg,
+						Registerer:     s.registerer,
+						HealthNotifier: s.healthNotifier,
+						Tracer:         s.tracer,
+					}
+					return op.RunFunc(ctx, deps)
+				},
+				nil,
+			).WithName("operator"), nil
+		}
+	}
+
+	return nil, fmt.Errorf("unknown operator: %s. available operators: %v", operatorName, GetRegisteredOperatorNames())
+}
+
+// Shutdown initiates Grafana graceful shutdown. This shuts down all
+// running background services. Since Run blocks Shutdown supposed to
+// be run from a separate goroutine.
+func (s *ModuleServer) Shutdown(ctx context.Context, reason string) error {
+	var err error
+	s.shutdownOnce.Do(func() {
+		s.log.Info("Shutdown started", "reason", reason)
+		// Call cancel func to stop background services.
+		s.shutdownFn()
+		// Wait for server to shut down
+		select {
+		case <-s.shutdownFinished:
+			s.log.Debug("Finished waiting for server to shut down")
+		case <-ctx.Done():
+			s.log.Warn("Timed out while waiting for server to shut down")
+			err = fmt.Errorf("timeout waiting for shutdown")
+		}
+	})
+
+	return err
+}
+
+// writePIDFile retrieves the current process ID and writes it to file.
+func (s *ModuleServer) writePIDFile() error {
+	if s.pidFile == "" {
+		return nil
+	}
+
+	// Ensure the required directory structure exists.
+	err := os.MkdirAll(filepath.Dir(s.pidFile), 0700)
+	if err != nil {
+		s.log.Error("Failed to verify pid directory", "error", err)
+		return fmt.Errorf("failed to verify pid directory: %s", err)
+	}
+
+	// Retrieve the PID and write it to file.
+	pid := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(s.pidFile, []byte(pid), 0644); err != nil {
+		s.log.Error("Failed to write pidfile", "error", err)
+		return fmt.Errorf("failed to write pidfile: %s", err)
+	}
+
+	s.log.Info("Writing PID file", "path", s.pidFile, "pid", pid)
+	return nil
+}
+
+// notifySystemd sends state notifications to systemd.
+func (s *ModuleServer) notifySystemd(state string) {
+	notifySocket := os.Getenv("NOTIFY_SOCKET")
+	if notifySocket == "" {
+		s.log.Debug(
+			"NOTIFY_SOCKET environment variable empty or unset, can't send systemd notification")
+		return
+	}
+
+	socketAddr := &net.UnixAddr{
+		Name: notifySocket,
+		Net:  "unixgram",
+	}
+	conn, err := net.DialUnix(socketAddr.Net, nil, socketAddr)
+	if err != nil {
+		s.log.Warn("Failed to connect to systemd", "err", err, "socket", notifySocket)
+		return
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			s.log.Warn("Failed to close connection", "err", err)
+		}
+	}()
+
+	_, err = conn.Write([]byte(state))
+	if err != nil {
+		s.log.Warn("Failed to write notification to systemd", "err", err)
+	}
+}

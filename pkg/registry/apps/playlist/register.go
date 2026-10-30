@@ -1,0 +1,123 @@
+package playlist
+
+import (
+	"context"
+	"fmt"
+
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	restclient "k8s.io/client-go/rest"
+
+	authlib "github.com/grafana/authlib/types"
+	"github.com/grafana/grafana-app-sdk/app"
+	appsdkapiserver "github.com/grafana/grafana-app-sdk/k8s/apiserver"
+	"github.com/grafana/grafana-app-sdk/simple"
+	"github.com/open-feature/go-sdk/openfeature"
+
+	"github.com/grafana/grafana/apps/playlist/pkg/apis/manifestdata"
+	playlistapp "github.com/grafana/grafana/apps/playlist/pkg/app"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
+	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/services/accesscontrol"
+	roleauthorizer "github.com/grafana/grafana/pkg/services/apiserver/auth/authorizer"
+	"github.com/grafana/grafana/pkg/services/featuremgmt"
+	"github.com/grafana/grafana/pkg/services/org"
+	"github.com/grafana/grafana/pkg/setting"
+)
+
+var (
+	_ appsdkapiserver.AppInstaller = (*AppInstaller)(nil)
+)
+
+type AppInstaller struct {
+	appsdkapiserver.AppInstaller
+	accessClient authlib.AccessClient
+	logger       log.Logger
+}
+
+func RegisterAppInstaller(
+	cfg *setting.Cfg,
+	accessControlService accesscontrol.Service,
+	accessClient authlib.AccessClient,
+) (*AppInstaller, error) {
+	if err := DeclareFixedRoles(accessControlService); err != nil {
+		return nil, fmt.Errorf("declaring fixed roles: %w", err)
+	}
+	return NewAppInstaller(accessClient, cfg.EnablePlaylistsReconciler)
+}
+
+func NewAppInstaller(accessClient authlib.AccessClient, enableReconcilers bool) (*AppInstaller, error) {
+	installer := &AppInstaller{
+		accessClient: accessClient,
+		logger:       log.New("playlist.api"),
+	}
+	specificConfig := any(&playlistapp.PlaylistConfig{
+		EnableReconcilers: enableReconcilers,
+	})
+	provider := simple.NewAppProvider(manifestdata.LocalManifest(), specificConfig, playlistapp.New)
+
+	appConfig := app.Config{
+		KubeConfig:     restclient.Config{}, // this will be overridden by the installer's InitializeApp method
+		ManifestData:   *manifestdata.LocalManifest().ManifestData,
+		SpecificConfig: specificConfig,
+	}
+	i, err := appsdkapiserver.NewDefaultAppInstaller(provider, appConfig, &manifestdata.GoTypeAssociator{})
+	if err != nil {
+		return nil, err
+	}
+	installer.AppInstaller = i
+
+	return installer, nil
+}
+
+func (p *AppInstaller) GetAuthorizer() authorizer.Authorizer {
+	return authorizer.AuthorizerFunc(
+		func(ctx context.Context, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+			if !attr.IsResourceRequest() {
+				return authorizer.DecisionNoOpinion, "", nil
+			}
+
+			user, err := identity.GetRequester(ctx)
+			if err != nil {
+				return authorizer.DecisionDeny, "valid user is required", err
+			}
+
+			if !openfeature.NewDefaultClient().Boolean(ctx, featuremgmt.FlagPlaylistsRBAC, false, openfeature.TransactionContext(ctx)) {
+				// Hotfix: grant None-role users viewer-level access until the toggle is enabled.
+				// Other roles use the legacy org-role rules. Multi-tenant API servers have no
+				// role authorizer in their chain, so the rules are applied here.
+				if user.GetOrgRole() != org.RoleNone {
+					//nolint:staticcheck // legacy path behind the toggle
+					return roleauthorizer.NewRoleAuthorizer().Authorize(ctx, attr)
+				}
+				switch attr.GetVerb() {
+				case "get", "list", "watch":
+					return authorizer.DecisionAllow, "", nil
+				default:
+					return authorizer.DecisionNoOpinion, "", nil
+				}
+			}
+
+			switch attr.GetVerb() {
+			case "get", "list", "watch", "create", "update", "patch", "delete", "deletecollection":
+			default:
+				return authorizer.DecisionDeny, "unsupported verb: " + attr.GetVerb(), nil
+			}
+
+			res, err := p.accessClient.Check(ctx, user, authlib.CheckRequest{
+				Verb:      attr.GetVerb(),
+				Group:     attr.GetAPIGroup(),
+				Resource:  attr.GetResource(),
+				Namespace: attr.GetNamespace(),
+			}, "")
+			if err != nil {
+				p.logger.Error("failed to evaluate permission", "error", err)
+				return authorizer.DecisionDeny, "permission evaluation failed", err
+			}
+			if !res.Allowed {
+				return authorizer.DecisionDeny, "insufficient permissions", nil
+			}
+
+			return authorizer.DecisionAllow, "", nil
+		},
+	)
+}

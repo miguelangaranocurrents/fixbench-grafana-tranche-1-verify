@@ -1,0 +1,667 @@
+import { type UserEvent } from '@testing-library/user-event';
+import { HttpResponse, http } from 'msw';
+import { type ReactNode } from 'react';
+import { renderRuleEditor, ui } from 'test/helpers/alertingRuleEditor';
+import { clickSelectOption } from 'test/helpers/selectOptionInTest';
+import { screen, testWithFeatureToggles, waitFor, within } from 'test/test-utils';
+import { byRole, byText } from 'testing-library-selector';
+
+import { config, setPluginLinksHook } from '@grafana/runtime';
+import { mockComboboxRect } from '@grafana/test-utils';
+import { contextSrv } from 'app/core/services/context_srv';
+import { setupMswServer } from 'app/features/alerting/unified/mockApi';
+import {
+  grantUserPermissions,
+  mockAlertmanagerAlert,
+  mockDataSource,
+  mockFolder,
+} from 'app/features/alerting/unified/mocks';
+import {
+  grafanaRulerGroup,
+  grafanaRulerNamespace,
+  grafanaRulerRule,
+  mockPreviewApiResponse,
+} from 'app/features/alerting/unified/mocks/grafanaRulerApi';
+import { setAlertmanagerChoices, setFolderResponse } from 'app/features/alerting/unified/mocks/server/configure';
+import { PROMETHEUS_DATASOURCE_UID } from 'app/features/alerting/unified/mocks/server/constants';
+import { captureRequests } from 'app/features/alerting/unified/mocks/server/events';
+import { FOLDER_TITLE_HAPPY_PATH } from 'app/features/alerting/unified/mocks/server/handlers/folders';
+import { setupDataSources } from 'app/features/alerting/unified/testSetup/datasources';
+import { DataSourceType } from 'app/features/alerting/unified/utils/datasource';
+import { MANUAL_ROUTING_KEY } from 'app/features/alerting/unified/utils/rule-form';
+import { AlertmanagerChoice } from 'app/plugins/datasource/alertmanager/types';
+import { AccessControlAction } from 'app/types/accessControl';
+import { type RulerGrafanaRuleDTO, type RulerRuleGroupDTO } from 'app/types/unified-alerting-dto';
+
+import { NAMED_ROOT_LABEL_NAME } from '../../notification-policies/useNotificationPolicyRoute';
+
+jest.mock('app/core/components/AppChrome/AppChromeUpdate', () => ({
+  AppChromeUpdate: ({ actions }: { actions: ReactNode }) => <div>{actions}</div>,
+}));
+
+jest.mock('app/features/alerting/unified/useRouteGroupsMatcher');
+
+jest.setTimeout(90 * 1000);
+
+const dataSources = {
+  default: mockDataSource(
+    {
+      type: 'prometheus',
+      name: 'Prom',
+      uid: PROMETHEUS_DATASOURCE_UID,
+      isDefault: true,
+    },
+    { alerting: true, module: 'core:plugin/prometheus' }
+  ),
+  am: mockDataSource({
+    name: 'Alertmanager',
+    type: DataSourceType.Alertmanager,
+  }),
+};
+
+const policyTreeUi = {
+  // Collapsed state
+  defaultBadge: byText('Default policy'),
+  changeButton: byRole('button', { name: /change notification policy/i }),
+  viewPoliciesLink: byRole('link', { name: /view notification policies/i }),
+
+  // Expanded state
+  policySelector: byRole('combobox', { name: /select notification policy/i }),
+  missingPolicyWarning: byText(/this policy tree is not in your list/i),
+};
+
+/** Opens the policy dropdown and picks the option whose label matches `name`. */
+const selectPolicyOption = async (user: UserEvent, name: RegExp) => {
+  await user.click(policyTreeUi.policySelector.get());
+  await user.click(await screen.findByRole('option', { name }));
+};
+
+const selectFolderAndGroup = async (user: UserEvent) => {
+  const folderPicker = ui.inputs.folder.get();
+  const folderButton = await within(folderPicker).findByRole('button', { name: /select folder/i });
+  await user.click(folderButton);
+
+  const folderOption = await within(folderPicker).findByLabelText(FOLDER_TITLE_HAPPY_PATH);
+  await user.click(folderOption);
+
+  await user.click(await screen.findByRole('radio', { name: /use groups \(legacy\)/i }));
+
+  const groupInput = await ui.inputs.group.find();
+  const groupCombobox = await byRole('combobox').find(groupInput);
+  await user.click(groupCombobox);
+  await clickSelectOption(groupInput, grafanaRulerGroup.name);
+};
+
+const server = setupMswServer();
+
+beforeEach(() => {
+  mockComboboxRect();
+
+  mockPreviewApiResponse(server, []);
+});
+
+setupDataSources(dataSources.default, dataSources.am);
+setPluginLinksHook(() => ({ links: [], isLoading: false }));
+
+afterEach(() => {
+  window.localStorage.clear();
+});
+
+const grantAllPermissions = () => {
+  grantUserPermissions([
+    AccessControlAction.AlertingRuleRead,
+    AccessControlAction.AlertingRuleUpdate,
+    AccessControlAction.AlertingRuleDelete,
+    AccessControlAction.AlertingRuleCreate,
+    AccessControlAction.DataSourcesRead,
+    AccessControlAction.DataSourcesWrite,
+    AccessControlAction.DataSourcesCreate,
+    AccessControlAction.FoldersWrite,
+    AccessControlAction.FoldersRead,
+    AccessControlAction.AlertingRuleExternalRead,
+    AccessControlAction.AlertingRuleExternalWrite,
+    AccessControlAction.AlertingNotificationsRead,
+    AccessControlAction.AlertingNotificationsWrite,
+  ]);
+};
+
+describe('PolicyTreeSelector', () => {
+  testWithFeatureToggles({ enable: ['alerting.rulesAPIV2'] });
+
+  beforeEach(() => {
+    localStorage.setItem(MANUAL_ROUTING_KEY, 'false');
+    contextSrv.isEditor = true;
+    contextSrv.hasEditPermissionInFolders = true;
+    setAlertmanagerChoices(AlertmanagerChoice.Internal, 1);
+    grantAllPermissions();
+  });
+
+  describe('new rule - collapsed default policy view', () => {
+    it('shows collapsed view with Default policy badge, Change button, and View policies link', async () => {
+      const { user } = renderRuleEditor();
+
+      await user.type(await ui.inputs.name.find(), 'my great new rule');
+      await selectFolderAndGroup(user);
+
+      // Wait for the policy section to appear
+      await waitFor(() => {
+        expect(policyTreeUi.defaultBadge.get()).toBeInTheDocument();
+      });
+
+      // Collapsed state: badge + change button, NO dropdown
+      expect(policyTreeUi.defaultBadge.get()).toBeInTheDocument();
+      expect(policyTreeUi.changeButton.get()).toBeInTheDocument();
+      expect(policyTreeUi.viewPoliciesLink.get()).toBeInTheDocument();
+      expect(policyTreeUi.viewPoliciesLink.get()).toHaveAttribute('href', '/alerting/routes');
+
+      // Dropdown should NOT be visible in collapsed state
+      expect(policyTreeUi.policySelector.query()).not.toBeInTheDocument();
+    });
+
+    describe('when Grafana is served from a sub path', () => {
+      const originalSubUrl = config.appSubUrl;
+
+      beforeEach(() => {
+        config.appSubUrl = '/grafana';
+      });
+
+      afterEach(() => {
+        config.appSubUrl = originalSubUrl;
+      });
+
+      it('prefixes the View policies link with the sub path', async () => {
+        const { user } = renderRuleEditor();
+
+        await user.type(await ui.inputs.name.find(), 'my great new rule');
+        await selectFolderAndGroup(user);
+
+        expect(await policyTreeUi.viewPoliciesLink.find()).toHaveAttribute('href', '/grafana/alerting/routes');
+      });
+    });
+
+    it('does not set notification_settings.policy or a legacy label when saving with default policy', async () => {
+      const capture = captureRequests((r) => r.method === 'POST' && r.url.includes('/api/ruler/'));
+
+      const { user } = renderRuleEditor();
+
+      await user.type(await ui.inputs.name.find(), 'my great new rule');
+      await selectFolderAndGroup(user);
+
+      // Wait for the collapsed policy section
+      await waitFor(() => {
+        expect(policyTreeUi.defaultBadge.get()).toBeInTheDocument();
+      });
+
+      // Save without changing policy
+      await user.click(ui.buttons.save.get());
+      const requests = await capture;
+      const bodies = await Promise.all(
+        requests.map((r) => r.json() as Promise<RulerRuleGroupDTO<RulerGrafanaRuleDTO>>)
+      );
+      const ruleBody = bodies[0];
+      const newRule = ruleBody.rules[ruleBody.rules.length - 1];
+
+      expect(newRule.grafana_alert.notification_settings).toBeUndefined();
+      expect(newRule.labels?.[NAMED_ROOT_LABEL_NAME]).toBeUndefined();
+    });
+
+    it('expands dropdown when Change button is clicked', async () => {
+      const { user } = renderRuleEditor();
+
+      await user.type(await ui.inputs.name.find(), 'my great new rule');
+      await selectFolderAndGroup(user);
+
+      // Wait for collapsed state
+      await waitFor(() => {
+        expect(policyTreeUi.changeButton.get()).toBeInTheDocument();
+      });
+
+      // Click "Change" to expand
+      await user.click(policyTreeUi.changeButton.get());
+
+      // Now the dropdown should be visible
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeInTheDocument();
+      });
+
+      // Badge and change button should be gone
+      expect(policyTreeUi.changeButton.query()).not.toBeInTheDocument();
+
+      // The dropdown should show "Default policy" as selected, not blank
+      expect(screen.getByDisplayValue(/default policy/i)).toBeInTheDocument();
+    });
+
+    it('sets notification_settings.policy when a custom policy is selected (no __grafana_managed_route__ label)', async () => {
+      const capture = captureRequests((r) => r.method === 'POST' && r.url.includes('/api/ruler/'));
+
+      const { user } = renderRuleEditor();
+
+      await user.type(await ui.inputs.name.find(), 'my great new rule');
+      await selectFolderAndGroup(user);
+
+      // Wait for collapsed state and click "Change"
+      await waitFor(() => {
+        expect(policyTreeUi.changeButton.get()).toBeInTheDocument();
+      });
+      await user.click(policyTreeUi.changeButton.get());
+
+      // Wait for dropdown to appear
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeInTheDocument();
+      });
+
+      // Open the policy dropdown
+      await user.click(policyTreeUi.policySelector.get());
+
+      // Wait for options to load
+      await waitFor(() => {
+        const options = screen.getAllByRole('option');
+        expect(options.length).toBeGreaterThan(1);
+      });
+
+      // Select a non-default policy
+      const customPolicyName = 'Managed Policy - Empty Provisioned';
+      const customPolicyOption = screen.getByRole('option', { name: new RegExp(customPolicyName, 'i') });
+      await user.click(customPolicyOption);
+
+      // Verify the policy was selected
+      await waitFor(() => {
+        expect(screen.getByDisplayValue(customPolicyName)).toBeInTheDocument();
+      });
+
+      // Save
+      await user.click(ui.buttons.save.get());
+      const requests = await capture;
+      const bodies = await Promise.all(
+        requests.map((r) => r.json() as Promise<RulerRuleGroupDTO<RulerGrafanaRuleDTO>>)
+      );
+      const ruleBody = bodies[0];
+      const newRule = ruleBody.rules[ruleBody.rules.length - 1];
+
+      // Should use notification_settings.policy, not __grafana_managed_route__ label
+      expect(newRule.grafana_alert.notification_settings?.policy).toBe(customPolicyName);
+      expect(newRule.grafana_alert.notification_settings?.receiver).toBeUndefined();
+      expect(newRule.labels?.[NAMED_ROOT_LABEL_NAME]).toBeUndefined();
+    });
+
+    it('collapses back to the default view when Default policy is selected again', async () => {
+      const { user } = renderRuleEditor();
+
+      await user.type(await ui.inputs.name.find(), 'my great new rule');
+      await selectFolderAndGroup(user);
+
+      // Expand the dropdown
+      await waitFor(() => {
+        expect(policyTreeUi.changeButton.get()).toBeInTheDocument();
+      });
+      await user.click(policyTreeUi.changeButton.get());
+
+      // Wait for dropdown
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeInTheDocument();
+      });
+
+      // Select a custom policy, then go back to the default one
+      await selectPolicyOption(user, /Managed Policy - Empty Provisioned/i);
+      await waitFor(() => {
+        expect(screen.getByDisplayValue('Managed Policy - Empty Provisioned')).toBeInTheDocument();
+      });
+
+      await selectPolicyOption(user, /default policy/i);
+
+      // Should collapse back to the default view
+      await waitFor(() => {
+        expect(policyTreeUi.defaultBadge.get()).toBeInTheDocument();
+      });
+      expect(policyTreeUi.policySelector.query()).not.toBeInTheDocument();
+    });
+  });
+
+  // Regression test for bug #1 from PR #124697:
+  // AutomaticRooting passed policyName={undefined} to NotificationPreview when a
+  // non-default policy tree was selected via the legacy label.
+  // The selected tree (stored as __grafana_managed_route__ label) was never forwarded,
+  // so routing was always evaluated against the default tree.
+  describe('notification preview routing (legacy label rule)', () => {
+    const CUSTOM_POLICY_NAME = 'Managed Policy - Empty Provisioned';
+
+    beforeEach(() => {
+      setFolderResponse(
+        mockFolder({
+          uid: grafanaRulerNamespace.uid,
+          title: grafanaRulerNamespace.name,
+          accessControl: {
+            [AccessControlAction.AlertingRuleRead]: true,
+            [AccessControlAction.AlertingRuleUpdate]: true,
+            [AccessControlAction.FoldersRead]: true,
+          },
+        })
+      );
+
+      // Rule uses legacy label-based routing (no notification_settings.policy)
+      const ruleWithLabel: RulerGrafanaRuleDTO = {
+        ...grafanaRulerRule,
+        labels: { [NAMED_ROOT_LABEL_NAME]: CUSTOM_POLICY_NAME },
+        grafana_alert: {
+          ...grafanaRulerRule.grafana_alert,
+          notification_settings: undefined,
+        },
+      };
+      const group: RulerRuleGroupDTO<RulerGrafanaRuleDTO> = {
+        ...grafanaRulerGroup,
+        rules: [ruleWithLabel],
+      };
+      server.use(
+        http.get(`/api/ruler/grafana/api/v1/rules/${grafanaRulerNamespace.uid}/${grafanaRulerGroup.name}`, () =>
+          HttpResponse.json(group)
+        )
+      );
+    });
+
+    it('forwards the policy name from the __grafana_managed_route__ label to the routing preview', async () => {
+      // Simulate the preview API returning an instance so the routing tree fetch is triggered
+      mockPreviewApiResponse(server, [mockAlertmanagerAlert({ labels: { severity: 'critical' } })]);
+
+      // Capture all GET requests to the k8s routing tree API so we can verify
+      // the preview fetched the named policy tree, not the default root.
+      const capture = captureRequests((r) => r.method === 'GET' && r.url.includes('/routingtrees/'));
+
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      // Wait for the form to load with the custom policy pre-selected
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeEnabled();
+      });
+
+      const requests = await capture;
+
+      // Before the fix, AutomaticRooting passed policyName={undefined} so the preview
+      // hook always fetched the default root tree (ROOT_ROUTE_NAME), never the named one.
+      // After the fix, it derives the name from the __grafana_managed_route__ label and
+      // the k8s API is called with the encoded policy name in the URL.
+      await waitFor(() => {
+        const routingTreeUrls = requests.map((r) => r.url);
+        expect(routingTreeUrls.some((url) => url.includes(encodeURIComponent(CUSTOM_POLICY_NAME)))).toBe(true);
+      });
+    });
+  });
+
+  describe('edit existing rule', () => {
+    const CUSTOM_POLICY_NAME = 'Managed Policy - Empty Provisioned';
+
+    // Setup folder with edit permissions
+    beforeEach(() => {
+      setFolderResponse(
+        mockFolder({
+          uid: grafanaRulerNamespace.uid,
+          title: grafanaRulerNamespace.name,
+          accessControl: {
+            [AccessControlAction.AlertingRuleRead]: true,
+            [AccessControlAction.AlertingRuleUpdate]: true,
+            [AccessControlAction.FoldersRead]: true,
+          },
+        })
+      );
+    });
+
+    const mockRulerGroupWithLabels = (labels: Record<string, string>) => {
+      const ruleWithLabels: RulerGrafanaRuleDTO = {
+        ...grafanaRulerRule,
+        labels: {
+          ...grafanaRulerRule.labels,
+          ...labels,
+        },
+      };
+
+      const group: RulerRuleGroupDTO<RulerGrafanaRuleDTO> = {
+        ...grafanaRulerGroup,
+        rules: [ruleWithLabels],
+      };
+
+      server.use(
+        http.get(`/api/ruler/grafana/api/v1/rules/${grafanaRulerNamespace.uid}/${grafanaRulerGroup.name}`, () =>
+          HttpResponse.json(group)
+        )
+      );
+    };
+
+    it('shows expanded dropdown with custom policy pre-selected when rule has __grafana_managed_route__ label', async () => {
+      mockRulerGroupWithLabels({ [NAMED_ROOT_LABEL_NAME]: CUSTOM_POLICY_NAME });
+
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      // Wait for the form to load - dropdown should be directly visible (expanded) for custom policy
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeEnabled();
+      });
+
+      // Should show the custom policy name as selected
+      expect(screen.getByDisplayValue(CUSTOM_POLICY_NAME)).toBeInTheDocument();
+
+      // Change button should NOT be visible (we're in expanded state)
+      expect(policyTreeUi.changeButton.query()).not.toBeInTheDocument();
+    });
+
+    it('shows collapsed default view when rule has no __grafana_managed_route__ label', async () => {
+      mockRulerGroupWithLabels({}); // no policy label
+
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      // Wait for the form to load - should show collapsed state
+      await waitFor(() => {
+        expect(policyTreeUi.defaultBadge.get()).toBeInTheDocument();
+      });
+
+      // Should show collapsed default view
+      await waitFor(() => {
+        expect(policyTreeUi.defaultBadge.get()).toBeInTheDocument();
+      });
+      expect(policyTreeUi.changeButton.get()).toBeInTheDocument();
+
+      // Dropdown should NOT be visible
+      expect(policyTreeUi.policySelector.query()).not.toBeInTheDocument();
+    });
+
+    // Regression test: before the fix, selectedPolicy was only migrated from the legacy label
+    // while the label itself stayed in form state, so re-opening the selector after resetting
+    // could still show (or re-select) the stale label value instead of the default.
+    it('clears the policy on reset (re-opening the selector shows default, not the stale label)', async () => {
+      mockRulerGroupWithLabels({ [NAMED_ROOT_LABEL_NAME]: CUSTOM_POLICY_NAME });
+
+      const { user } = renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      // Loads expanded with the migrated policy selected.
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeEnabled();
+      });
+      expect(screen.getByDisplayValue(CUSTOM_POLICY_NAME)).toBeInTheDocument();
+
+      // Go back to the default policy, then re-open the selector.
+      await selectPolicyOption(user, /default policy/i);
+      await waitFor(() => {
+        expect(policyTreeUi.changeButton.get()).toBeInTheDocument();
+      });
+      await user.click(policyTreeUi.changeButton.get());
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeInTheDocument();
+      });
+
+      // The selector must reflect the default policy, not the stale legacy label.
+      expect(screen.queryByDisplayValue(CUSTOM_POLICY_NAME)).not.toBeInTheDocument();
+      expect(screen.getByDisplayValue(/default policy/i)).toBeInTheDocument();
+    });
+  });
+
+  // Regression: a rule routed via notification_settings.policy (the canonical, backend-honored
+  // storage) was shown as "Default policy" and silently dropped on save when a non-default
+  // policy tree was selected, because the selector/save paths only looked at the legacy
+  // __grafana_managed_route__ label.
+  describe('edit existing rule with notification_settings.policy', () => {
+    const CUSTOM_POLICY_NAME = 'Managed Policy - Empty Provisioned';
+
+    beforeEach(() => {
+      setFolderResponse(
+        mockFolder({
+          uid: grafanaRulerNamespace.uid,
+          title: grafanaRulerNamespace.name,
+          accessControl: {
+            [AccessControlAction.AlertingRuleRead]: true,
+            [AccessControlAction.AlertingRuleUpdate]: true,
+            [AccessControlAction.FoldersRead]: true,
+          },
+        })
+      );
+
+      const ruleWithPolicy: RulerGrafanaRuleDTO = {
+        ...grafanaRulerRule,
+        labels: {},
+        grafana_alert: {
+          ...grafanaRulerRule.grafana_alert,
+          notification_settings: { policy: CUSTOM_POLICY_NAME },
+        },
+      };
+      const group: RulerRuleGroupDTO<RulerGrafanaRuleDTO> = {
+        ...grafanaRulerGroup,
+        rules: [ruleWithPolicy],
+      };
+      server.use(
+        http.get(`/api/ruler/grafana/api/v1/rules/${grafanaRulerNamespace.uid}/${grafanaRulerGroup.name}`, () =>
+          HttpResponse.json(group)
+        )
+      );
+    });
+
+    it('shows the policy from notification_settings.policy pre-selected, not "Default policy"', async () => {
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeEnabled();
+      });
+
+      expect(screen.getByDisplayValue(CUSTOM_POLICY_NAME)).toBeInTheDocument();
+      expect(policyTreeUi.changeButton.query()).not.toBeInTheDocument();
+      expect(policyTreeUi.defaultBadge.query()).not.toBeInTheDocument();
+    });
+
+    it('round-trips notification_settings.policy on save (does not drop it or add a legacy label)', async () => {
+      const capture = captureRequests((r) => r.method === 'POST' && r.url.includes('/api/ruler/'));
+
+      const { user } = renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeEnabled();
+      });
+
+      await user.click(ui.buttons.save.get());
+      const requests = await capture;
+      const bodies = await Promise.all(
+        requests.map((r) => r.json() as Promise<RulerRuleGroupDTO<RulerGrafanaRuleDTO>>)
+      );
+      const savedRule = bodies[0].rules.find((r) => r.grafana_alert.title === grafanaRulerRule.grafana_alert.title);
+
+      expect(savedRule?.grafana_alert.notification_settings?.policy).toBe(CUSTOM_POLICY_NAME);
+      expect(savedRule?.labels?.[NAMED_ROOT_LABEL_NAME]).toBeUndefined();
+    });
+  });
+
+  // A rule can point at a tree the dropdown doesn't list: it was deleted, or the list only contains
+  // the trees this user is allowed to read. Those are indistinguishable from the client, so the
+  // assignment has to stay both visible and intact either way.
+  describe('rule pointing at a policy tree missing from the list', () => {
+    const MISSING_POLICY_NAME = 'tree-not-in-the-list';
+
+    beforeEach(() => {
+      setFolderResponse(
+        mockFolder({
+          uid: grafanaRulerNamespace.uid,
+          title: grafanaRulerNamespace.name,
+          accessControl: {
+            [AccessControlAction.AlertingRuleRead]: true,
+            [AccessControlAction.AlertingRuleUpdate]: true,
+            [AccessControlAction.FoldersRead]: true,
+          },
+        })
+      );
+
+      const ruleWithMissingPolicy: RulerGrafanaRuleDTO = {
+        ...grafanaRulerRule,
+        labels: {},
+        grafana_alert: {
+          ...grafanaRulerRule.grafana_alert,
+          notification_settings: { policy: MISSING_POLICY_NAME },
+        },
+      };
+      const group: RulerRuleGroupDTO<RulerGrafanaRuleDTO> = {
+        ...grafanaRulerGroup,
+        rules: [ruleWithMissingPolicy],
+      };
+      server.use(
+        http.get(`/api/ruler/grafana/api/v1/rules/${grafanaRulerNamespace.uid}/${grafanaRulerGroup.name}`, () =>
+          HttpResponse.json(group)
+        )
+      );
+    });
+
+    it('shows the policy name rather than an empty picker', async () => {
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      await waitFor(() => {
+        expect(policyTreeUi.policySelector.get()).toBeEnabled();
+      });
+
+      expect(screen.getByDisplayValue(MISSING_POLICY_NAME)).toBeInTheDocument();
+      expect(policyTreeUi.defaultBadge.query()).not.toBeInTheDocument();
+    });
+
+    it('warns that the policy is unavailable, since the name alone looks like a valid pick', async () => {
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      expect(await policyTreeUi.missingPolicyWarning.find()).toBeInTheDocument();
+    });
+
+    it('does not warn when the policy is in the list', async () => {
+      // Same rule shape, but pointing at a tree the list actually contains.
+      const ruleWithKnownPolicy: RulerGrafanaRuleDTO = {
+        ...grafanaRulerRule,
+        labels: {},
+        grafana_alert: {
+          ...grafanaRulerRule.grafana_alert,
+          notification_settings: { policy: 'Managed Policy - Empty Provisioned' },
+        },
+      };
+      server.use(
+        http.get(`/api/ruler/grafana/api/v1/rules/${grafanaRulerNamespace.uid}/${grafanaRulerGroup.name}`, () =>
+          HttpResponse.json({ ...grafanaRulerGroup, rules: [ruleWithKnownPolicy] })
+        )
+      );
+
+      renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      await waitFor(() => {
+        expect(screen.getByDisplayValue('Managed Policy - Empty Provisioned')).toBeInTheDocument();
+      });
+      expect(policyTreeUi.missingPolicyWarning.query()).not.toBeInTheDocument();
+    });
+
+    it('keeps the policy on save instead of silently resetting it', async () => {
+      const capture = captureRequests((r) => r.method === 'POST' && r.url.includes('/api/ruler/'));
+
+      const { user } = renderRuleEditor(grafanaRulerRule.grafana_alert.uid);
+
+      await waitFor(() => {
+        expect(screen.getByDisplayValue(MISSING_POLICY_NAME)).toBeInTheDocument();
+      });
+
+      await user.click(ui.buttons.save.get());
+
+      const requests = await capture;
+      const bodies = await Promise.all(
+        requests.map((r) => r.json() as Promise<RulerRuleGroupDTO<RulerGrafanaRuleDTO>>)
+      );
+      const savedRule = bodies[0].rules.find((r) => r.grafana_alert.title === grafanaRulerRule.grafana_alert.title);
+
+      expect(savedRule?.grafana_alert.notification_settings?.policy).toBe(MISSING_POLICY_NAME);
+      expect(savedRule?.labels?.[NAMED_ROOT_LABEL_NAME]).toBeUndefined();
+    });
+  });
+});

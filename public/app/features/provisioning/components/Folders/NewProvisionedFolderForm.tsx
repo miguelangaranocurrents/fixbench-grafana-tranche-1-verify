@@ -1,0 +1,333 @@
+import { useState } from 'react';
+import { FormProvider, useForm } from 'react-hook-form';
+import { useNavigate } from 'react-router-dom-v5-compat';
+
+import { Trans, t } from '@grafana/i18n';
+import { reportInteraction } from '@grafana/runtime';
+import { Alert, Button, Field, Input, Stack, Text } from '@grafana/ui';
+import { type Folder } from 'app/api/clients/folder/v1beta1';
+import { type RepositoryView, useCreateRepositoryFilesWithPathMutation } from 'app/api/clients/provisioning/v0alpha1';
+import { useUrlParams } from 'app/core/navigation/hooks';
+import { type Resource } from 'app/features/apiserver/types';
+import { usePullRequestParam } from 'app/features/provisioning/hooks/usePullRequestParam';
+import { GENERAL_FOLDER_UID } from 'app/features/search/constants';
+import { type FolderDTO } from 'app/types/folders';
+
+import { ProvisioningAlert } from '../../Shared/ProvisioningAlert';
+import { useBranchTemplate } from '../../hooks/useBranchTemplate';
+import { useCommitMessageTemplate } from '../../hooks/useCommitMessageTemplate';
+import { RepoViewStatus, type RepositoryViewData } from '../../hooks/useGetResourceRepositoryView';
+import { useProvisionedFolderFormData } from '../../hooks/useProvisionedFolderFormData';
+import { type ProvisionedOperationInfo, useProvisionedRequestHandler } from '../../hooks/useProvisionedRequestHandler';
+import { usePullRequestTitle } from '../../hooks/usePullRequestTitle';
+import { type BaseProvisionedFormData } from '../../types/form';
+import { type CommitTemplateVars } from '../../utils/commitMessage';
+import { getCurrentCommitUser } from '../../utils/currentUser';
+import { buildResourceBranchRedirectUrl } from '../../utils/redirect';
+import { ProvisionedFormGate } from '../ProvisionedFormGate';
+import { ResourceEditFormSharedFields } from '../Shared/ResourceEditFormSharedFields';
+import { getProvisionedRequestError } from '../utils/errors';
+import { validateProvisionedFolderName } from '../utils/folderName';
+import { joinPath } from '../utils/path';
+
+interface FormProps {
+  initialValues: BaseProvisionedFormData;
+  repository?: RepositoryView;
+  canPushToConfiguredBranch: boolean;
+  folder?: Folder;
+  onDismiss?: () => void;
+}
+
+interface Props {
+  onDismiss?: () => void;
+  /** Resolved once by the caller, so this form and the caller always agree on the repository */
+  view: RepositoryViewData;
+}
+
+function FormContent({ initialValues, repository, canPushToConfiguredBranch, folder, onDismiss }: FormProps) {
+  const { prURL } = usePullRequestParam();
+  const navigate = useNavigate();
+  const [, updateUrlParams] = useUrlParams();
+  const [create, request] = useCreateRepositoryFilesWithPathMutation();
+  const [error, setError] = useState<string | undefined>(undefined);
+
+  const methods = useForm<BaseProvisionedFormData>({
+    defaultValues: initialValues,
+    mode: 'onBlur', // Validates when user leaves the field
+  });
+  const { handleSubmit, watch, register, formState } = methods;
+
+  const [workflow, ref] = watch(['workflow', 'ref']);
+
+  const title = watch('title');
+  const templateVars: CommitTemplateVars = {
+    action: 'create',
+    resourceKind: 'folder',
+    resourceID: '',
+    title: title ?? '',
+    ...getCurrentCommitUser(),
+  };
+  const { locked, message } = useCommitMessageTemplate({
+    repository,
+    vars: templateVars,
+    comment: watch('comment') ?? '',
+    isCommentDirty: Boolean(formState.dirtyFields.comment),
+    setComment: (value) => methods.setValue('comment', value, { shouldDirty: false }),
+  });
+
+  const { locked: lockBranch } = useBranchTemplate({
+    repository,
+    vars: templateVars,
+    workflow,
+    value: ref ?? '',
+    setBranch: (value) => methods.setValue('ref', value, { shouldDirty: false }),
+  });
+
+  const { prTitle } = usePullRequestTitle({ repository, vars: templateVars, workflow });
+
+  const repoLabel = repository?.title || repository?.name;
+  // Rendered as React text, which escapes it already; escaping here too would show "/" as "&#x2F;"
+  const destination = initialValues.path
+    ? t(
+        'browse-dashboards.new-provisioned-folder-form.text-destination-path',
+        'Will be created in {{repository}} under {{path}}',
+        { repository: repoLabel, path: initialValues.path, interpolation: { escapeValue: false } }
+      )
+    : t(
+        'browse-dashboards.new-provisioned-folder-form.text-destination-root',
+        'Will be created at the root of {{repository}}',
+        { repository: repoLabel, interpolation: { escapeValue: false } }
+      );
+
+  const onBranchSuccess = ({ urls }: { urls?: Record<string, string> }, info: ProvisionedOperationInfo) => {
+    const prUrl = urls?.newPullRequestURL;
+    // Fall back to the repository URL if no PR URL is returned, so preview banner link button stay visible
+    const paramValue = prUrl ?? repository?.url ?? '';
+    const params: Record<string, string> = {};
+
+    if (paramValue) {
+      params.new_pull_request_url = paramValue;
+    }
+    if (info.repoType) {
+      params.repo_type = info.repoType;
+    }
+    if (prTitle) {
+      params.pr_title = prTitle;
+    }
+
+    if (Object.keys(params).length > 0) {
+      updateUrlParams(params);
+    }
+  };
+
+  const onWriteSuccess = (resource: Resource<FolderDTO>) => {
+    // Navigation for new folders (resource-specific concern)
+    if (resource?.metadata?.name) {
+      navigate(`/dashboards/f/${resource.metadata.name}/`);
+      return;
+    }
+
+    // When sync is disabled, the BE returns resource.upsert as null (no Grafana resource created).
+    // Redirect to dashboards with a banner linking to the repo status page.
+    const url = buildResourceBranchRedirectUrl({
+      paramName: 'resource_pushed_to',
+      paramValue: repository?.name,
+      repoType: repository?.type,
+    });
+
+    navigate(url);
+  };
+
+  const onError = (error: unknown) => {
+    setError(
+      getProvisionedRequestError(
+        error,
+        t('browse-dashboards.new-provisioned-folder-form.error-saving', 'An error occurred while creating folder.')
+      )
+    );
+  };
+
+  // Use the repository-type and resource-type aware provisioned request handler
+  const { handleSuccess } = useProvisionedRequestHandler<FolderDTO>({
+    // No parent folder at the root, so the root list is the one to refetch
+    folderUID: folder?.metadata.name ?? GENERAL_FOLDER_UID,
+    workflow,
+    repository,
+    resourceType: 'folder',
+    handlers: {
+      onDismiss,
+      onBranchSuccess,
+      onWriteSuccess,
+    },
+  });
+
+  const doSave = async ({ ref, title, workflow, path: basePath }: BaseProvisionedFormData) => {
+    setError(undefined);
+    const repoName = repository?.name;
+    if (!title || !repoName) {
+      onError(
+        t(
+          'browse-dashboards.new-provisioned-folder-form.error-missing-title-or-repo',
+          'Missing folder name or repository information'
+        )
+      );
+      return;
+    }
+
+    const path = joinPath(basePath, `${title}/`);
+
+    const folderModel = {
+      title,
+      type: 'folder',
+    };
+
+    // The branch entered in the form, before the ref is dropped for the write workflow
+    const selectedBranch = ref;
+    if (workflow === 'write') {
+      ref = undefined;
+    }
+
+    reportInteraction('grafana_provisioning_folder_create_submitted', {
+      workflow,
+      repositoryName: repoName,
+      repositoryType: repository?.type ?? 'unknown',
+      source: 'new-folder-form',
+    });
+
+    try {
+      const data = await create({
+        ref,
+        name: repoName,
+        path,
+        message,
+        body: folderModel,
+      }).unwrap();
+      handleSuccess(data, { workflow, selectedBranch });
+    } catch (err) {
+      onError(err);
+    }
+  };
+
+  return (
+    <FormProvider {...methods}>
+      <form onSubmit={handleSubmit(doSave)}>
+        <Stack direction="column" gap={2}>
+          {!repository?.workflows?.length && (
+            <Alert
+              title={t(
+                'browse-dashboards.new-provisioned-folder-form.title-this-repository-is-read-only',
+                'This repository is read only'
+              )}
+            >
+              <Trans i18nKey="browse-dashboards.text-this-repository-is-read-only">
+                If you have direct access to the target, copy the JSON and paste it there.
+              </Trans>
+            </Alert>
+          )}
+
+          <Field
+            noMargin
+            label={t('browse-dashboards.new-provisioned-folder-form.label-folder-name', 'Folder name')}
+            invalid={!!formState?.errors.title}
+            error={formState?.errors.title?.message}
+          >
+            <Input
+              {...register('title', {
+                required: t('browse-dashboards.new-provisioned-folder-form.error-required', 'Folder name is required'),
+                // This value becomes a directory name in the repository, so it must never carry surrounding spaces
+                setValueAs: (value: string) => value.trim(),
+                validate: validateProvisionedFolderName,
+              })}
+              placeholder={t(
+                'browse-dashboards.new-provisioned-folder-form.folder-name-input-placeholder-enter-folder-name',
+                'Enter folder name'
+              )}
+              id="folder-name-input"
+            />
+          </Field>
+
+          {repoLabel && (
+            <Text variant="bodySmall" color="secondary">
+              {destination}
+            </Text>
+          )}
+
+          <ResourceEditFormSharedFields
+            resourceType="folder"
+            isNew
+            canPushToConfiguredBranch={canPushToConfiguredBranch}
+            repository={repository}
+            hiddenFields={['path']}
+            lockComment={locked}
+            commitMessage={message}
+            lockBranch={lockBranch}
+          />
+
+          {prURL && (
+            <Alert
+              severity="info"
+              title={t(
+                'browse-dashboards.new-provisioned-folder-form.title-pull-request-created',
+                'Pull request created'
+              )}
+            >
+              <Trans i18nKey="browse-dashboards.new-provisioned-folder-form.text-pull-request-created">
+                A pull request has been created with changes to this folder:
+              </Trans>{' '}
+              <a href={prURL} target="_blank" rel="noopener noreferrer">
+                {prURL}
+              </a>
+            </Alert>
+          )}
+
+          {error && <ProvisioningAlert error={error} />}
+
+          <Stack gap={2}>
+            <Button variant="secondary" fill="outline" onClick={onDismiss}>
+              <Trans i18nKey="browse-dashboards.new-provisioned-folder-form.cancel">Cancel</Trans>
+            </Button>
+            <Button type="submit" disabled={request.isLoading || !!formState?.errors.title}>
+              {request.isLoading
+                ? t('browse-dashboards.new-provisioned-folder-form.button-creating', 'Creating...')
+                : t('browse-dashboards.new-provisioned-folder-form.button-create', 'Create')}
+            </Button>
+          </Stack>
+        </Stack>
+      </form>
+    </FormProvider>
+  );
+}
+
+export function NewProvisionedFolderForm({ onDismiss, view }: Props) {
+  const { canPushToConfiguredBranch, initialValues } = useProvisionedFolderFormData({
+    view,
+    title: '', // Empty title for new folders
+  });
+
+  return (
+    <ProvisionedFormGate
+      isLoading={view.status === RepoViewStatus.Loading}
+      // A deleted or unreachable repository is a dead end of its own, not the same as a location
+      // that was never provisioned, so each gets its own notice rather than the generic banner
+      isOrphaned={view.status === RepoViewStatus.Orphaned}
+      isError={view.status === RepoViewStatus.Error}
+      error={view.error}
+      isMissingRepo={view.isMissingRepo}
+      isReadOnly={view.isReadOnlyRepo}
+      readOnlyMessage={t(
+        'browse-dashboards.new-folder.read-only-message',
+        'To create this folder, please add the resource in your repository directly.'
+      )}
+    >
+      {initialValues && (
+        <FormContent
+          onDismiss={onDismiss}
+          initialValues={initialValues}
+          repository={view.repository}
+          canPushToConfiguredBranch={canPushToConfiguredBranch}
+          folder={view.folder}
+        />
+      )}
+    </ProvisionedFormGate>
+  );
+}

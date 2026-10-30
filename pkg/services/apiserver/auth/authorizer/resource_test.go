@@ -1,0 +1,405 @@
+package authorizer
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/grafana/authlib/authn"
+	"github.com/grafana/authlib/types"
+	"github.com/grafana/grafana-app-sdk/logging"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+)
+
+// recordingLogger captures Debug()/Error() calls for assertions. With/WithContext
+// return itself, since FromContext calls WithContext before logging.
+type recordingLogger struct {
+	debugCalls [][]any
+	errorCalls [][]any
+}
+
+func (l *recordingLogger) Debug(msg string, args ...any) {
+	l.debugCalls = append(l.debugCalls, append([]any{msg}, args...))
+}
+func (l *recordingLogger) Info(string, ...any) {}
+func (l *recordingLogger) Warn(string, ...any) {}
+func (l *recordingLogger) Error(msg string, args ...any) {
+	l.errorCalls = append(l.errorCalls, append([]any{msg}, args...))
+}
+func (l *recordingLogger) With(...any) logging.Logger                 { return l }
+func (l *recordingLogger) WithContext(context.Context) logging.Logger { return l }
+
+// fakeAccessChecker is a fake implementation of claims.AccessChecker for testing
+type fakeAccessChecker struct {
+	checkFunc func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error)
+}
+
+func (m *fakeAccessChecker) Check(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+	return m.checkFunc(ctx, ident, req, extra)
+}
+
+// mockAttributes is a mock implementation of authorizer.Attributes for testing
+type mockAttributes struct {
+	authorizer.Attributes
+	isResourceRequest bool
+	verb              string
+	apiGroup          string
+	resource          string
+	namespace         string
+	name              string
+	subresource       string
+	path              string
+}
+
+func (a mockAttributes) IsResourceRequest() bool { return a.isResourceRequest }
+func (a mockAttributes) GetVerb() string         { return a.verb }
+func (a mockAttributes) GetAPIGroup() string     { return a.apiGroup }
+func (a mockAttributes) GetResource() string     { return a.resource }
+func (a mockAttributes) GetNamespace() string    { return a.namespace }
+func (a mockAttributes) GetName() string         { return a.name }
+func (a mockAttributes) GetSubresource() string  { return a.subresource }
+func (a mockAttributes) GetPath() string         { return a.path }
+
+// newTestAuthInfo returns a minimal AuthInfo for use in authorization tests.
+func newTestAuthInfo() types.AuthInfo {
+	return authn.NewIDTokenAuthInfo(
+		authn.Claims[authn.AccessTokenClaims]{},
+		&authn.Claims[authn.IDTokenClaims]{},
+	)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_EmptySubresource_DelegatesToResourceAuthorizer(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: true}, nil
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{
+		"test": func(ctx context.Context, ident types.AuthInfo, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+			return authorizer.DecisionDeny, "should not be called", nil
+		},
+	})
+
+	// Empty subresource should delegate to ResourceAuthorizer
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "", // empty subresource
+	}
+
+	ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.NoError(t, err)
+	require.Equal(t, authorizer.DecisionAllow, decision)
+	require.Empty(t, reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_KnownSubresource_RunsSubresourceCheck(t *testing.T) {
+	checkCalled := false
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: true}, nil
+		},
+	}
+
+	subresourceCheck := func(ctx context.Context, ident types.AuthInfo, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+		checkCalled = true
+		// Verify the attributes are passed correctly
+		require.Equal(t, "testresource", attr.GetResource())
+		require.Equal(t, "testsub", attr.GetSubresource())
+		return authorizer.DecisionAllow, "", nil
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{
+		"testsub": subresourceCheck,
+	})
+
+	// Add auth info to context so it's not denied due to missing identity
+	ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "testsub",
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.NoError(t, err)
+	require.True(t, checkCalled, "subresource check should have been called")
+	require.Equal(t, authorizer.DecisionAllow, decision)
+	require.Empty(t, reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_KnownSubresource_Denied(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: true}, nil
+		},
+	}
+
+	subresourceCheck := func(ctx context.Context, ident types.AuthInfo, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+		return authorizer.DecisionDeny, "custom denial reason", nil
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{
+		"testsub": subresourceCheck,
+	})
+
+	ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "testsub",
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.NoError(t, err)
+	require.Equal(t, authorizer.DecisionDeny, decision)
+	require.Equal(t, "custom denial reason", reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_UnknownSubresource_ReturnsDeny(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: true}, nil
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{
+		"knownsub": func(ctx context.Context, ident types.AuthInfo, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+			return authorizer.DecisionAllow, "", nil
+		},
+	})
+
+	ctx := context.Background()
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "unknownsub",
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no authorizer for subresource")
+	require.Equal(t, authorizer.DecisionDeny, decision)
+	require.Empty(t, reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_NonResourceRequest_ReturnsNoOpinion(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: true}, nil
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{
+		"testsub": func(ctx context.Context, ident types.AuthInfo, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+			return authorizer.DecisionAllow, "", nil
+		},
+	})
+
+	ctx := context.Background()
+
+	attrs := mockAttributes{
+		isResourceRequest: false, // not a resource request
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "testsub",
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.NoError(t, err)
+	require.Equal(t, authorizer.DecisionNoOpinion, decision)
+	require.Empty(t, reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_NoIdentity_ReturnsDeny(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: true}, nil
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{
+		"testsub": func(ctx context.Context, ident types.AuthInfo, attr authorizer.Attributes) (authorizer.Decision, string, error) {
+			return authorizer.DecisionAllow, "", nil
+		},
+	})
+
+	// No auth info in context
+	ctx := context.Background()
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "testsub",
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no identity found")
+	require.Equal(t, authorizer.DecisionDeny, decision)
+	require.Empty(t, reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_DelegateCheckError(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{}, errors.New("check failed")
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{})
+
+	ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "", // empty subresource
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "check failed")
+	require.Equal(t, authorizer.DecisionDeny, decision)
+	require.Empty(t, reason)
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_DelegateCheckError_LogsFailure(t *testing.T) {
+	checkErr := errors.New("rpc error: code = Unauthenticated desc = transport: per-RPC creds failed due to error: missing required namespace")
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{}, checkErr
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{})
+
+	logger := &recordingLogger{}
+	ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+	ctx = logging.Context(ctx, logger)
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "delete",
+		apiGroup:          "folder.grafana.app",
+		resource:          "folders",
+		namespace:         "stacks-4669",
+		name:              "efzt6k5xkg3y8b",
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.ErrorIs(t, err, checkErr)
+	require.Equal(t, authorizer.DecisionDeny, decision)
+	require.Empty(t, reason)
+
+	require.Empty(t, logger.debugCalls, "a non-cancellation failure should not be logged at debug level")
+	require.Len(t, logger.errorCalls, 1, "the access-check failure should be logged exactly once")
+	logged := logger.errorCalls[0]
+	require.Equal(t, "resource access check failed", logged[0])
+	require.Contains(t, logged, checkErr)
+	require.Contains(t, logged, "stacks-4669")
+	require.Contains(t, logged, "folders")
+	require.Contains(t, logged, "delete")
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_DelegateCheckCanceled_LogsAtDebug(t *testing.T) {
+	cases := map[string]error{
+		"context.Canceled":    context.Canceled,
+		"grpc codes.Canceled": status.Error(codes.Canceled, "context canceled"),
+	}
+
+	for name, checkErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			mockChecker := &fakeAccessChecker{
+				checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+					return types.CheckResponse{}, checkErr
+				},
+			}
+
+			auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{})
+
+			logger := &recordingLogger{}
+			ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+			ctx = logging.Context(ctx, logger)
+
+			attrs := mockAttributes{
+				isResourceRequest: true,
+				verb:              "delete",
+				apiGroup:          "folder.grafana.app",
+				resource:          "folders",
+				namespace:         "stacks-4669",
+				name:              "efzt6k5xkg3y8b",
+			}
+
+			decision, _, err := auth.Authorize(ctx, attrs)
+			require.ErrorIs(t, err, checkErr)
+			require.Equal(t, authorizer.DecisionDeny, decision)
+
+			require.Empty(t, logger.errorCalls, "a cancellation should not be logged at error level")
+			require.Len(t, logger.debugCalls, 1, "a cancellation should be logged at debug level")
+			require.Equal(t, "resource access check failed", logger.debugCalls[0][0])
+		})
+	}
+}
+
+func TestNewResourceAuthorizerWithSubresourceHandlers_DelegateCheckDenied(t *testing.T) {
+	mockChecker := &fakeAccessChecker{
+		checkFunc: func(ctx context.Context, ident types.AuthInfo, req types.CheckRequest, extra string) (types.CheckResponse, error) {
+			return types.CheckResponse{Allowed: false}, nil
+		},
+	}
+
+	auth := NewResourceAuthorizerWithSubresourceHandlers(mockChecker, map[string]SubresourceCheck{})
+
+	ctx := types.WithAuthInfo(context.Background(), newTestAuthInfo())
+
+	attrs := mockAttributes{
+		isResourceRequest: true,
+		verb:              "get",
+		apiGroup:          "test.group",
+		resource:          "testresource",
+		namespace:         "testns",
+		name:              "testname",
+		subresource:       "", // empty subresource
+	}
+
+	decision, reason, err := auth.Authorize(ctx, attrs)
+	require.NoError(t, err)
+	require.Equal(t, authorizer.DecisionDeny, decision)
+	require.Equal(t, "unauthorized request", reason)
+}

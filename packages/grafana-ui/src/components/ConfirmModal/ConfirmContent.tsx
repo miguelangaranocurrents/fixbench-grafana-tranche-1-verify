@@ -1,0 +1,162 @@
+import { css } from '@emotion/css';
+import { type FormEvent, type ReactNode, type RefObject, useEffect, useState } from 'react';
+import { useForm } from 'react-hook-form';
+
+import { type GrafanaTheme2 } from '@grafana/data';
+import { selectors } from '@grafana/e2e-selectors';
+import { t } from '@grafana/i18n';
+
+import { useStyles2 } from '../../themes/ThemeContext';
+import { Button, type ButtonVariant } from '../Button/Button';
+import { Field } from '../Forms/Field';
+import { Input } from '../Input/Input';
+import { Stack } from '../Layout/Stack/Stack';
+import { type JustifyContent } from '../Layout/types';
+import { type ResponsiveProp } from '../Layout/utils/responsiveness';
+import { Modal } from '../Modal/Modal';
+
+export interface ConfirmContentProps {
+  /** Modal content */
+  body: ReactNode;
+  /** Modal description */
+  description?: ReactNode;
+  /** Text for confirm button */
+  confirmButtonLabel: string;
+  confirmButtonRef?: RefObject<HTMLButtonElement | null>;
+  /** Confirm button variant */
+  confirmButtonVariant?: ButtonVariant;
+  /** Text user needs to fill in before confirming */
+  confirmPromptText?: string;
+  confirmPromptRef?: RefObject<HTMLInputElement | null>;
+  /** Text for dismiss button */
+  dismissButtonLabel?: string;
+  /** Variant for dismiss button */
+  dismissButtonVariant?: ButtonVariant;
+  /** Text for alternative button */
+  alternativeButtonLabel?: string;
+  /** Justify for buttons placement */
+  justifyButtons?: ResponsiveProp<JustifyContent>;
+  /** Confirm action callback
+   * Return a promise to disable the confirm button until the promise is resolved
+   */
+  onConfirm(): void | Promise<void>;
+  /** Dismiss action callback */
+  onDismiss(): void;
+  /** Alternative action callback */
+  onAlternative?(): void;
+  /** Disable the confirm button and the confirm text input if needed */
+  disabled?: boolean;
+}
+
+const promptCollator = new Intl.Collator();
+
+export const ConfirmContent = ({
+  body,
+  confirmPromptText,
+  confirmPromptRef,
+  confirmButtonLabel,
+  confirmButtonRef,
+  confirmButtonVariant,
+  dismissButtonVariant,
+  dismissButtonLabel,
+  onConfirm,
+  onDismiss,
+  onAlternative,
+  alternativeButtonLabel,
+  description,
+  justifyButtons = 'flex-end',
+  disabled,
+}: ConfirmContentProps) => {
+  const [isDisabled, setIsDisabled] = useState(disabled);
+  const styles = useStyles2(getStyles);
+
+  const onConfirmationTextChange = (event: FormEvent<HTMLInputElement>) => {
+    setIsDisabled(
+      confirmPromptText === undefined ||
+        promptCollator.compare(confirmPromptText.toLowerCase(), event.currentTarget.value.toLowerCase()) !== 0
+    );
+  };
+
+  useEffect(() => {
+    setIsDisabled(disabled ? true : Boolean(confirmPromptText));
+  }, [confirmPromptText, disabled]);
+
+  const onConfirmClick = async () => {
+    if (disabled === undefined) {
+      setIsDisabled(true);
+    }
+    try {
+      await onConfirm();
+    } finally {
+      if (disabled === undefined) {
+        setIsDisabled(false);
+      }
+    }
+  };
+
+  const { handleSubmit } = useForm();
+  const stopPropagation = (callback: (event: FormEvent) => void) => {
+    return (event: FormEvent) => {
+      event.stopPropagation();
+      callback(event);
+    };
+  };
+
+  const placeholder = t('grafana-ui.confirm-content.placeholder', 'Type "{{confirmPromptText}}" to confirm', {
+    confirmPromptText,
+  });
+  return (
+    <form onSubmit={stopPropagation(handleSubmit(onConfirmClick))}>
+      <div className={styles.text}>
+        {body}
+        {description ? <div className={styles.description}>{description}</div> : null}
+        {confirmPromptText ? (
+          <div className={styles.confirmationInput}>
+            <Stack alignItems="flex-start">
+              <Field disabled={disabled}>
+                <Input
+                  ref={confirmPromptRef}
+                  placeholder={placeholder}
+                  onChange={onConfirmationTextChange}
+                  data-testid={selectors.pages.ConfirmModal.input}
+                />
+              </Field>
+            </Stack>
+          </div>
+        ) : null}
+      </div>
+      <Modal.ButtonRow>
+        <Button variant={dismissButtonVariant} onClick={onDismiss} fill="outline">
+          {dismissButtonLabel}
+        </Button>
+        <Button
+          type="submit"
+          variant={confirmButtonVariant}
+          disabled={isDisabled}
+          ref={confirmButtonRef}
+          data-testid={selectors.pages.ConfirmModal.delete}
+        >
+          {confirmButtonLabel}
+        </Button>
+        {onAlternative ? (
+          <Button variant="primary" onClick={onAlternative}>
+            {alternativeButtonLabel}
+          </Button>
+        ) : null}
+      </Modal.ButtonRow>
+    </form>
+  );
+};
+
+const getStyles = (theme: GrafanaTheme2) => ({
+  text: css({
+    fontSize: theme.typography.h5.fontSize,
+    color: theme.colors.text.primary,
+  }),
+  description: css({
+    fontSize: theme.typography.body.fontSize,
+  }),
+  confirmationInput: css({
+    paddingTop: theme.spacing(1),
+  }),
+});

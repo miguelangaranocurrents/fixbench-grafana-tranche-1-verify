@@ -1,0 +1,41 @@
+import { dump } from 'js-yaml';
+import * as React from 'react';
+
+import { isSupportedExternalPrometheusFlavoredRulesSourceType } from '@grafana/alerting/internal';
+import { type DataSourceInstanceListItem } from '@grafana/data';
+import { type AlertDataQuery } from 'app/types/unified-alerting-dto';
+
+import { DataSourceType } from '../../../../utils/datasource';
+import { isPromOrLokiQuery } from '../../../../utils/rule-form';
+
+import { SQLQueryPreview, isSQLLikeQuery } from './SQLQueryPreview';
+
+const PrometheusQueryPreview = React.lazy(() => import('./PrometheusQueryPreview'));
+const LokiQueryPreview = React.lazy(() => import('./LokiQueryPreview'));
+
+interface DatasourceModelPreviewProps {
+  model: AlertDataQuery;
+  dataSource: DataSourceInstanceListItem;
+}
+
+function DatasourceModelPreview({ model, dataSource: datasource }: DatasourceModelPreviewProps): React.ReactNode {
+  if (isSupportedExternalPrometheusFlavoredRulesSourceType(datasource.type) && isPromOrLokiQuery(model)) {
+    return <PrometheusQueryPreview query={model.expr} />;
+  }
+
+  if (datasource.type === DataSourceType.Loki && isPromOrLokiQuery(model)) {
+    return <LokiQueryPreview query={model.expr ?? ''} />;
+  }
+
+  if (isSQLLikeQuery(model)) {
+    return <SQLQueryPreview expression={model.rawSql} />;
+  }
+
+  return (
+    <pre>
+      <code>{dump(model)}</code>
+    </pre>
+  );
+}
+
+export { DatasourceModelPreview };

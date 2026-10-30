@@ -1,0 +1,171 @@
+import { type BuildInfo } from '@grafana/data';
+import {
+  type EchoBackend,
+  EchoEventType,
+  type ExperimentViewEchoEvent,
+  type InteractionEchoEvent,
+  isExperimentViewEvent,
+  isInteractionEvent,
+  isPageviewEvent,
+  type PageviewEchoEvent,
+} from '@grafana/runtime';
+
+import { type User } from '../../../context_srv';
+import { loadScript } from '../../utils';
+
+type Properties = Record<string, string | boolean | number>;
+
+interface Rudderstack {
+  identify: (identifier: string, traits: Properties) => void;
+  load: (
+    writeKey: string,
+    dataPlaneURL: string,
+    options: {
+      configUrl?: string;
+      destSDKBaseURL?: string;
+      storage?: {
+        encryption?: {
+          version: 'V3' | 'legacy';
+        };
+        migrate?: boolean;
+      };
+      queueOptions?: {
+        maxAttempts?: number;
+      };
+      useBeacon?: boolean;
+      beaconQueueOptions?: {
+        maxItems?: number;
+        flushQueueInterval?: number;
+      };
+    }
+  ) => void;
+  page: () => void;
+  track: (eventName: string, properties?: Properties) => void;
+}
+
+declare global {
+  interface Window {
+    // We say all methods are undefined because we can't be sure they're there
+    // and we should be extra cautious
+    rudderanalytics?: Partial<Rudderstack>;
+  }
+}
+
+export interface RudderstackBackendOptions {
+  writeKey: string;
+  dataPlaneUrl: string;
+  buildInfo: BuildInfo;
+  user?: User;
+  sdkUrl?: string;
+  configUrl?: string;
+  integrationsUrl?: string;
+  batchInterval?: number;
+}
+
+export class RudderstackBackend
+  implements EchoBackend<PageviewEchoEvent | InteractionEchoEvent | ExperimentViewEchoEvent, RudderstackBackendOptions>
+{
+  supportedEvents = [EchoEventType.Pageview, EchoEventType.Interaction, EchoEventType.ExperimentView];
+
+  constructor(public options: RudderstackBackendOptions) {
+    const url = options.sdkUrl || `https://cdn.rudderlabs.com/v3/modern/rsa.min.js`;
+    loadScript(url);
+
+    // this preloadRudderstack functionality is mirror the loading snippet reference in the Rudderstack
+    // docs here: https://www.rudderstack.com/docs/sources/event-streams/sdks/rudderstack-javascript-sdk/installation/#using-cdn
+    // We don't need a bunch of what's in the snippet, and we can rely on browser support being modern,
+    // so this is much more terse and only needs to handle the temp setup that pushes calls to the
+    // rudderstack API into the temp array.
+    const preloadRudderstack: unknown[] = [];
+
+    const methodNames = [
+      'setDefaultInstanceKey',
+      'load',
+      'ready',
+      'page',
+      'track',
+      'identify',
+      'alias',
+      'group',
+      'reset',
+      'setAnonymousId',
+      'startSession',
+      'endSession',
+      'consent',
+      'addCustomIntegration',
+    ];
+
+    methodNames.forEach((methodName) => {
+      // using Object.assign gets around the types being "wrong".
+      Object.assign(preloadRudderstack, {
+        [methodName]: function () {
+          preloadRudderstack.push([methodName].concat(Array.prototype.slice.call(arguments)));
+        },
+      });
+    });
+
+    Object.assign(window, { rudderanalytics: preloadRudderstack });
+
+    window.rudderanalytics?.load?.(options.writeKey, options.dataPlaneUrl, {
+      configUrl: options.configUrl,
+      destSDKBaseURL: options.integrationsUrl,
+      // these storage settings allow backwards compat across subdomains with the older rudderstack
+      // version. This would have to be changed to the new setting across all instances at once,
+      // and wouldn't be able to be rolled back.
+      storage: {
+        encryption: {
+          version: 'legacy',
+        },
+        migrate: false,
+      },
+      // reduce the maximum number of retries for failed requests to avoid network spam.
+      queueOptions: {
+        maxAttempts: 3,
+      },
+      // enable batching via beacon of the events we generate to reduce network spam.
+      // xhr queue defaults to 100 items, beacon queue defaults to 10 items, meet in the middle.
+      useBeacon: (options.batchInterval ?? 0) > 0,
+      beaconQueueOptions: {
+        maxItems: 50,
+        flushQueueInterval: options.batchInterval ?? 0,
+      },
+    });
+
+    if (options.user) {
+      const { identifier } = options.user.analytics;
+
+      window.rudderanalytics?.identify?.(identifier, {
+        email: options.user.email,
+        orgId: options.user.orgId,
+        language: options.user.language,
+        version: options.buildInfo.version,
+        edition: options.buildInfo.edition,
+      });
+    }
+  }
+
+  addEvent = (e: PageviewEchoEvent | InteractionEchoEvent | ExperimentViewEchoEvent) => {
+    if (!window.rudderanalytics) {
+      return;
+    }
+
+    if (isPageviewEvent(e)) {
+      window.rudderanalytics.page?.();
+    }
+
+    if (isInteractionEvent(e)) {
+      window.rudderanalytics.track?.(e.payload.interactionName, e.payload.properties);
+    }
+
+    if (isExperimentViewEvent(e)) {
+      window.rudderanalytics.track?.('experiment_viewed', {
+        experiment_id: e.payload.experimentId,
+        experiment_group: e.payload.experimentGroup,
+        experiment_variant: e.payload.experimentVariant,
+      });
+    }
+  };
+
+  // Not using Echo buffering, addEvent above sends events to GA as soon as they appear
+  flush = () => {};
+}

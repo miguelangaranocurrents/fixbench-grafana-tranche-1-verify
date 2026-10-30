@@ -1,0 +1,514 @@
+package apistore
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+	"uuid"
+
+	authlib "github.com/grafana/authlib/types"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/storage"
+
+	"github.com/grafana/grafana-app-sdk/logging"
+	folders "github.com/grafana/grafana/apps/folder/pkg/apis/folder/v1"
+	common "github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
+	"github.com/grafana/grafana/pkg/apimachinery/utils"
+	secrets "github.com/grafana/grafana/pkg/storage/unified/apistore/securevalue"
+	"github.com/grafana/grafana/pkg/storage/unified/resourceclient/resourceutil"
+	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+)
+
+type objectForStorage struct {
+	// The value to save in unistore
+	raw json.RawMessage
+
+	// Reference to the owner object
+	ref common.ObjectReference
+
+	// apply permissions after create (defined in the resource body)
+	grantPermissions string
+
+	// Synchronous AfterCreate permissions -- allows users to become "admin" of the thing they made
+	permissionCreator permissionCreatorFunc
+
+	// These secrets where created, should be cleaned up if storage fails
+	createdSecureValues []string
+
+	// These should be deleted if storage succeeds
+	deleteSecureValues []string
+
+	// We know something changed
+	// This will ensure that the generation increments
+	hasChanged bool
+}
+
+func (v *objectForStorage) finish(ctx context.Context, err error, secrets secrets.InlineSecureValueSupport) error {
+	if err != nil {
+		// Remove the secure values that were created
+		for _, s := range v.createdSecureValues {
+			if e := secrets.DeleteWhenOwnedByResource(ctx, v.ref, s); e != nil {
+				logging.FromContext(ctx).Warn("unable to clean up new secure value", "name", s, "err", e)
+			}
+		}
+		return err
+	}
+
+	// Delete secure values after successfully saving the object
+	if len(v.deleteSecureValues) > 0 {
+		for _, s := range v.deleteSecureValues {
+			if e := secrets.DeleteWhenOwnedByResource(ctx, v.ref, s); e != nil {
+				logging.FromContext(ctx).Warn("unable to clean up new secure value", "name", s, "err", e)
+			}
+		}
+	}
+
+	// Create permissions
+	if v.permissionCreator != nil {
+		return v.permissionCreator(ctx)
+	}
+
+	return nil
+}
+
+// verifyFolder enforces the folder-annotation contract on write.
+//
+//   - EnableFolderSupport=false: the resource does not live in the folder tree
+//     at all; reject any write that sets the folder annotation.
+//   - EnableFolderSupport=true and RequireFolder=false: any folder value is
+//     accepted (including empty / root).
+//   - EnableFolderSupport=true and RequireFolder=true: the folder annotation
+//     must be present and non-root; resources of this kind must live in a real
+//     folder.
+func (s *Storage) verifyFolder(obj utils.GrafanaMetaAccessor) error {
+	folderUID := obj.GetFolder()
+	if !s.opts.EnableFolderSupport {
+		if folderUID == "" {
+			return nil
+		}
+		return apierrors.NewInvalid(
+			obj.GetGroupVersionKind().GroupKind(),
+			obj.GetName(),
+			field.ErrorList{
+				field.Forbidden(
+					field.NewPath("metadata", "annotations").Key(utils.AnnoKeyFolder),
+					fmt.Sprintf("folders are not supported for %s", s.gr.String()),
+				),
+			},
+		)
+	}
+	if !s.opts.RequireFolder {
+		return nil
+	}
+	if folderUID == "" {
+		return apierrors.NewInvalid(
+			obj.GetGroupVersionKind().GroupKind(),
+			obj.GetName(),
+			field.ErrorList{
+				field.Required(
+					field.NewPath("metadata", "annotations").Key(utils.AnnoKeyFolder),
+					fmt.Sprintf("folder is required for %s", s.gr.String()),
+				),
+			},
+		)
+	}
+	if isRootFolderUID(folderUID) {
+		return apierrors.NewInvalid(
+			obj.GetGroupVersionKind().GroupKind(),
+			obj.GetName(),
+			field.ErrorList{
+				field.Forbidden(
+					field.NewPath("metadata", "annotations").Key(utils.AnnoKeyFolder),
+					fmt.Sprintf("%s cannot be created in the root folder", s.gr.String()),
+				),
+			},
+		)
+	}
+	return nil
+}
+
+// Called on create
+func (s *Storage) prepareObjectForStorage(ctx context.Context, newObject runtime.Object) (objectForStorage, error) {
+	v := objectForStorage{}
+	info, ok := authlib.AuthInfoFrom(ctx)
+	if !ok {
+		return v, errors.New("missing auth info")
+	}
+	s.checkGVK(newObject)
+
+	obj, err := utils.MetaAccessor(newObject)
+	if err != nil {
+		return v, err
+	}
+	if obj.GetName() == "" {
+		return v, storage.NewInvalidObjError("", "missing name")
+	}
+	if obj.GetResourceVersion() != "" {
+		return v, storage.ErrResourceVersionSetOnCreate
+	}
+	if obj.GetUID() == "" {
+		obj.SetUID(types.UID(uuid.NewV4().String()))
+	}
+	if err = s.verifyFolder(obj); err != nil {
+		return v, err
+	}
+	if s.opts.MaximumNameLength > 0 && len(obj.GetName()) > s.opts.MaximumNameLength {
+		return v, apierrors.NewBadRequest(fmt.Sprintf("name exceeds maximum length (%d)", s.opts.MaximumNameLength))
+	}
+
+	v.grantPermissions = obj.GetAnnotation(utils.AnnoKeyGrantPermissions)
+	if v.grantPermissions != "" {
+		obj.SetAnnotation(utils.AnnoKeyGrantPermissions, "") // remove the annotation
+	}
+	if err := checkManagerPropertiesOnCreate(info, obj); err != nil {
+		return v, err
+	}
+	if err := s.ensureRepoManagedByParentFolder(ctx, obj); err != nil {
+		return v, err
+	}
+
+	// Make sure the deprecated internal ID is valid
+	id := obj.GetDeprecatedInternalID() // nolint:staticcheck
+	// nolint:staticcheck
+	switch {
+	case id > 0:
+		if s.opts.DeprecatedInternalID == DeprecatedID_None {
+			return v, apierrors.NewBadRequest("internal ID is not supported")
+		}
+		if err := s.ensureSingleDeprecatedInternalID(ctx, id, obj); err != nil {
+			return v, err
+		}
+	case s.opts.DeprecatedInternalID == DeprecatedID_Required:
+		// the ID must be smaller than 9007199254740991, otherwise we will lose precision
+		// on the frontend, which uses the number type to store ids. The largest safe number in
+		// javascript is 9007199254740991, compared to 9223372036854775807 as the max int64
+		obj.SetDeprecatedInternalID(s.snowflake.Generate().Int64() & ((1 << 52) - 1))
+	case s.opts.DeprecatedInternalID == DeprecatedID_None:
+		obj.SetDeprecatedInternalID(0) // remove it
+	}
+
+	obj.SetGenerateName("") // Clear the random name field
+	obj.SetResourceVersion("")
+	obj.SetSelfLink("")
+
+	obj.SetUpdatedBy("")
+	obj.SetUpdatedTimestamp(nil)
+	createdBy := info.GetUID()
+	if metaUID, ok := identity.MetadataIdentityUIDFrom(ctx); ok {
+		createdBy = metaUID
+	}
+	obj.SetCreatedBy(createdBy)
+	obj.SetGeneration(1) // the first time we write
+
+	err = prepareSecureValues(ctx, s.opts.SecureValues, obj, nil, s.ownerReference(obj), &v)
+	if err != nil {
+		return v, err
+	}
+
+	v.raw, err = s.encode(ctx, newObject, true)
+	return v, err
+}
+
+// ensureSingleDeprecatedInternalID rejects a write when the requested internal
+// ID is already in use. This is best effort, not a guarantee: the check queries
+// an eventually-consistent search index and is not atomic with the write, so
+// concurrent (or rapid sequential, before the index catches up) writes with the
+// same ID can both pass. It catches the common accidental-duplicate case, not
+// races.
+func (s *Storage) ensureSingleDeprecatedInternalID(ctx context.Context, id int64, obj utils.GrafanaMetaAccessor) error {
+	if s.opts.Index == nil {
+		// The storage was not configured to verify uniqueness
+		return nil
+	}
+	rsp, err := s.opts.Index.Search(ctx, &resourcepb.ResourceSearchRequest{
+		Limit: 1, // we only need to know if any match exists
+		// An empty projection returns every field; name keeps this key-only.
+		Fields:       []string{resourceutil.SEARCH_FIELD_NAME},
+		ResultFormat: resourcepb.ResourceSearchRequest_FIELD_VALUES,
+		Options: &resourcepb.ListOptions{
+			Key: &resourcepb.ResourceKey{
+				Group:     s.storageGroup(),
+				Resource:  s.gr.Resource,
+				Namespace: obj.GetNamespace(),
+			},
+			Labels: []*resourcepb.Requirement{{
+				Key:      utils.LabelKeyDeprecatedInternalID,
+				Operator: string(selection.Equals),
+				Values:   []string{strconv.FormatInt(id, 10)},
+			}},
+		},
+	})
+	// A failed search returns no rows, which would otherwise pass as "the ID is free".
+	if err := resourceutil.StatusErrorFromResponse(rsp.GetError(), err); err != nil {
+		return err
+	}
+	hasResults, err := searchResponseHasRows(rsp)
+	if err != nil {
+		return err
+	}
+	if hasResults {
+		return apierrors.NewConflict(s.gr, obj.GetName(),
+			fmt.Errorf("deprecatedInternalID=%d is already in use", id))
+	}
+	return nil
+}
+
+func searchResponseHasRows(rsp *resourcepb.ResourceSearchResponse) (bool, error) {
+	if rsp == nil {
+		return false, errors.New("nil search response")
+	}
+	switch rsp.GetResultFormat() {
+	case resourcepb.ResourceSearchRequest_UNSPECIFIED, resourcepb.ResourceSearchRequest_RESOURCE_TABLE:
+		return len(rsp.GetResults().GetRows()) > 0, nil
+	case resourcepb.ResourceSearchRequest_FIELD_VALUES:
+		return len(rsp.GetRows()) > 0, nil
+	default:
+		return false, fmt.Errorf("unsupported search result format %d", rsp.GetResultFormat())
+	}
+}
+
+// Called on update
+func (s *Storage) prepareObjectForUpdate(ctx context.Context, updateObject runtime.Object, previousObject runtime.Object) (objectForStorage, error) {
+	v := objectForStorage{}
+	info, ok := authlib.AuthInfoFrom(ctx)
+	if !ok {
+		return v, errors.New("missing auth info")
+	}
+	s.checkGVK(updateObject)
+
+	obj, err := utils.MetaAccessor(updateObject)
+	if err != nil {
+		return v, err
+	}
+	if obj.GetName() == "" {
+		return v, fmt.Errorf("updated object must have a name")
+	}
+
+	previous, err := utils.MetaAccessor(previousObject)
+	if err != nil {
+		return v, err
+	}
+
+	if previous.GetUID() == "" {
+		logging.FromContext(ctx).Error("object is missing UID", "gvk", obj.GetGroupVersionKind().String(), "name", obj.GetName())
+	} else if obj.GetUID() != previous.GetUID() {
+		// Eventually this should be a real error or logged
+		// However the dashboard dual write behavior hits this every time, so we will ignore it
+		// if obj.GetUID() != "" {
+		// 	logging.FromContext(ctx).Error("object UID mismatch", "gvk", obj.GetGroupVersionKind().String(), "was", previous.GetUID(), "now", obj.GetUID())
+		// }
+		obj.SetUID(previous.GetUID())
+	}
+
+	if obj.GetName() != previous.GetName() {
+		return v, fmt.Errorf("name mismatch between existing and updated object")
+	}
+
+	obj.SetCreatedBy(previous.GetCreatedBy())
+	obj.SetCreationTimestamp(previous.GetCreationTimestamp())
+	obj.SetResourceVersion("")                           // removed from saved JSON because the RV is not yet calculated
+	obj.SetAnnotation(utils.AnnoKeyGrantPermissions, "") // Grant is ignored for update requests
+
+	// Make sure the deprecated internalID does not change
+	obj.SetDeprecatedInternalID(previous.GetDeprecatedInternalID()) // nolint:staticcheck
+
+	err = prepareSecureValues(ctx, s.opts.SecureValues, obj, previous, s.ownerReference(obj), &v)
+	if err != nil {
+		return v, err
+	}
+
+	// Check if we should bump the generation
+	if obj.GetFolder() != previous.GetFolder() {
+		if err = s.verifyFolder(obj); err != nil {
+			return v, err
+		}
+		if err := s.ensureRepoManagedByParentFolder(ctx, obj); err != nil {
+			return v, err
+		}
+		v.hasChanged = true
+	} else if obj.GetDeletionTimestamp() != nil && previous.GetDeletionTimestamp() == nil {
+		v.hasChanged = true // bump generation when deleted
+	} else if !v.hasChanged {
+		spec, e1 := obj.GetSpec()
+		oldSpec, e2 := previous.GetSpec()
+		if e1 == nil && e2 == nil {
+			if !apiequality.Semantic.DeepEqual(spec, oldSpec) {
+				v.hasChanged = true
+			}
+		}
+	}
+
+	if err := checkManagerPropertiesOnUpdateSpec(info, obj, previous); err != nil {
+		return v, err
+	}
+
+	// If staying in the same folder but manager properties changed, re-validate
+	// consistency with the parent folder. Without this, removing or changing
+	// manager annotations would leave unmanaged resources in a repo-managed folder.
+	if obj.GetFolder() != "" && obj.GetFolder() == previous.GetFolder() {
+		newMgr, newOk := obj.GetManagerProperties()
+		oldMgr, oldOk := previous.GetManagerProperties()
+		if newOk != oldOk || newMgr != oldMgr {
+			if err := s.ensureRepoManagedByParentFolder(ctx, obj); err != nil {
+				return v, err
+			}
+		}
+	}
+
+	// Mark the resource as changed
+	if v.hasChanged {
+		obj.SetGeneration(previous.GetGeneration() + 1)
+		updatedBy := info.GetUID()
+		if metaUID, ok := identity.MetadataIdentityUIDFrom(ctx); ok {
+			updatedBy = metaUID
+		}
+		obj.SetUpdatedBy(updatedBy)
+		obj.SetUpdatedTimestampMillis(time.Now().UnixMilli())
+	} else {
+		obj.SetGeneration(previous.GetGeneration())
+		obj.SetAnnotation(utils.AnnoKeyUpdatedBy, previous.GetAnnotation(utils.AnnoKeyUpdatedBy))
+		obj.SetAnnotation(utils.AnnoKeyUpdatedTimestamp, previous.GetAnnotation(utils.AnnoKeyUpdatedTimestamp))
+	}
+
+	// Enforce the cap on updates too, so an object stored above the cap cannot keep being mutated — except
+	// for deletion. A soft delete sets the deletionTimestamp (and finalizer/status writes run while it is
+	// set); exempt those so an already-over-cap object stays removable. Net: over-cap objects are drain-only.
+	deleting := obj.GetDeletionTimestamp() != nil || previous.GetDeletionTimestamp() != nil
+	v.raw, err = s.encode(ctx, updateObject, !deleting)
+	return v, err
+}
+
+func (s *Storage) ensureRepoManagedByParentFolder(ctx context.Context, obj utils.GrafanaMetaAccessor) error {
+	if !s.opts.EnableFolderSupport || isRootFolderUID(obj.GetFolder()) {
+		return nil
+	}
+	folder, err := s.getParentFolder(ctx, obj)
+	if err != nil {
+		return err
+	}
+	if folder == nil {
+		return nil
+	}
+	return ensureSameRepoManager(folder, obj)
+}
+
+// getParentFolder fetches the folder that contains obj. Returns (nil, nil)
+// when the dynamic client is not available, signalling the caller to skip
+// the consistency check.
+func (s *Storage) getParentFolder(ctx context.Context, obj utils.GrafanaMetaAccessor) (utils.GrafanaMetaAccessor, error) {
+	if s.getDynClient == nil {
+		logging.FromContext(ctx).Warn("skipping repo-manager consistency check: dynamic client not configured", "resource", s.gr.String())
+		return nil, nil
+	}
+	dynClient, err := s.getDynClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	name := obj.GetFolder()
+	gvr := folders.FolderResourceInfo.GroupVersionResource()
+	raw, err := dynClient.Resource(gvr).Namespace(obj.GetNamespace()).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read folder %s: %w", name, err)
+	}
+
+	return utils.MetaAccessor(raw)
+}
+
+// checkGVK completes obj's group+version+kind from [StorageOptions.GVK] when the
+// object does not carry a full one of its own. Serializers that do not infer the
+// GVK from a scheme need it populated to persist an apiVersion and kind.
+//
+// A resource that declares no GVK is left alone here for the serializer.
+func (s *Storage) checkGVK(obj runtime.Object) {
+	info := obj.GetObjectKind()
+	gvk := info.GroupVersionKind()
+	if gvk.Group != "" && gvk.Kind != "" && gvk.Version != "" {
+		return
+	}
+	if s.opts.GVK.Empty() {
+		return
+	}
+
+	gvk.Group = s.opts.GVK.Group
+	gvk.Kind = s.opts.GVK.Kind
+	if gvk.Version == "" {
+		gvk.Version = s.opts.GVK.Version
+	}
+	info.SetGroupVersionKind(gvk)
+}
+
+// encode returns the JSON representation of obj. enforceCap applies the group's maxAllowedVersion ceiling. Callers pass
+// true on create and on non-deletion updates; deletion-related updates pass false so an object already
+// stored above the cap stays removable (its deletion, finalizer and status writes all go through here).
+func (s *Storage) encode(ctx context.Context, obj runtime.Object, enforceCap bool) (json.RawMessage, error) {
+	s.checkGVK(obj)
+
+	raw, err := s.serializer.Encode(ctx, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	if !enforceCap || s.opts.VersionPolicy == nil || !s.opts.VersionPolicy.HasMaxAllowed(s.gr.Group) {
+		return raw, nil
+	}
+
+	gv := persistedVersion(raw, obj)
+	// A custom serializer may pick a GVK outside this resource's group. Such a version cannot be ranked
+	// against the group's cap (it would look unregistered and slip through), so reject rather than store it.
+	if gv.Group != s.storageGroup() {
+		return nil, apierrors.NewBadRequest(fmt.Sprintf(
+			"%s: encoded apiVersion group %q does not match storage group %q", s.gr.String(), gv.Group, s.storageGroup()))
+	}
+	if err := s.enforceMaxAllowedVersion(gv.Version); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// enforceMaxAllowedVersion rejects (never rewrites) a write whose version outranks the group's configured maxAllowedVersion.
+// This is a REST-write-path check in apistore.encode: it does not cover writes that bypass apistore (bulk
+// import via BulkStore, direct ResourceClient callers, migrations), and under legacy-primary dual-write an
+// over-cap write still lands in legacy while only the background unified copy is rejected.
+func (s *Storage) enforceMaxAllowedVersion(version string) error {
+	if s.opts.VersionPolicy == nil {
+		return nil
+	}
+	allowed, maxAllowed := s.opts.VersionPolicy.IsVersionAllowed(s.gr.Group, version)
+	if allowed {
+		return nil
+	}
+	return apierrors.NewBadRequest(fmt.Sprintf(
+		"%s: version %q exceeds the configured maximum version %s for group %s",
+		s.gr.String(), version, maxAllowed, s.gr.Group))
+}
+
+// persistedVersion reads the group/version actually written by the serializer, so the cap is enforced against
+// the stored version. It falls back to the object's declared GVK if the encoded form has no parseable
+// TypeMeta, so it never silently skips the cap.
+func persistedVersion(encoded []byte, obj runtime.Object) schema.GroupVersion {
+	var tm metav1.TypeMeta
+	if json.Unmarshal(encoded, &tm) == nil && tm.APIVersion != "" {
+		if gv, err := schema.ParseGroupVersion(tm.APIVersion); err == nil {
+			return gv
+		}
+	}
+	return obj.GetObjectKind().GroupVersionKind().GroupVersion()
+}
+
+// isRootFolderUID matches folder.IsRootFolderUID ("" is the legacy root, "general" the canonical
+// one). apistore cannot import pkg/services/folder, which is in the core module.
+func isRootFolderUID(uid string) bool {
+	return uid == "" || uid == "general"
+}

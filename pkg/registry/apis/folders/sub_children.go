@@ -1,0 +1,231 @@
+package folders
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apiserver/pkg/registry/rest"
+
+	"github.com/grafana/grafana-app-sdk/logging"
+	folders "github.com/grafana/grafana/apps/folder/pkg/apis/folder/v1"
+	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
+	"github.com/grafana/grafana/pkg/services/folder"
+	"github.com/grafana/grafana/pkg/storage/unified/resource"
+	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+)
+
+const (
+	childrenDefaultLimit = 500
+	childrenMaxLimit     = 500
+)
+
+type subChildrenREST struct {
+	getter   rest.Getter
+	searcher resourcepb.ResourceIndexClient
+}
+
+var _ rest.Connecter = (*subChildrenREST)(nil)
+var _ rest.StorageMetadata = (*subChildrenREST)(nil)
+
+func (r *subChildrenREST) New() runtime.Object {
+	return &folders.FolderList{}
+}
+
+func (r *subChildrenREST) Destroy() {
+}
+
+func (r *subChildrenREST) ProducesMIMETypes(verb string) []string {
+	return nil
+}
+
+func (r *subChildrenREST) ProducesObject(verb string) interface{} {
+	return &folders.FolderList{}
+}
+
+func (r *subChildrenREST) ConnectMethods() []string {
+	return []string{"GET"}
+}
+
+func (r *subChildrenREST) NewConnectOptions() (runtime.Object, bool, string) {
+	return nil, false, ""
+}
+
+func (r *subChildrenREST) Connect(ctx context.Context, name string, _ runtime.Object, responder rest.Responder) (http.Handler, error) {
+	if name == folder.GeneralFolderUID {
+		name = ""
+	} else if _, err := r.getter.Get(ctx, name, &v1.GetOptions{}); err != nil {
+		return nil, err
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ns, err := request.NamespaceInfoFrom(ctx, true)
+		if err != nil {
+			responder.Error(err)
+			return
+		}
+
+		limit, offset, err := parseChildrenPaging(req)
+		if err != nil {
+			responder.Error(err)
+			return
+		}
+
+		gvr := folders.FolderResourceInfo.GroupVersionResource()
+		resp, err := r.searcher.Search(ctx, &resourcepb.ResourceSearchRequest{
+			Options: &resourcepb.ListOptions{
+				Key: &resourcepb.ResourceKey{
+					Namespace: ns.Value,
+					Group:     gvr.Group,
+					Resource:  gvr.Resource,
+				},
+				Fields: []*resourcepb.Requirement{{
+					Key:      resource.SEARCH_FIELD_FOLDER,
+					Operator: string(selection.Equals),
+					Values:   []string{name},
+				}},
+			},
+			Fields: []string{
+				resource.SEARCH_FIELD_TITLE,
+				resource.SEARCH_FIELD_RV,
+			},
+			Limit:        limit,
+			Offset:       offset,
+			ResultFormat: resourcepb.ResourceSearchRequest_FIELD_VALUES,
+		})
+		if err := resource.StatusErrorFromResponse(resp.GetError(), err); err != nil {
+			logging.FromContext(ctx).Error("Failed to search child folders", "namespace", ns.Value, "folder", name, "error", err)
+			responder.Error(err)
+			return
+		}
+
+		rows, err := decodeSearchRows(resp)
+		if err != nil {
+			responder.Error(err)
+			return
+		}
+
+		children := &folders.FolderList{Items: make([]folders.Folder, 0, len(rows))}
+		if resp.ResourceVersion > 0 {
+			children.ResourceVersion = strconv.FormatInt(resp.ResourceVersion, 10)
+		}
+		for _, row := range rows {
+			f := folders.Folder{}
+			f.Name = row.key.Name
+			f.Namespace = row.key.Namespace
+			if row.resourceVersion > 0 {
+				f.ResourceVersion = strconv.FormatInt(row.resourceVersion, 10)
+			}
+			f.Spec.Title = row.title
+			children.Items = append(children.Items, f)
+		}
+
+		total := resp.TotalHits
+		if offset+int64(len(rows)) < total {
+			children.Continue = strconv.FormatInt(offset+int64(len(rows)), 10)
+		}
+		if total > 0 {
+			remaining := total - (offset + int64(len(rows)))
+			if remaining > 0 {
+				children.RemainingItemCount = &remaining
+			}
+		}
+
+		responder.Object(http.StatusOK, children)
+	}), nil
+}
+
+// The continue token is a raw decimal offset, not an opaque k8s token.
+// Offset paging over a live index may skip or duplicate items across pages.
+func parseChildrenPaging(req *http.Request) (int64, int64, error) {
+	q := req.URL.Query()
+	limit := int64(childrenDefaultLimit)
+	if v := q.Get("limit"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || parsed < 0 {
+			return 0, 0, apierrors.NewBadRequest(fmt.Sprintf("invalid limit: %q", v))
+		}
+		if parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > childrenMaxLimit {
+		limit = childrenMaxLimit
+	}
+
+	var offset int64
+	if v := q.Get("continue"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || parsed < 0 {
+			return 0, 0, apierrors.NewBadRequest(fmt.Sprintf("invalid continue token: %q", v))
+		}
+		offset = parsed
+	}
+	return limit, offset, nil
+}
+
+type decodedSearchRow struct {
+	key             *resourcepb.ResourceKey
+	resourceVersion int64
+	title           string
+}
+
+func decodeSearchRows(response *resourcepb.ResourceSearchResponse) ([]decodedSearchRow, error) {
+	if response == nil {
+		return nil, nil
+	}
+
+	switch response.GetResultFormat() {
+	case resourcepb.ResourceSearchRequest_UNSPECIFIED, resourcepb.ResourceSearchRequest_RESOURCE_TABLE:
+		table := response.GetResults()
+		if table == nil {
+			return nil, nil
+		}
+		titleIndex := -1
+		for i, column := range table.Columns {
+			if column.GetName() == resource.SEARCH_FIELD_TITLE {
+				titleIndex = i
+				break
+			}
+		}
+		rows := make([]decodedSearchRow, 0, len(table.Rows))
+		for _, row := range table.Rows {
+			if row == nil || row.Key == nil {
+				continue
+			}
+			decoded := decodedSearchRow{key: row.Key, resourceVersion: row.ResourceVersion}
+			if titleIndex >= 0 && titleIndex < len(row.Cells) {
+				decoded.title = string(row.Cells[titleIndex])
+			}
+			rows = append(rows, decoded)
+		}
+		return rows, nil
+
+	case resourcepb.ResourceSearchRequest_FIELD_VALUES:
+		rows := make([]decodedSearchRow, 0, len(response.Rows))
+		for i, row := range response.Rows {
+			if row == nil || row.Key == nil {
+				continue
+			}
+			values, err := resource.DecodeSearchValues(response.Fields, row)
+			if err != nil {
+				return nil, fmt.Errorf("decoding search result row %d: %w", i, err)
+			}
+			title, _ := values[resource.SEARCH_FIELD_TITLE].(string)
+			rows = append(rows, decodedSearchRow{
+				key:             row.Key,
+				resourceVersion: row.ResourceVersion,
+				title:           title,
+			})
+		}
+		return rows, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported search result format %d", response.GetResultFormat())
+	}
+}

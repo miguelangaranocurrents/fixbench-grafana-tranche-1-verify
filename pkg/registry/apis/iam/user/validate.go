@@ -1,0 +1,225 @@
+package user
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/grafana/authlib/types"
+	iamv0alpha1 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
+	"github.com/grafana/grafana/pkg/storage/legacysql/dualwrite"
+)
+
+func ValidateOnCreate(ctx context.Context, search *dualwrite.Selector[SearchBackend], obj *iamv0alpha1.User) error {
+	requester, err := identity.GetRequester(ctx)
+	if err != nil {
+		return apierrors.NewUnauthorized("no identity found")
+	}
+
+	// Temporary validation that the user is not trying to create a Grafana Admin without being a Grafana Admin.
+	if obj.Spec.GrafanaAdmin && !requester.GetIsGrafanaAdmin() {
+		return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+			obj.Name,
+			fmt.Errorf("only grafana admins can create grafana admins"))
+	}
+
+	if obj.Spec.Login == "" && obj.Spec.Email == "" {
+		return apierrors.NewBadRequest("user must have either login or email")
+	}
+
+	if err := validateRole(requester, obj); err != nil {
+		return err
+	}
+
+	userSearchClient, err := search.Resolve(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateEmail(ctx, userSearchClient, obj.GetNamespace(), obj.Name, obj.Spec.Email); err != nil {
+		return err
+	}
+
+	if err := validateLogin(ctx, userSearchClient, obj.GetNamespace(), obj.Name, obj.Spec.Login); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ValidateOnUpdate(ctx context.Context, search *dualwrite.Selector[SearchBackend], oldObj, newObj *iamv0alpha1.User) error {
+	requester, err := identity.GetRequester(ctx)
+	if err != nil {
+		return apierrors.NewUnauthorized("no identity found")
+	}
+
+	isGrafanaAdmin := requester.GetIsGrafanaAdmin()
+	isServiceUser := requester.IsIdentityType(types.TypeAccessPolicy)
+
+	if !isGrafanaAdmin {
+		if newObj.Spec.Disabled != oldObj.Spec.Disabled {
+			return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+				newObj.Name,
+				fmt.Errorf("only grafana admins can disable or enable a user"))
+		}
+		if newObj.Spec.GrafanaAdmin != oldObj.Spec.GrafanaAdmin {
+			return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+				newObj.Name,
+				fmt.Errorf("only grafana admins can change grafana admin status"))
+		}
+	}
+
+	if !newObj.Spec.Provisioned && oldObj.Spec.Provisioned {
+		return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+			newObj.Name,
+			fmt.Errorf("provisioned user cannot be un-provisioned"))
+	}
+
+	if !isServiceUser {
+		if newObj.Spec.Provisioned && !oldObj.Spec.Provisioned {
+			return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+				newObj.Name,
+				fmt.Errorf("only service users can provision a user"))
+		}
+		if newObj.Spec.EmailVerified && !oldObj.Spec.EmailVerified {
+			return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+				newObj.Name,
+				fmt.Errorf("only service users can verify email"))
+		}
+	}
+
+	// Only service identities or Grafana admins may update profile fields (login, email, title, etc.).
+	// OrgAdmins are allowed through the RBAC gate with "org.users:write" but
+	// are restricted to only role updates.
+	if !isServiceUser && !isGrafanaAdmin && !onlyAllowedFieldsChanged(oldObj.Spec, newObj.Spec) {
+		return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+			newObj.Name,
+			fmt.Errorf("updating fields beyond org role requires service identity or grafana admin"))
+	}
+
+	if newObj.Spec.Login == "" && newObj.Spec.Email == "" {
+		return apierrors.NewBadRequest("user must have either login or email")
+	}
+
+	if newObj.Spec.Role != oldObj.Spec.Role {
+		if err := validateRole(requester, newObj); err != nil {
+			return err
+		}
+	} else if newObj.Spec.Role == "" {
+		return apierrors.NewBadRequest("role is required")
+	} else if !identity.RoleType(newObj.Spec.Role).IsValid() {
+		return apierrors.NewBadRequest(fmt.Sprintf("invalid role '%s'", newObj.Spec.Role))
+	}
+
+	if newObj.Spec.Email == oldObj.Spec.Email && newObj.Spec.Login == oldObj.Spec.Login {
+		return nil
+	}
+	userSearchClient, err := search.Resolve(ctx)
+	if err != nil {
+		return err
+	}
+
+	if newObj.Spec.Email != oldObj.Spec.Email {
+		if err := validateEmail(ctx, userSearchClient, newObj.GetNamespace(), newObj.Name, newObj.Spec.Email); err != nil {
+			return err
+		}
+	}
+
+	if newObj.Spec.Login != oldObj.Spec.Login {
+		if err := validateLogin(ctx, userSearchClient, newObj.GetNamespace(), newObj.Name, newObj.Spec.Login); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// allowedFieldsForNonServiceUsers lists the UserSpec fields that non-service users
+// are allowed to change. Role is the only one for now. Any field NOT in this set requires a service identity to modify.
+var allowedFieldsForNonServiceUsers = map[string]bool{
+	"Role": true,
+}
+
+// onlyAllowedFieldsChanged iterates over all fields of UserSpec via reflection and
+// returns true only if every field that changed is in the allowed set. This is
+// forward-compatible: any new field added to UserSpec is automatically restricted
+// to service identities without needing to update this function.
+func onlyAllowedFieldsChanged(oldSpec, newSpec iamv0alpha1.UserSpec) bool {
+	oldVal := reflect.ValueOf(oldSpec)
+	newVal := reflect.ValueOf(newSpec)
+
+	for i := range oldVal.NumField() {
+		if allowedFieldsForNonServiceUsers[oldVal.Type().Field(i).Name] {
+			continue
+		}
+		if !reflect.DeepEqual(oldVal.Field(i).Interface(), newVal.Field(i).Interface()) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateRole(requester identity.Requester, obj *iamv0alpha1.User) error {
+	if obj.Spec.Role == "" {
+		return apierrors.NewBadRequest("role is required")
+	}
+
+	requestedRole := identity.RoleType(obj.Spec.Role)
+	if !requestedRole.IsValid() {
+		return apierrors.NewBadRequest(fmt.Sprintf("invalid role '%s'", obj.Spec.Role))
+	}
+
+	if !requester.HasRole(requestedRole) {
+		return apierrors.NewForbidden(iamv0alpha1.UserResourceInfo.GroupResource(),
+			obj.Name,
+			fmt.Errorf("cannot assign a role higher than user's role"))
+	}
+
+	return nil
+}
+
+func validateEmail(ctx context.Context, searchClient SearchBackend, namespace, name, email string) error {
+	resp, err := searchClient.Search(ctx, SearchQuery{Namespace: namespace, Email: &email})
+	if err != nil {
+		return err
+	}
+
+	// FIXME(mgyongyosi): Improve the exact match validation
+
+	if resp.TotalHits > 0 {
+		// If the found user is the same as the one being created/updated, it's not a conflict.
+		// This is required for Mode 2 when the resource is written to LegacyStorage and UnifiedStorage.
+		if len(resp.Hits) > 0 && resp.Hits[0].Name == name {
+			return nil
+		}
+		return apierrors.NewConflict(iamv0alpha1.UserResourceInfo.GroupResource(),
+			name,
+			fmt.Errorf("email '%s' is already taken", email))
+	}
+
+	return nil
+}
+
+func validateLogin(ctx context.Context, searchClient SearchBackend, namespace, name, login string) error {
+	resp, err := searchClient.Search(ctx, SearchQuery{Namespace: namespace, Login: &login})
+	if err != nil {
+		return err
+	}
+
+	// FIXME(mgyongyosi): Improve the exact match validation
+
+	if resp.TotalHits > 0 {
+		// If the found user is the same as the one being created/updated, it's not a conflict.
+		// This is required for Mode 2 when the resource is written to LegacyStorage and UnifiedStorage.
+		if len(resp.Hits) > 0 && resp.Hits[0].Name == name {
+			return nil
+		}
+		return apierrors.NewConflict(iamv0alpha1.UserResourceInfo.GroupResource(),
+			name,
+			fmt.Errorf("login '%s' is already taken", login))
+	}
+
+	return nil
+}

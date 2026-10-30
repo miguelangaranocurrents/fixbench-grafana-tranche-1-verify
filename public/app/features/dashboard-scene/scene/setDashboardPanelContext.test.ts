@@ -1,0 +1,1157 @@
+import { act, renderHook } from '@testing-library/react';
+import { createElement, type PropsWithChildren } from 'react';
+import { delay, of, Subject } from 'rxjs';
+
+import {
+  type AdHocVariableModel,
+  CoreApp,
+  EventBusSrv,
+  getDefaultTimeRange,
+  type GroupByVariableModel,
+  LoadingState,
+  type Scope,
+  type VariableModel,
+} from '@grafana/data';
+import { type BackendSrv, config, setBackendSrv } from '@grafana/runtime';
+import { FlagKeys, getFeatureFlagClient } from '@grafana/runtime/internal';
+import {
+  AdHocFiltersVariable,
+  GroupByVariable,
+  SceneDataNode,
+  sceneGraph,
+  SceneDataTransformer,
+  SceneQueryRunner,
+  SceneVariableSet,
+  VizPanel,
+} from '@grafana/scenes';
+import { type AdHocFilterItem, type PanelContext, PanelContextProvider, useAdHocTransformations } from '@grafana/ui';
+
+import { isAnnotationApiAvailable } from '../../annotations/isAnnotationApiAvailable';
+import { openPanelInspector } from '../inspect/panelInspectorOpener';
+import { buildPanelEditScene } from '../panel-edit/PanelEditor';
+import { transformSaveModelToScene } from '../serialization/transformSaveModelToScene';
+import { findVizPanelByKey } from '../utils/findVizPanel';
+import { getQueryRunnerFor } from '../utils/getQueryRunnerFor';
+
+import { DashboardScene } from './DashboardScene';
+import { AutoGridItem } from './layout-auto-grid/AutoGridItem';
+import { AutoGridLayout } from './layout-auto-grid/AutoGridLayout';
+import { AutoGridLayoutManager } from './layout-auto-grid/AutoGridLayoutManager';
+import { RowItem } from './layout-rows/RowItem';
+import { RowsLayoutManager } from './layout-rows/RowsLayoutManager';
+import { getAdHocFilterVariableFor, setDashboardPanelContext } from './setDashboardPanelContext';
+
+jest.mock('../inspect/panelInspectorOpener', () => ({
+  ...jest.requireActual('../inspect/panelInspectorOpener'),
+  openPanelInspector: jest.fn(),
+}));
+
+jest.mock('../../annotations/isAnnotationApiAvailable');
+jest.mock('@grafana/runtime/internal', () => ({
+  ...jest.requireActual('@grafana/runtime/internal'),
+  getFeatureFlagClient: jest.fn(),
+  getDatasourcePluginMeta: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('@grafana/runtime/unstable', () => ({
+  ...jest.requireActual('@grafana/runtime/unstable'),
+  getDataSourceInstance: jest.fn().mockResolvedValue({ uid: 'my-ds-uid', type: 'prometheus' }),
+  getDataSourceInstanceSettings: jest.fn().mockResolvedValue(undefined),
+}));
+
+const mockIsAssistantAvailable = jest.fn();
+const mockOpenAssistant = jest.fn();
+const mockCreateAssistantContextItem = jest.fn();
+
+jest.mock('@grafana/assistant', () => ({
+  isAssistantAvailable: () => mockIsAssistantAvailable(),
+  openAssistant: (...args: unknown[]) => mockOpenAssistant(...args),
+  createAssistantContextItem: (...args: unknown[]) => mockCreateAssistantContextItem(...args),
+}));
+
+// Opaque on purpose. The real `createAssistantContextItem` returns a `{ node: { ... } }` tree, so
+// standing in a different shape here and then asserting against that shape would pass no matter
+// how this call site drifted. Instead the tests assert the arguments we pass it (its real
+// signature still type-checks the call site) and that whatever it returns reaches `openAssistant`.
+const PANEL_CONTEXT_ITEM = Symbol('panel context item');
+
+const mockGetAssistantChatIdToContinue = jest.fn();
+
+jest.mock('app/core/assistant/assistantSidebarState', () => ({
+  getAssistantChatIdToContinue: () => mockGetAssistantChatIdToContinue(),
+}));
+
+const mockIsAnnotationApiAvailable = jest.mocked(isAnnotationApiAvailable);
+const mockGetFeatureFlagClient = jest.mocked(getFeatureFlagClient);
+const getBooleanValueFn = jest.fn();
+
+function stubFFEnabled(enabled: boolean) {
+  getBooleanValueFn.mockImplementation((key: string, defaultValue: boolean) =>
+    key === FlagKeys.GrafanaKubernetesAnnotationsClient ? enabled : defaultValue
+  );
+}
+
+const postFn = jest.fn();
+const putFn = jest.fn();
+const patchFn = jest.fn();
+const deleteFn = jest.fn();
+const getFn = jest.fn();
+
+setBackendSrv({
+  post: postFn,
+  put: putFn,
+  patch: patchFn,
+  delete: deleteFn,
+  get: getFn,
+} as unknown as BackendSrv);
+mockGetFeatureFlagClient.mockReturnValue({ getBooleanValue: getBooleanValueFn } as unknown as ReturnType<
+  typeof getFeatureFlagClient
+>);
+
+beforeEach(() => {
+  postFn.mockReset();
+  putFn.mockReset();
+  patchFn.mockReset();
+  deleteFn.mockReset();
+  getFn.mockReset();
+  mockIsAnnotationApiAvailable.mockReset();
+  getBooleanValueFn.mockReset();
+  stubFFEnabled(false);
+  mockIsAssistantAvailable.mockReset().mockReturnValue(of(false));
+  mockOpenAssistant.mockReset();
+  mockCreateAssistantContextItem.mockReset().mockReturnValue(PANEL_CONTEXT_ITEM);
+  mockGetAssistantChatIdToContinue.mockReset();
+});
+
+describe('setDashboardPanelContext', () => {
+  describe('adHocTransformations', () => {
+    it('reads and updates only the selected owner through the panel context hook', () => {
+      const { context } = buildTestScene({});
+      const api = context.adHocTransformations!;
+      api.set('table', [{ id: 'organize', options: {} }]);
+      api.set('other', [{ id: 'limit', options: { limitField: 2 } }]);
+      const { result, rerender } = renderHook(({ owner }) => useAdHocTransformations(owner), {
+        initialProps: { owner: 'table' },
+        wrapper: ({ children }: PropsWithChildren) => createElement(PanelContextProvider, { value: context }, children),
+      });
+
+      expect(result.current?.transformations).toEqual([{ id: 'organize', options: {} }]);
+      act(() => result.current?.setTransformations([]));
+      expect(api.get('table')).toEqual([]);
+      expect(api.get('other')).toEqual([{ id: 'limit', options: { limitField: 2 } }]);
+
+      rerender({ owner: 'other' });
+      act(() => api.set('table', [{ id: 'organize', options: {} }]));
+      expect(result.current?.transformations).toEqual([{ id: 'limit', options: { limitField: 2 } }]);
+      act(() => api.set('other', [{ id: 'limit', options: { limitField: 3 } }]));
+      expect(result.current?.transformations).toEqual([{ id: 'limit', options: { limitField: 3 } }]);
+    });
+
+    it('keeps each panel’s single view list and subscriptions independent', () => {
+      const first = buildTestScene({});
+      const second = buildTestScene({});
+      const firstApi = first.context.adHocTransformations!;
+      const secondApi = second.context.adHocTransformations!;
+      const firstChanged = jest.fn();
+      const secondChanged = jest.fn();
+      const unsubscribe = firstApi.subscribe('grafana:table-view', firstChanged);
+      const unsubscribeSecond = secondApi.subscribe('grafana:table-view', secondChanged);
+
+      firstApi.set('grafana:table-view', [{ id: 'organize', options: { excludeByName: { hidden: true } } }]);
+      secondApi.set('grafana:table-view', [{ id: 'limit', options: { limitField: 2 } }]);
+      firstApi.set('grafana:table-view', []);
+
+      expect(firstApi.get('grafana:table-view')).toEqual([]);
+      expect(secondApi.get('grafana:table-view')).toEqual([{ id: 'limit', options: { limitField: 2 } }]);
+      expect(firstChanged).toHaveBeenCalledTimes(2);
+      expect(secondChanged).toHaveBeenCalledTimes(1);
+      unsubscribe();
+      firstApi.set('grafana:table-view', [{ id: 'limit', options: { limitField: 1 } }]);
+      expect(firstChanged).toHaveBeenCalledTimes(2);
+      unsubscribeSecond();
+    });
+
+    it('replaces the entire view list with an immutable snapshot', () => {
+      const { context } = buildTestScene({});
+      const api = context.adHocTransformations!;
+      const configs = [{ id: 'limit', options: { limitField: 2 } }];
+      api.set('grafana:table-view', configs);
+      const snapshot = api.get('grafana:table-view');
+      configs[0].options.limitField = 99;
+
+      expect(api.get('grafana:table-view')).toBe(snapshot);
+      expect(api.get('grafana:table-view')).toEqual([{ id: 'limit', options: { limitField: 2 } }]);
+      expect(Object.isFrozen(snapshot[0].options)).toBe(true);
+      api.set('grafana:table-view', [{ id: 'organize', options: {} }]);
+      expect(api.get('grafana:table-view')).toEqual([{ id: 'organize', options: {} }]);
+    });
+
+    it('notifies subscribers when transformations are cleared or the panel plugin changes', () => {
+      const { context, vizPanel } = buildTestScene({});
+      const api = context.adHocTransformations!;
+      const changed = jest.fn();
+      const unsubscribe = api.subscribe('grafana:table-view', changed);
+
+      api.set('grafana:table-view', [{ id: 'organize', options: {} }]);
+      api.set('grafana:table-view', []);
+      expect(api.get('grafana:table-view')).toEqual([]);
+      expect(changed).toHaveBeenCalledTimes(2);
+      api.set('grafana:table-view', [{ id: 'limit', options: { limitField: 2 } }]);
+      expect(api.get('grafana:table-view')).toEqual([{ id: 'limit', options: { limitField: 2 } }]);
+      vizPanel.setState({ pluginId: 'table' });
+      expect(api.get('grafana:table-view')).toEqual([]);
+      expect(changed).toHaveBeenCalledTimes(4);
+      unsubscribe();
+    });
+
+    it('uses the panel runtime transformation controller across data replacements', () => {
+      const { context, vizPanel } = buildTestScene({ dashboardCanEdit: false });
+      const controller = vizPanel.getRuntimeTransformations();
+
+      expect(context.adHocTransformations).toBe(controller);
+      expect(context.adHocTransformations?.get('grafana:table-view')).toEqual([]);
+
+      controller.set('grafana:table-view', [{ id: 'organize', options: {} }]);
+      vizPanel.setState({ $data: new SceneDataTransformer({ transformations: [] }) });
+
+      expect(context.adHocTransformations).toBe(controller);
+      expect(context.adHocTransformations?.get('grafana:table-view')).toEqual([{ id: 'organize', options: {} }]);
+    });
+  });
+
+  describe('app', () => {
+    it('Is PanelEditor while the panel edit pane is open', () => {
+      const { scene, vizPanel, context } = buildTestScene({});
+
+      expect(context.app).toBe(CoreApp.Dashboard);
+
+      scene.onEnterEditMode();
+      scene.setState({ editPanel: buildPanelEditScene(vizPanel) });
+
+      expect(context.app).toBe(CoreApp.PanelEditor);
+    });
+
+    it('Still tracks the panel edit pane after the scene is deactivated and reactivated', async () => {
+      // Activating the scene resolves the panel datasource, which this suite does not register.
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const { scene, vizPanel, context } = buildTestScene({});
+
+      // Navigating away leaves the scene in the page cache, so the same context object is reused.
+      scene.activate()();
+      const deactivate = scene.activate();
+
+      scene.onEnterEditMode();
+      scene.setState({ editPanel: buildPanelEditScene(vizPanel) });
+
+      expect(context.app).toBe(CoreApp.PanelEditor);
+
+      deactivate();
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe('canAddAnnotations', () => {
+    it('Can add when builtIn is enabled and permissions allow', () => {
+      const { context } = buildTestScene({ builtInAnnotationsEnabled: true, dashboardCanEdit: true, canAdd: true });
+      expect(context.canAddAnnotations!()).toBe(true);
+    });
+
+    it('Can not when builtIn is disabled', () => {
+      const { context } = buildTestScene({ builtInAnnotationsEnabled: false, dashboardCanEdit: true, canAdd: true });
+      expect(context.canAddAnnotations!()).toBe(false);
+    });
+
+    it('Can not when permission do not allow', () => {
+      const { context } = buildTestScene({ builtInAnnotationsEnabled: true, dashboardCanEdit: true, canAdd: false });
+      expect(context.canAddAnnotations!()).toBe(false);
+    });
+  });
+
+  describe('canEditAnnotations', () => {
+    it('Can edit global event when user has org permission', () => {
+      const { context } = buildTestScene({ canEdit: true });
+      expect(context.canEditAnnotations!()).toBe(true);
+    });
+
+    it('Can not edit global event when has no org permission', () => {
+      const { context } = buildTestScene({ canEdit: false });
+      expect(context.canEditAnnotations!()).toBe(false);
+    });
+
+    it('Can edit dashboard event when has dashboard permission', () => {
+      const { context } = buildTestScene({ canEdit: true });
+      expect(context.canEditAnnotations!('dash-uid')).toBe(true);
+    });
+
+    it('Can not edit dashboard event when has no dashboard permission', () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canEdit: false });
+      expect(context.canEditAnnotations!('dash-uid')).toBe(false);
+    });
+  });
+
+  describe('canDeleteAnnotations', () => {
+    it('Can delete global event when user has org permission', () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canDelete: true });
+      expect(context.canDeleteAnnotations!()).toBe(true);
+    });
+
+    it('Can not delete global event when has no org permission', () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canDelete: false });
+      expect(context.canDeleteAnnotations!()).toBe(false);
+    });
+
+    it('Can delete dashboard event when has dashboard permission', () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canDelete: true });
+      expect(context.canDeleteAnnotations!('dash-uid')).toBe(true);
+    });
+
+    it('Can not delete dashboard event when has no dashboard permission', () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canDelete: false });
+      expect(context.canDeleteAnnotations!('dash-uid')).toBe(false);
+    });
+  });
+
+  describe('onAnnotationCreate', () => {
+    it('should create annotation', async () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+
+      await context.onAnnotationCreate!({ from: 100, to: 200, description: 'save it', tags: [] });
+
+      expect(postFn).toHaveBeenCalledWith('/api/annotations', {
+        dashboardUID: 'dash-1',
+        isRegion: true,
+        panelId: 4,
+        tags: [],
+        text: 'save it',
+        time: 100,
+        timeEnd: 200,
+      });
+    });
+
+    it('should POST to the k8s endpoint when the k8s annotation client is enabled and the API is discovered', async () => {
+      stubFFEnabled(true);
+      config.namespace = 'stack-1';
+      mockIsAnnotationApiAvailable.mockResolvedValue(true);
+      postFn.mockResolvedValue({});
+
+      const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+
+      await context.onAnnotationCreate!({ from: 100, to: 200, description: 'save it', tags: ['t'] });
+
+      expect(postFn).toHaveBeenCalledWith(
+        '/apis/annotation.grafana.app/v0alpha1/namespaces/stack-1/annotations',
+        expect.objectContaining({
+          kind: 'Annotation',
+          spec: expect.objectContaining({
+            dashboardUID: 'dash-1',
+            panelID: 4,
+            text: 'save it',
+            time: 100,
+            timeEnd: 200,
+            tags: ['t'],
+          }),
+        }),
+        expect.anything()
+      );
+    });
+
+    it('should include active scopes in k8s create request', async () => {
+      stubFFEnabled(true);
+      config.namespace = 'stack-1';
+      mockIsAnnotationApiAvailable.mockResolvedValue(true);
+      postFn.mockResolvedValue({});
+
+      const mockScope: Scope = { metadata: { name: 'scope-a' }, spec: { title: 'Scope A' } };
+      jest.spyOn(sceneGraph, 'getScopes').mockReturnValue([mockScope]);
+
+      try {
+        const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+        await context.onAnnotationCreate!({ from: 100, to: 200, description: 'with scope', tags: [] });
+
+        const [, body] = postFn.mock.calls[0];
+        expect(body.spec.scopes).toEqual(['scope-a']);
+      } finally {
+        jest.restoreAllMocks();
+      }
+    });
+  });
+
+  describe('onAnnotationUpdate', () => {
+    it('should update annotation', async () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+
+      await context.onAnnotationUpdate!({ from: 100, to: 200, id: 'event-id-123', description: 'updated', tags: [] });
+
+      expect(putFn).toHaveBeenCalledWith('/api/annotations/event-id-123', {
+        dashboardUID: 'dash-1',
+        isRegion: true,
+        panelId: 4,
+        tags: [],
+        text: 'updated',
+        time: 100,
+        timeEnd: 200,
+      });
+    });
+
+    it('should PATCH the k8s endpoint when the k8s annotation client is enabled and the API is discovered', async () => {
+      stubFFEnabled(true);
+      config.namespace = 'stack-1';
+      mockIsAnnotationApiAvailable.mockResolvedValue(true);
+      patchFn.mockResolvedValue({});
+
+      const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+
+      await context.onAnnotationUpdate!({ from: 100, to: 200, id: 'event-id-123', description: 'updated', tags: [] });
+
+      expect(getFn).not.toHaveBeenCalled();
+      expect(putFn).not.toHaveBeenCalled();
+      expect(patchFn).toHaveBeenCalledWith(
+        '/apis/annotation.grafana.app/v0alpha1/namespaces/stack-1/annotations/event-id-123',
+        expect.objectContaining({
+          spec: expect.objectContaining({ text: 'updated', time: 100, timeEnd: 200 }),
+        }),
+        expect.objectContaining({ headers: { 'Content-Type': 'application/merge-patch+json' } })
+      );
+    });
+
+    it('should include active scopes in k8s update request', async () => {
+      stubFFEnabled(true);
+      config.namespace = 'stack-1';
+      mockIsAnnotationApiAvailable.mockResolvedValue(true);
+      patchFn.mockResolvedValue({});
+
+      const mockScope: Scope = { metadata: { name: 'scope-b' }, spec: { title: 'Scope B' } };
+      jest.spyOn(sceneGraph, 'getScopes').mockReturnValue([mockScope]);
+
+      try {
+        const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+        await context.onAnnotationUpdate!({
+          from: 100,
+          to: 200,
+          id: 'event-id-123',
+          description: 'scoped update',
+          tags: [],
+        });
+
+        const [, body] = patchFn.mock.calls[0];
+        expect(body.spec.scopes).toEqual(['scope-b']);
+      } finally {
+        jest.restoreAllMocks();
+      }
+    });
+  });
+
+  describe('onAnnotationDelete', () => {
+    it('should delete annotation', async () => {
+      const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+
+      await context.onAnnotationDelete!('I-do-not-want-you');
+
+      expect(deleteFn).toHaveBeenCalledWith('/api/annotations/I-do-not-want-you');
+    });
+
+    it('should DELETE the k8s resource when the k8s annotation client is enabled and the API is discovered', async () => {
+      stubFFEnabled(true);
+      config.namespace = 'stack-1';
+      mockIsAnnotationApiAvailable.mockResolvedValue(true);
+      deleteFn.mockResolvedValue({});
+
+      const { context } = buildTestScene({ dashboardCanEdit: true, canAdd: true });
+
+      // Bare numeric id from the legacy /api/annotations response — the k8s client
+      // is responsible for prefixing it with "a-" before hitting the new endpoint.
+      await context.onAnnotationDelete!('123');
+
+      expect(deleteFn).toHaveBeenCalledWith(
+        '/apis/annotation.grafana.app/v0alpha1/namespaces/stack-1/annotations/a-123',
+        undefined,
+        { showSuccessAlert: false }
+      );
+    });
+  });
+
+  describe('while planning', () => {
+    // canAddAnnotations has no isEditing check: this is an immediate backend write, reachable by
+    // the ordinary drag-to-annotate gesture regardless of edit mode, so it's refused explicitly.
+    it('refuses to create, update or delete an annotation', async () => {
+      const { scene, context } = buildTestScene({
+        dashboardCanEdit: true,
+        canAdd: true,
+        canEdit: true,
+        canDelete: true,
+      });
+      scene.setState({
+        planning: { planId: 'plan-1', planTitle: 'Plan', onBuild: () => {}, onDismiss: () => {} },
+      });
+
+      await context.onAnnotationCreate!({ from: 100, to: 200, description: 'save it', tags: [] });
+      await context.onAnnotationUpdate!({ from: 100, to: 200, id: 'event-id-123', description: 'updated', tags: [] });
+      await context.onAnnotationDelete!('123');
+
+      expect(postFn).not.toHaveBeenCalled();
+      expect(putFn).not.toHaveBeenCalled();
+      expect(patchFn).not.toHaveBeenCalled();
+      expect(deleteFn).not.toHaveBeenCalled();
+    });
+
+    it('refuses to open the errors/notices popover inspector', async () => {
+      // A third route to inspect-panel, independent of the 'i' keyboard shortcut (guarded in
+      // keyboardShortcuts.ts) and the menu item (unreachable -- preview panels have no menu at
+      // all). Unreachable while the sample generator never reports an error, but guarded here
+      // directly rather than left open for when that changes.
+      getBooleanValueFn.mockImplementation(
+        (key: string, defaultValue: boolean) => key === FlagKeys.GrafanaNewPanelQueryErrorsUI || defaultValue
+      );
+      const { scene, context } = buildTestScene({ dashboardCanEdit: true });
+      scene.setState({
+        planning: { planId: 'plan-1', planTitle: 'Plan', onBuild: () => {}, onDismiss: () => {} },
+      });
+
+      expect(context.onOpenInspector).toBeDefined();
+      context.onOpenInspector!();
+
+      expect(openPanelInspector).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('onAddAdHocFilter', () => {
+    it('Should add new filter set', async () => {
+      const { scene, context } = buildTestScene({});
+
+      await context.onAddAdHocFilter!({ key: 'hello', value: 'world', operator: '!=' });
+      await context.onAddAdHocFilter!({ key: 'hello', value: 'world2', operator: '!=' });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      expect(variable.state.filters).toEqual([
+        { key: 'hello', value: 'world', operator: '!=' },
+        { key: 'hello', value: 'world2', operator: '!=' },
+        ,
+      ]);
+    });
+
+    it('Should update and add filter to existing set', async () => {
+      const { scene, context } = buildTestScene({ existingFilterVariable: true });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      variable.setState({ filters: [{ key: 'existing', value: 'world', operator: '=' }] });
+
+      await context.onAddAdHocFilter!({ key: 'hello', value: 'world', operator: '=' });
+
+      expect(variable.state.filters.length).toBe(2);
+
+      // Can update existing filter value without adding a new filter
+      await context.onAddAdHocFilter!({ key: 'hello', value: 'world', operator: '!=' });
+      // Verify existing filter value updated
+      expect(variable.state.filters[1].operator).toBe('!=');
+    });
+
+    it('Should use existing adhoc filter when panel has no panel-level datasource because queries have all the same datasources (v2 behavior)', async () => {
+      const { scene, context } = buildTestScene({ existingFilterVariable: true, panelDatasourceUndefined: true });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+      variable.setState({ filters: [] });
+
+      await context.onAddAdHocFilter!({ key: 'hello', value: 'world', operator: '=' });
+
+      // Should use the existing adhoc filter variable, not create a new one
+      expect(variable.state.filters).toEqual([{ key: 'hello', value: 'world', operator: '=' }]);
+
+      // Verify no new adhoc variables were created
+      const variables = sceneGraph.getVariables(scene);
+      const adhocVars = variables.state.variables.filter((v) => v.state.type === 'adhoc');
+      expect(adhocVars.length).toBe(1);
+    });
+  });
+
+  describe('onAddAdHocFilter with a section-local filter variable', () => {
+    function buildRowScopedScene() {
+      const rowFilters = new AdHocFiltersVariable({ name: 'Filters', datasource: { uid: 'my-ds-uid' }, filters: [] });
+      const dashboardFilters = new AdHocFiltersVariable({
+        name: 'Filters',
+        datasource: { uid: 'my-ds-uid' },
+        filters: [],
+      });
+
+      const vizPanel = new VizPanel({
+        key: 'panel-4',
+        pluginId: 'timeseries',
+        $data: new SceneQueryRunner({ datasource: { uid: 'my-ds-uid' }, queries: [{ refId: 'A' }] }),
+      });
+
+      const row = new RowItem({
+        $variables: new SceneVariableSet({ variables: [rowFilters] }),
+        layout: new AutoGridLayoutManager({
+          layout: new AutoGridLayout({ children: [new AutoGridItem({ body: vizPanel })] }),
+        }),
+      });
+
+      new DashboardScene({
+        uid: 'dash-1',
+        title: 'hello',
+        $variables: new SceneVariableSet({ variables: [dashboardFilters] }),
+        body: new RowsLayoutManager({ rows: [row] }),
+      });
+
+      const context: PanelContext = { eventBus: new EventBusSrv(), eventsScope: 'global' };
+      setDashboardPanelContext(vizPanel, context);
+
+      return { rowFilters, dashboardFilters, context };
+    }
+
+    it('adds the filter to the row-local variable instead of the dashboard-global one', async () => {
+      const { rowFilters, dashboardFilters, context } = buildRowScopedScene();
+
+      await context.onAddAdHocFilter!({ key: 'hello', value: 'world', operator: '=' });
+
+      expect(rowFilters.state.filters).toEqual([{ key: 'hello', value: 'world', operator: '=' }]);
+      expect(dashboardFilters.state.filters).toEqual([]);
+    });
+  });
+
+  describe('getAdHocFilterVariableFor', () => {
+    it('does not create duplicate Filters variables when called concurrently', async () => {
+      const { scene } = buildTestScene({});
+
+      const [first, second] = await Promise.all([
+        getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' }),
+        getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' }),
+      ]);
+
+      const adhocVars = sceneGraph.getVariables(scene).state.variables.filter((v) => v.state.type === 'adhoc');
+      expect(adhocVars).toHaveLength(1);
+      expect(first).toBe(second);
+    });
+  });
+
+  describe('getFiltersBasedOnGrouping', () => {
+    beforeAll(() => {
+      config.featureToggles.groupByVariable = true;
+    });
+
+    afterAll(() => {
+      config.featureToggles.groupByVariable = false;
+    });
+
+    it('should return filters based on grouping', () => {
+      const { scene, context } = buildTestScene({ existingFilterVariable: true, existingGroupByVariable: true });
+
+      const groupBy = sceneGraph.getVariables(scene).state.variables.find((f) => f instanceof GroupByVariable);
+
+      groupBy?.changeValueTo(['container', 'cluster']);
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'container', value: 'container', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+        { key: 'cpu', value: 'cpu', operator: '=' },
+        { key: 'id', value: 'id', operator: '=' },
+      ];
+
+      const result = context.getFiltersBasedOnGrouping?.(filters);
+      expect(result).toEqual([
+        { key: 'container', value: 'container', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+      ]);
+    });
+
+    it('should return empty filters if there is no groupBy selection', () => {
+      const { context } = buildTestScene({ existingFilterVariable: true, existingGroupByVariable: true });
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'container', value: 'container', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+        { key: 'cpu', value: 'cpu', operator: '=' },
+        { key: 'id', value: 'id', operator: '=' },
+      ];
+
+      const result = context.getFiltersBasedOnGrouping?.(filters);
+      expect(result).toEqual([]);
+    });
+
+    it('should return empty filters if there is no groupBy variable', () => {
+      const { context } = buildTestScene({ existingFilterVariable: true, existingGroupByVariable: false });
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'container', value: 'container', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+        { key: 'cpu', value: 'cpu', operator: '=' },
+        { key: 'id', value: 'id', operator: '=' },
+      ];
+
+      const result = context.getFiltersBasedOnGrouping?.(filters);
+      expect(result).toEqual([]);
+    });
+
+    it('should return empty filters if panel and groupBy ds differs', () => {
+      const { scene, context } = buildTestScene({
+        existingFilterVariable: true,
+        existingGroupByVariable: true,
+        groupByDatasourceUid: 'different-ds',
+      });
+
+      const groupBy = sceneGraph.getVariables(scene).state.variables.find((f) => f instanceof GroupByVariable);
+
+      groupBy?.changeValueTo(['container', 'cluster']);
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'container', value: 'container', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+        { key: 'cpu', value: 'cpu', operator: '=' },
+        { key: 'id', value: 'id', operator: '=' },
+      ];
+
+      const result = context.getFiltersBasedOnGrouping?.(filters);
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('onAddAdHocFilters', () => {
+    it('should add adhoc filters', async () => {
+      const { scene, context } = buildTestScene({
+        existingFilterVariable: true,
+      });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'existing', value: 'val', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+      ];
+
+      await context.onAddAdHocFilters?.(filters);
+      expect(variable.state.filters).toEqual([
+        { key: 'existing', value: 'val', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+      ]);
+    });
+
+    it('should update and add adhoc filters', async () => {
+      const { scene, context } = buildTestScene({
+        existingFilterVariable: true,
+      });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      variable.setState({ filters: [{ key: 'existing', value: 'val', operator: '=' }] });
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'existing', value: 'val', operator: '!=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+        { key: 'cpu', value: 'cpu', operator: '=' },
+        { key: 'id', value: 'id', operator: '=' },
+      ];
+
+      await context.onAddAdHocFilters?.(filters);
+      expect(variable.state.filters).toEqual([
+        { key: 'existing', value: 'val', operator: '!=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+        { key: 'cpu', value: 'cpu', operator: '=' },
+        { key: 'id', value: 'id', operator: '=' },
+      ]);
+    });
+
+    it('should not add a filter that already exists with the same key, value and operator', async () => {
+      const { scene, context } = buildTestScene({
+        existingFilterVariable: true,
+      });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      variable.setState({ filters: [{ key: 'existing', value: 'val', operator: '=' }] });
+
+      const filters: AdHocFilterItem[] = [
+        { key: 'existing', value: 'val', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+      ];
+
+      await context.onAddAdHocFilters?.(filters);
+      expect(variable.state.filters).toEqual([
+        { key: 'existing', value: 'val', operator: '=' },
+        { key: 'cluster', value: 'cluster', operator: '=' },
+      ]);
+    });
+
+    it('should not update the filters when all new filters are duplicates', async () => {
+      const { scene, context } = buildTestScene({
+        existingFilterVariable: true,
+      });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      variable.setState({ filters: [{ key: 'existing', value: 'val', operator: '=' }] });
+      const updateFiltersSpy = jest.spyOn(variable, 'updateFilters');
+
+      await context.onAddAdHocFilters?.([{ key: 'existing', value: 'val', operator: '=' }]);
+
+      expect(updateFiltersSpy).not.toHaveBeenCalled();
+      expect(variable.state.filters).toEqual([{ key: 'existing', value: 'val', operator: '=' }]);
+    });
+
+    it('should not do anything if filters empty', async () => {
+      const { scene, context } = buildTestScene({
+        existingFilterVariable: true,
+      });
+
+      const variable = await getAdHocFilterVariableFor(scene, { uid: 'my-ds-uid' });
+
+      const filters: AdHocFilterItem[] = [];
+
+      await context.onAddAdHocFilters?.(filters);
+      expect(variable.state.filters).toEqual([]);
+    });
+  });
+
+  describe('onInvestigateErrors', () => {
+    beforeEach(() => {
+      getBooleanValueFn.mockImplementation((key: string, defaultValue: boolean) =>
+        key === FlagKeys.GrafanaNewPanelQueryErrorsUI ? true : defaultValue
+      );
+    });
+
+    it('is not set when the new panel query errors UI feature flag is disabled', () => {
+      stubFFEnabled(false);
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+
+      const { context } = buildTestScene({});
+
+      expect(context.onInvestigateErrors).toBeUndefined();
+    });
+
+    it('is not set when the assistant is unavailable', () => {
+      mockIsAssistantAvailable.mockReturnValue(of(false));
+
+      const { context } = buildTestScene({});
+
+      expect(context.onInvestigateErrors).toBeUndefined();
+    });
+
+    it('is set once the assistant reports available', () => {
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+
+      const { context } = buildTestScene({});
+
+      expect(context.onInvestigateErrors).toBeInstanceOf(Function);
+    });
+
+    it('picks up availability reported after the initial (stale) check, and forces a re-render', () => {
+      // The assistant app plugin can still be loading when this runs, so the very first
+      // emission can be `false` even though the plugin registers moments later. A live
+      // subscription (not a one-shot check) needs to catch that second emission.
+      const availability = new Subject<boolean>();
+      mockIsAssistantAvailable.mockReturnValue(availability);
+
+      const { vizPanel, context } = buildTestScene({});
+      const forceRenderSpy = jest.spyOn(vizPanel, 'forceRender');
+
+      availability.next(false);
+      expect(context.onInvestigateErrors).toBeUndefined();
+
+      availability.next(true);
+      expect(context.onInvestigateErrors).toBeInstanceOf(Function);
+      expect(forceRenderSpy).toHaveBeenCalled();
+    });
+
+    it('ignores registry churn that does not change availability, and stops watching once available', () => {
+      // `isAssistantAvailable()` re-emits on every plugin extension registration, not only when
+      // availability actually changes, so every panel would otherwise re-render on each one.
+      const availability = new Subject<boolean>();
+      mockIsAssistantAvailable.mockReturnValue(availability);
+
+      const { vizPanel } = buildTestScene({});
+      const forceRenderSpy = jest.spyOn(vizPanel, 'forceRender');
+
+      availability.next(false);
+      availability.next(false);
+      availability.next(false);
+      expect(forceRenderSpy).toHaveBeenCalledTimes(1);
+
+      availability.next(true);
+      expect(forceRenderSpy).toHaveBeenCalledTimes(2);
+
+      // Availability never flips back, so the subscription completes here instead of living on
+      // past the panel it closes over — nothing in a panel context can tear it down.
+      expect(availability.observed).toBe(false);
+    });
+
+    it('stops watching once the availability wait times out, so the panel is not held onto forever', () => {
+      // If the assistant app is never installed, `isAssistantAvailable()` never emits `true` and
+      // never completes on its own. Without a hard cutoff the subscription — and the `vizPanel` it
+      // closes over — would live for the app's whole lifetime, since extendPanelContext has no
+      // deactivation hook to unsubscribe through.
+      jest.useFakeTimers();
+      try {
+        const availability = new Subject<boolean>();
+        mockIsAssistantAvailable.mockReturnValue(availability);
+
+        const { context } = buildTestScene({});
+        availability.next(false);
+        expect(context.onInvestigateErrors).toBeUndefined();
+        expect(availability.observed).toBe(true);
+
+        jest.runAllTimers();
+
+        expect(availability.observed).toBe(false);
+        expect(context.onInvestigateErrors).toBeUndefined();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('re-renders when availability arrives asynchronously, as it always does in practice', async () => {
+      // `isAssistantAvailable()` resolves through the plugin extension registries, which are
+      // promise-backed, so its first value always lands after the render that built this panel
+      // context. Without the re-render the popover never picks the action up — a panel sitting in
+      // a static error state has no other reason to render again.
+      mockIsAssistantAvailable.mockReturnValue(of(true).pipe(delay(0)));
+
+      const { vizPanel, context } = buildTestScene({});
+      const forceRenderSpy = jest.spyOn(vizPanel, 'forceRender');
+      expect(context.onInvestigateErrors).toBeUndefined();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(context.onInvestigateErrors).toBeInstanceOf(Function);
+      expect(forceRenderSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does nothing when the panel currently has no errors or notices', async () => {
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+
+      const { context } = buildTestScene({});
+      context.onInvestigateErrors?.();
+
+      expect(mockOpenAssistant).not.toHaveBeenCalled();
+    });
+
+    it('opens the assistant with a fix-errors prompt when the panel has a query error', async () => {
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+
+      const { vizPanel, context } = buildTestScene({});
+      vizPanel.setState({
+        title: 'CPU usage',
+        $data: new SceneDataNode({
+          data: {
+            state: LoadingState.Error,
+            series: [],
+            timeRange: getDefaultTimeRange(),
+            errors: [{ message: 'boom' }],
+          },
+        }),
+      });
+
+      context.onInvestigateErrors?.();
+
+      expect(mockOpenAssistant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          origin: 'grafana/panel-status-popover',
+          prompt: expect.stringContaining('fix the query errors'),
+          context: [PANEL_CONTEXT_ITEM],
+        })
+      );
+      // Attaches a reference to the panel itself (matching the assistant's own "select a panel as
+      // context" picker) rather than a text snapshot of its errors.
+      expect(mockCreateAssistantContextItem).toHaveBeenCalledWith('structured', {
+        data: { name: 'Panel: CPU usage', panelId: '4', panelKey: 'panel-4' },
+      });
+    });
+
+    it('falls back to a placeholder name for an untitled panel', () => {
+      // Otherwise the context pill reads "Panel: " with nothing after it.
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+
+      const { vizPanel, context } = buildTestScene({});
+      vizPanel.setState({
+        title: '',
+        $data: new SceneDataNode({
+          data: {
+            state: LoadingState.Error,
+            series: [],
+            timeRange: getDefaultTimeRange(),
+            errors: [{ message: 'boom' }],
+          },
+        }),
+      });
+
+      context.onInvestigateErrors?.();
+
+      expect(mockCreateAssistantContextItem).toHaveBeenCalledWith(
+        'structured',
+        expect.objectContaining({ data: expect.objectContaining({ name: 'Panel: Untitled' }) })
+      );
+    });
+
+    it('does not target a chat when the assistant is not on screen', async () => {
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+      mockGetAssistantChatIdToContinue.mockReturnValue(undefined);
+
+      const { vizPanel, context } = buildTestScene({});
+      vizPanel.setState({
+        $data: new SceneDataNode({
+          data: {
+            state: LoadingState.Error,
+            series: [],
+            timeRange: getDefaultTimeRange(),
+            errors: [{ message: 'boom' }],
+          },
+        }),
+      });
+
+      context.onInvestigateErrors?.();
+
+      expect(mockOpenAssistant).toHaveBeenCalledWith(expect.objectContaining({ chatId: undefined }));
+    });
+
+    it('targets the active chat when the assistant is already on screen', async () => {
+      // Otherwise this silently does nothing: opening the assistant while it's already open just
+      // republishes the same props instead of landing in the active conversation.
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+      mockGetAssistantChatIdToContinue.mockReturnValue('active-chat-id');
+
+      const { vizPanel, context } = buildTestScene({});
+      vizPanel.setState({
+        $data: new SceneDataNode({
+          data: {
+            state: LoadingState.Error,
+            series: [],
+            timeRange: getDefaultTimeRange(),
+            errors: [{ message: 'boom' }],
+          },
+        }),
+      });
+
+      context.onInvestigateErrors?.();
+
+      expect(mockOpenAssistant).toHaveBeenCalledWith(
+        expect.objectContaining({ appendContext: true, chatId: 'active-chat-id' })
+      );
+    });
+
+    it('opens the assistant with an explain-notices prompt when the panel only has notices', async () => {
+      mockIsAssistantAvailable.mockReturnValue(of(true));
+
+      const { vizPanel, context } = buildTestScene({});
+      vizPanel.setState({
+        $data: new SceneDataNode({
+          data: {
+            state: LoadingState.Done,
+            series: [
+              { name: 'A', fields: [], length: 0, meta: { notices: [{ severity: 'warning', text: 'slow query' }] } },
+            ],
+            timeRange: getDefaultTimeRange(),
+          },
+        }),
+      });
+
+      context.onInvestigateErrors?.();
+
+      expect(mockOpenAssistant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: expect.stringContaining('Investigate the query notices'),
+        })
+      );
+    });
+  });
+});
+
+interface SceneOptions {
+  builtInAnnotationsEnabled?: boolean;
+  dashboardCanEdit?: boolean;
+  canAdd?: boolean;
+  canEdit?: boolean;
+  canDelete?: boolean;
+  existingFilterVariable?: boolean;
+  existingGroupByVariable?: boolean;
+  groupByDatasourceUid?: string;
+  panelDatasourceUndefined?: boolean;
+}
+
+function buildTestScene(options: SceneOptions) {
+  const varList: VariableModel[] = [];
+
+  if (options.existingFilterVariable) {
+    varList.push({
+      type: 'adhoc',
+      name: 'Filters',
+      datasource: { uid: 'my-ds-uid' },
+    } as AdHocVariableModel);
+  }
+
+  if (options.existingGroupByVariable) {
+    varList.push({
+      type: 'groupby',
+      name: 'Group By',
+      datasource: { uid: options.groupByDatasourceUid ?? 'my-ds-uid', type: 'prometheus' },
+    } as GroupByVariableModel);
+  }
+
+  const scene = transformSaveModelToScene({
+    dashboard: {
+      title: 'hello',
+      uid: 'dash-1',
+      schemaVersion: 38,
+      annotations: {
+        list: [
+          {
+            builtIn: 1,
+            datasource: {
+              type: 'grafana',
+              uid: '-- Grafana --',
+            },
+            enable: options.builtInAnnotationsEnabled ?? false,
+            hide: true,
+            iconColor: 'rgba(0, 211, 255, 1)',
+            name: 'Annotations & Alerts',
+            target: { refId: 'A' },
+            type: 'dashboard',
+          },
+        ],
+      },
+      panels: [
+        {
+          type: 'timeseries',
+          id: 4,
+          datasource: { uid: 'my-ds-uid', type: 'prometheus' },
+          targets: [],
+        },
+      ],
+      templating: {
+        list: varList,
+      },
+    },
+    meta: {
+      canEdit: options.dashboardCanEdit,
+      annotationsPermissions: {
+        dashboard: {
+          canAdd: options.canAdd ?? false,
+          canEdit: options.canEdit ?? false,
+          canDelete: options.canDelete ?? false,
+        },
+      },
+    },
+  });
+
+  const vizPanel = findVizPanelByKey(scene, 'panel-4')!;
+
+  // Simulate v2 dashboard behavior where non-mixed panels don't have panel-level datasource
+  // but the queries have their own datasources
+  if (options.panelDatasourceUndefined) {
+    const queryRunner = getQueryRunnerFor(vizPanel);
+    if (queryRunner instanceof SceneQueryRunner) {
+      queryRunner.setState({
+        datasource: undefined,
+        queries: [{ refId: 'A', datasource: { uid: 'my-ds-uid', type: 'prometheus' } }],
+      });
+    }
+  }
+
+  const context: PanelContext = {
+    eventBus: new EventBusSrv(),
+    eventsScope: 'global',
+  };
+
+  setDashboardPanelContext(vizPanel, context);
+
+  return { scene, vizPanel, context };
+}

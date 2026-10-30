@@ -1,0 +1,733 @@
+package user
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/authlib/types"
+	iamv0alpha1 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
+	"github.com/grafana/grafana/pkg/services/org"
+	"github.com/grafana/grafana/pkg/storage/unified/resource"
+	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestValidateOnCreate(t *testing.T) {
+	tests := []struct {
+		name          string
+		user          *iamv0alpha1.User
+		requester     *identity.StaticRequester
+		searchClient  SearchBackend
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "valid user creation by grafana admin",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "grafana admin creating another grafana admin",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login:        "newadmin",
+					GrafanaAdmin: true,
+					Role:         "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "non-admin trying to create a grafana admin",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login:        "newadmin",
+					GrafanaAdmin: true,
+					Role:         "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			searchClient:  &fakeSearchBackend{},
+			expectError:   true,
+			errorContains: "only grafana admins can create grafana admins",
+		},
+		{
+			name: "user with empty login and email",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Role: "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			searchClient:  &fakeSearchBackend{},
+			expectError:   true,
+			errorContains: "user must have either login or email",
+		},
+		{
+			name: "user with only login",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Viewer",
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "user with only email",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Email: "test@example",
+					Role:  "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Viewer",
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "user with empty role",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			searchClient:  &fakeSearchBackend{},
+			expectError:   true,
+			errorContains: "role is required",
+		},
+		{
+			name: "user with invalid role",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "InvalidRole",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			searchClient:  &fakeSearchBackend{},
+			expectError:   true,
+			errorContains: "invalid role 'InvalidRole'",
+		},
+		{
+			name: "user with valid role",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "Admin",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "non-admin cannot create a user with a role higher than their own",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "Admin",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Editor",
+			},
+			searchClient:  &fakeSearchBackend{},
+			expectError:   true,
+			errorContains: "cannot assign a role higher than user's role",
+		},
+		{
+			name: "non-admin can create a user with a role at or below their own",
+			user: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "Editor",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Editor",
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "user with existing email",
+			user: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "userx",
+				},
+				Spec: iamv0alpha1.UserSpec{
+					Email: "existing@example",
+					Role:  "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Viewer",
+			},
+			searchClient: &fakeSearchBackend{
+				Users: []*org.OrgUserDTO{
+					{Email: "existing@example"},
+				},
+			},
+			expectError:   true,
+			errorContains: "email 'existing@example' is already taken",
+		},
+		{
+			name: "user with existing login",
+			user: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "userx",
+				},
+				Spec: iamv0alpha1.UserSpec{
+					Login: "existinguser",
+					Email: "existinguser@example",
+					Role:  "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Viewer",
+			},
+			searchClient: &fakeSearchBackend{
+				Users: []*org.OrgUserDTO{
+					{Login: "existinguser"},
+				},
+			},
+			expectError:   true,
+			errorContains: "login 'existinguser' is already taken",
+		},
+		{
+			name: "service identity creating a user scopes the uniqueness search to the object's namespace, not the requester's wildcard",
+			user: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "userx",
+					Namespace: "default",
+				},
+				Spec: iamv0alpha1.UserSpec{
+					Login: "testuser",
+					Role:  "Viewer",
+				},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeAccessPolicy,
+				Namespace:      "*",
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{
+				SearchFunc: func(_ context.Context, query SearchQuery) (*iamv0alpha1.GetSearchUsersResponse, error) {
+					require.Equal(t, "default", query.Namespace)
+					return iamv0alpha1.NewGetSearchUsersResponse(), nil
+				},
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := identity.WithRequester(
+				context.Background(),
+				tt.requester,
+			)
+
+			err := ValidateOnCreate(ctx, selectorForBackend(tt.searchClient), tt.user)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorContains != "" {
+					require.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateEmailFieldValueResults(t *testing.T) {
+	index := &MockClient{MockResponses: []*resourcepb.ResourceSearchResponse{{
+		ResultFormat: resourcepb.ResourceSearchRequest_FIELD_VALUES,
+		TotalHits:    1,
+		Rows: []*resourcepb.ResourceSearchRow{{
+			Key: &resourcepb.ResourceKey{Name: "user-1"},
+		}},
+	}}}
+	client := NewUnifiedSearchClient(index, nil)
+
+	require.NoError(t, validateEmail(t.Context(), client, "stacks-1", "user-1", "user@example.com"))
+	request := index.LastSearchRequest
+	require.NotNil(t, request)
+	require.Equal(t, resourcepb.ResourceSearchRequest_FIELD_VALUES, request.ResultFormat)
+	require.Equal(t, []string{resource.SEARCH_FIELD_NAME}, request.Fields)
+}
+
+func TestValidateLoginFieldValueResults(t *testing.T) {
+	index := &MockClient{MockResponses: []*resourcepb.ResourceSearchResponse{{
+		ResultFormat: resourcepb.ResourceSearchRequest_FIELD_VALUES,
+		TotalHits:    1,
+		Rows: []*resourcepb.ResourceSearchRow{{
+			Key: &resourcepb.ResourceKey{Name: "another-user"},
+		}},
+	}}}
+	client := NewUnifiedSearchClient(index, nil)
+
+	err := validateLogin(t.Context(), client, "stacks-1", "user-1", "taken")
+	require.ErrorContains(t, err, "login 'taken' is already taken")
+}
+
+func TestValidateOnUpdate(t *testing.T) {
+	tests := []struct {
+		name          string
+		oldUser       *iamv0alpha1.User
+		newUser       *iamv0alpha1.User
+		requester     *identity.StaticRequester
+		searchClient  SearchBackend
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "un-provisioning a provisioned user",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Provisioned: true, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Provisioned: false, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError:   true,
+			errorContains: "provisioned user cannot be un-provisioned",
+		},
+		{
+			name: "non-service user provisions a user",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Provisioned: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Provisioned: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError:   true,
+			errorContains: "only service users can provision a user",
+		},
+		{
+			name: "service user provisions a user",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Provisioned: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Provisioned: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeAccessPolicy,
+			},
+			expectError: false,
+		},
+		{
+			name: "no changes",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeUser,
+			},
+			expectError: false,
+		},
+		{
+			name: "update with empty login and email",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "", Email: "", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeAccessPolicy,
+			},
+			expectError:   true,
+			errorContains: "user must have either login or email",
+		},
+		{
+			name: "update with only login",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Email: "test@example", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeAccessPolicy,
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "update with only email",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "", Email: "test@example", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeAccessPolicy,
+			},
+			searchClient: &fakeSearchBackend{},
+			expectError:  false,
+		},
+		{
+			name: "service user verifies email",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", EmailVerified: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", EmailVerified: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeAccessPolicy,
+			},
+			expectError: false,
+		},
+		{
+			name: "non-service user verifies email",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", EmailVerified: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", EmailVerified: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type: types.TypeUser,
+			},
+			expectError:   true,
+			errorContains: "only service users can verify email",
+		},
+		{
+			name: "grafana admin disables user",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Disabled: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Disabled: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError: false,
+		},
+		{
+			name: "non-admin disables user",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Disabled: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Disabled: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			expectError:   true,
+			errorContains: "only grafana admins can disable or enable a user",
+		},
+		{
+			name: "grafana admin grants admin",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", GrafanaAdmin: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", GrafanaAdmin: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError: false,
+		},
+		{
+			name: "non-admin grants admin",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", GrafanaAdmin: false, Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", GrafanaAdmin: true, Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			expectError:   true,
+			errorContains: "only grafana admins can change grafana admin status",
+		},
+		{
+			name: "update to empty role",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: ""},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError:   true,
+			errorContains: "role is required",
+		},
+		{
+			name: "update to invalid role",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "InvalidRole"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError:   true,
+			errorContains: "invalid role 'InvalidRole'",
+		},
+		{
+			name: "update to valid role",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Editor"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError: false,
+		},
+		{
+			name: "non-service non-admin user updating role field is allowed",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "user@example", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "user@example", Role: "Editor"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Editor",
+			},
+			expectError: false,
+		},
+		{
+			name: "non-admin org.users:write holder cannot escalate role beyond their own",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Admin"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Editor",
+			},
+			expectError:   true,
+			errorContains: "cannot assign a role higher than user's role",
+		},
+		{
+			name: "non-admin can update unrelated fields when role is unchanged, even above their own level",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Admin"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Role: "Admin"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+				OrgRole:        "Editor",
+			},
+			expectError: false,
+		},
+		{
+			name: "non-service non-admin user updating non-role fields is forbidden",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "old@example", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "new@example", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: false,
+			},
+			expectError:   true,
+			errorContains: "updating fields beyond org role requires service identity or grafana admin",
+		},
+		{
+			name: "grafana admin updating non-role fields is allowed",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "user@example", Title: "Old Title", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "user@example", Title: "New Title", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			expectError: false,
+		},
+		{
+			name: "update with existing email",
+			oldUser: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "userx",
+				},
+				Spec: iamv0alpha1.UserSpec{Email: "one@example", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "userx",
+				},
+				Spec: iamv0alpha1.UserSpec{Email: "two@example", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeAccessPolicy,
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{
+				Users: []*org.OrgUserDTO{
+					{Email: "two@example"},
+				},
+			},
+			expectError:   true,
+			errorContains: "email 'two@example' is already taken",
+		},
+		{
+			name: "update with existing login",
+			oldUser: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "userx",
+				},
+				Spec: iamv0alpha1.UserSpec{Login: "one", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "userx",
+				},
+				Spec: iamv0alpha1.UserSpec{Login: "two", Role: "Viewer"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeAccessPolicy,
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{
+				Users: []*org.OrgUserDTO{
+					{Name: "other", UID: "uid456", Login: "two"},
+				},
+			},
+			expectError:   true,
+			errorContains: "login 'two' is already taken",
+		},
+		{
+			name: "update with no change to login or email",
+			oldUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "test@example", Role: "Viewer"},
+			},
+			newUser: &iamv0alpha1.User{
+				Spec: iamv0alpha1.UserSpec{Login: "testuser", Email: "test@example", Role: "Editor"},
+			},
+			requester: &identity.StaticRequester{
+				Type:           types.TypeUser,
+				IsGrafanaAdmin: true,
+			},
+			searchClient: &fakeSearchBackend{
+				Users: []*org.OrgUserDTO{
+					{Login: "testuser", Email: "test@example"},
+				},
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := identity.WithRequester(
+				context.Background(),
+				tt.requester,
+			)
+
+			err := ValidateOnUpdate(ctx, selectorForBackend(tt.searchClient), tt.oldUser, tt.newUser)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorContains != "" {
+					require.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

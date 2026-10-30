@@ -1,0 +1,303 @@
+import { useCallback, useEffect, useState } from 'react';
+import { useToggle } from 'react-use';
+import { mergeMap, type Subscription } from 'rxjs';
+
+import {
+  type DataTransformerConfig,
+  type TransformerRegistryItem,
+  FrameMatcherID,
+  type DataTransformContext,
+  getFrameMatchers,
+  transformDataFrame,
+  type DataFrame,
+  transformerUsesDynamicRefId,
+} from '@grafana/data';
+import { selectors } from '@grafana/e2e-selectors';
+import { t } from '@grafana/i18n';
+import { getTemplateSrv, reportInteraction } from '@grafana/runtime';
+import { ConfirmModal } from '@grafana/ui';
+import {
+  QueryOperationAction,
+  QueryOperationToggleAction,
+} from 'app/core/components/QueryOperationRow/QueryOperationAction';
+import { QueryOperationRow } from 'app/core/components/QueryOperationRow/QueryOperationRow';
+import { PluginStateInfo } from 'app/features/plugins/components/PluginStateInfo';
+
+import { TransformationEditor } from './TransformationEditor';
+import { TransformationEditorHelpDisplay } from './TransformationEditorHelpDisplay';
+import { TransformationFilter } from './TransformationFilter';
+import { TransformationOperationRowHeader } from './TransformationOperationRowHeader';
+import { type TransformationData, type TransformationsEditorTransformation } from './types';
+
+interface TransformationOperationRowProps {
+  id: string;
+  index: number;
+  data: TransformationData;
+  uiConfig: TransformerRegistryItem<null>;
+  configs: TransformationsEditorTransformation[];
+  onRemove: (index: number) => void;
+  onChange: (index: number, config: DataTransformerConfig) => void;
+}
+
+export const TransformationOperationRow = ({
+  onRemove,
+  index,
+  id,
+  data,
+  configs,
+  uiConfig,
+  onChange,
+}: TransformationOperationRowProps) => {
+  const [showDeleteModal, setShowDeleteModal] = useToggle(false);
+  const [showDebug, toggleShowDebug] = useToggle(false);
+  const [showHelp, toggleShowHelp] = useToggle(false);
+  const disabled = !!configs[index].transformation.disabled;
+  const topic = configs[index].transformation.topic;
+  const showFilterEditor = configs[index].transformation.filter != null || topic != null;
+  const showFilterToggle = showFilterEditor || data.series.length > 0 || (data.annotations?.length ?? 0) > 0;
+  const [input, setInput] = useState<DataFrame[]>([]);
+  const [output, setOutput] = useState<DataFrame[]>([]);
+  // output of previous transformation
+  const [prevOutput, setPrevOutput] = useState<DataFrame[]>([]);
+  const [generatedRefId, setGeneratedRefId] = useState<string | undefined>(undefined);
+
+  // Whether the name can be pinned follows the configuration, not the data, so the editor does not
+  // appear and disappear as queries come and go.
+  const canSetRefId = transformerUsesDynamicRefId(uiConfig, configs[index].transformation.options);
+  // prevOutput is this transformation's unfiltered input, so its refIds are the reserved ones.
+  const reservedRefIds = prevOutput.map((frame) => frame.refId).filter((refId): refId is string => !!refId);
+
+  const onDisableToggle = useCallback(
+    (index: number) => {
+      const current = configs[index].transformation;
+      onChange(index, {
+        ...current,
+        disabled: current.disabled ? undefined : true,
+      });
+    },
+    [onChange, configs]
+  );
+
+  // Adds or removes the frame filter
+  const toggleFilter = useCallback(() => {
+    let current = { ...configs[index].transformation };
+    if (current.filter) {
+      delete current.filter;
+    } else {
+      current.filter = {
+        id: FrameMatcherID.byRefId,
+        options: '', // empty string will not do anything
+      };
+    }
+    onChange(index, current);
+  }, [onChange, index, configs]);
+
+  // Instrument toggle callback
+  const instrumentToggleCallback = useCallback(
+    (callback: (e: React.MouseEvent) => void, toggleId: string, active: boolean | undefined) =>
+      (e: React.MouseEvent) => {
+        let eventName = 'transformations_redesign_panel_editor_tabs_transformations_toggle';
+
+        reportInteraction(eventName, {
+          action: active ? 'off' : 'on',
+          toggleId,
+          transformationId: configs[index].transformation.id,
+        });
+
+        callback(e);
+      },
+    [configs, index]
+  );
+
+  useEffect(() => {
+    const config = configs[index].transformation;
+    const matcher = config.filter?.options ? getFrameMatchers(config.filter) : undefined;
+    // we need previous transformation index to get its outputs
+    //    to be used in this transforms inputs
+    const prevTransformIndex = index - 1;
+
+    let prevInputTransforms: Array<DataTransformerConfig<{}>> = [];
+    let prevOutputTransforms: Array<DataTransformerConfig<{}>> = [];
+
+    if (prevTransformIndex >= 0) {
+      prevInputTransforms = configs.slice(0, prevTransformIndex).map((t) => t.transformation);
+      prevOutputTransforms = configs.slice(prevTransformIndex, index).map((t) => t.transformation);
+    }
+
+    const inputTransforms = configs.slice(0, index).map((t) => t.transformation);
+    const outputTransforms = configs.slice(index, index + 1).map((t) => t.transformation);
+
+    const ctx: DataTransformContext = {
+      interpolate: (v: string) => getTemplateSrv().replace(v),
+    };
+
+    const applyFilter = (frames: DataFrame[]) => (matcher ? frames.filter((frame) => matcher(frame)) : frames);
+
+    const inputSubscription = transformDataFrame(inputTransforms, data.series, ctx).subscribe((data) => {
+      setInput(applyFilter(data));
+    });
+
+    // The generated name has to come from what this transformation actually emits. Guessing it from
+    // the input is wrong wherever the two diverge: Reduce in fields mode keeps the incoming refIds,
+    // transformers that drop empty frames build the name from fewer of them, and the no-op paths
+    // return their input untouched. Run without the filter (already applied) or the static refId, so
+    // what comes back is the name the user would get by leaving the field blank; without `disabled`
+    // too, so a disabled row still shows one. Only the rows that can pin a name render it, and the
+    // rest would pay for the extra replay on every data or config change.
+    let generatedRefIdSubscription: Subscription | undefined;
+
+    if (canSetRefId) {
+      const previewConfig: DataTransformerConfig = {
+        ...config,
+        refId: undefined,
+        filter: undefined,
+        disabled: undefined,
+      };
+      generatedRefIdSubscription = transformDataFrame(inputTransforms, data.series, ctx)
+        .pipe(mergeMap((before) => transformDataFrame([previewConfig], applyFilter(before), ctx)))
+        // More than one frame means there is no single output to name, so the row shows "(Auto)".
+        .subscribe((frames) => setGeneratedRefId(frames.length === 1 ? frames[0].refId : undefined));
+    }
+    const outputSubscription = transformDataFrame(inputTransforms, data.series, ctx)
+      .pipe(mergeMap((before) => transformDataFrame(outputTransforms, before, ctx)))
+      .subscribe(setOutput);
+    const prevOutputSubscription = transformDataFrame(prevInputTransforms, data.series, ctx)
+      .pipe(mergeMap((before) => transformDataFrame(prevOutputTransforms, before, ctx)))
+      .subscribe((result) => {
+        let mergedResult = [...result];
+        // add refIds that were requested even if they did not return a result
+        data.request?.targets.forEach((series) => {
+          const refIdInResult = mergedResult.some((frame) => frame.refId === series.refId);
+          if (!refIdInResult) {
+            mergedResult.push({ refId: series.refId, fields: [], length: 0 });
+          }
+        });
+        setPrevOutput(mergedResult);
+      });
+
+    return function unsubscribe() {
+      inputSubscription.unsubscribe();
+      outputSubscription.unsubscribe();
+      prevOutputSubscription.unsubscribe();
+      generatedRefIdSubscription?.unsubscribe();
+    };
+  }, [index, data, configs, canSetRefId]);
+
+  const renderHeader = () => {
+    return (
+      <TransformationOperationRowHeader
+        index={index}
+        transformation={configs[index].transformation}
+        transformations={configs.map((config) => config.transformation)}
+        transformationTypeName={`${index + 1} - ${uiConfig.name}`}
+        disabled={disabled}
+        onChange={onChange}
+        canSetRefId={canSetRefId}
+        dynamicRefId={generatedRefId}
+        reservedRefIds={reservedRefIds}
+      />
+    );
+  };
+
+  const renderActions = () => {
+    return (
+      <>
+        {uiConfig.state && <PluginStateInfo state={uiConfig.state} />}
+        <QueryOperationToggleAction
+          title={t(
+            'dashboard.transformation-operation-row.render-actions.title-show-transform-help',
+            'Show transform help'
+          )}
+          icon="info-circle"
+          // `instrumentToggleCallback` expects a function that takes a MouseEvent, is unused in the state setter. Instead, we simply toggle the state.
+          onClick={instrumentToggleCallback(toggleShowHelp, 'help', showHelp)}
+          active={showHelp}
+        />
+        {showFilterToggle && (
+          <QueryOperationToggleAction
+            title={t('dashboard.transformation-operation-row.render-actions.title-filter', 'Filter')}
+            icon="filter"
+            onClick={instrumentToggleCallback(toggleFilter, 'filter', showFilterEditor)}
+            active={showFilterEditor}
+          />
+        )}
+        <QueryOperationToggleAction
+          title={t('dashboard.transformation-operation-row.render-actions.title-debug', 'Debug')}
+          icon="bug"
+          onClick={instrumentToggleCallback(toggleShowDebug, 'debug', showDebug)}
+          active={showDebug}
+        />
+        <QueryOperationToggleAction
+          title={t(
+            'dashboard.transformation-operation-row.render-actions.title-disable-transformation',
+            'Disable transformation'
+          )}
+          icon={disabled ? 'eye-slash' : 'eye'}
+          onClick={instrumentToggleCallback(() => onDisableToggle(index), 'disabled', disabled)}
+          active={disabled}
+          dataTestId={selectors.components.Transforms.disableTransformationButton}
+        />
+        <QueryOperationAction
+          title={t('dashboard.transformation-operation-row.render-actions.title-remove', 'Remove')}
+          icon="trash-alt"
+          onClick={() => setShowDeleteModal(true)}
+        />
+
+        <ConfirmModal
+          isOpen={showDeleteModal}
+          title={t('dashboard.transformation-operation-row.title-delete', 'Delete {{name}}?', {
+            name: uiConfig.name,
+          })}
+          body={t(
+            'dashboard.transformation-operation-row.body-delete',
+            'Note that removing one transformation may break others. If there is only a single transformation, you will go back to the main selection screen.'
+          )}
+          confirmText={t('dashboard.transformation-operation-row.render-actions.confirmText-delete', 'Delete')}
+          onConfirm={() => {
+            setShowDeleteModal(false);
+            onRemove(index);
+          }}
+          onDismiss={() => setShowDeleteModal(false)}
+        />
+      </>
+    );
+  };
+
+  return (
+    <>
+      <QueryOperationRow
+        id={id}
+        index={index}
+        draggable
+        actions={renderActions}
+        headerElement={renderHeader}
+        disabled={disabled}
+        expanderMessages={{
+          close: 'Collapse transformation row',
+          open: 'Expand transformation row',
+        }}
+      >
+        {showFilterEditor && (
+          <TransformationFilter
+            data={prevOutput}
+            index={index}
+            config={configs[index].transformation}
+            annotations={data.annotations}
+            onChange={onChange}
+          />
+        )}
+        <TransformationEditor
+          input={input}
+          output={output}
+          debugMode={showDebug}
+          index={index}
+          configs={configs}
+          uiConfig={uiConfig}
+          onChange={onChange}
+          toggleShowDebug={toggleShowDebug}
+        />
+      </QueryOperationRow>
+      <TransformationEditorHelpDisplay transformer={uiConfig} isOpen={showHelp} onCloseClick={toggleShowHelp} />
+    </>
+  );
+};

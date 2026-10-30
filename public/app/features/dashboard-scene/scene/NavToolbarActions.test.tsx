@@ -1,0 +1,389 @@
+import { screen, render, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { TestProvider } from 'test/helpers/TestProvider';
+import { getGrafanaContextMock } from 'test/mocks/getGrafanaContextMock';
+
+import { selectors } from '@grafana/e2e-selectors';
+import { LocationServiceProvider, locationService } from '@grafana/runtime';
+import { SceneQueryRunner, SceneTimeRange, UrlSyncContextProvider, VizPanel } from '@grafana/scenes';
+import { setTestFlags } from '@grafana/test-utils/unstable';
+import { mockLocalStorage } from 'app/features/alerting/unified/mocks';
+import { playlistSrv } from 'app/features/playlist/PlaylistSrv';
+import {
+  RepoViewStatus,
+  type RepositoryViewData,
+  useGetResourceRepositoryView,
+} from 'app/features/provisioning/hooks/useGetResourceRepositoryView';
+import { type DashboardMeta } from 'app/types/dashboard';
+
+import { buildPanelEditScene } from '../panel-edit/PanelEditor';
+import { DashboardInteractions } from '../utils/interactions';
+
+import { DashboardScene } from './DashboardScene';
+import { NavToolbarActions, ToolbarActions } from './NavToolbarActions';
+import { DefaultGridLayoutManager } from './layout-default/DefaultGridLayoutManager';
+
+jest.mock('../utils/interactions', () => ({
+  DashboardInteractions: {
+    editSessionStarted: jest.fn(),
+    editButtonClicked: jest.fn(),
+  },
+}));
+
+const localStorageMock = mockLocalStorage();
+Object.defineProperty(window, 'localStorage', {
+  value: localStorageMock,
+  writable: true,
+});
+
+jest.mock('app/features/playlist/PlaylistSrv', () => ({
+  playlistSrv: {
+    useState: jest.fn().mockReturnValue({ isPlaying: false }),
+    setState: jest.fn(),
+    isPlaying: true,
+    start: jest.fn(),
+    next: jest.fn(),
+    prev: jest.fn(),
+    stop: jest.fn(),
+  },
+}));
+
+jest.mock('app/features/provisioning/hooks/useGetResourceRepositoryView', () => ({
+  ...jest.requireActual('app/features/provisioning/hooks/useGetResourceRepositoryView'),
+  useGetResourceRepositoryView: jest.fn(),
+}));
+
+// Same as what the real hook returns with provisioning off, so the existing toolbar tests keep
+// their baseline. Only the read-only badge tests care about this mock.
+const noRepositoryView: RepositoryViewData = {
+  isLoading: false,
+  isInstanceManaged: false,
+  isReadOnlyRepo: false,
+  isMissingRepo: false,
+  status: RepoViewStatus.Disabled,
+};
+
+const readOnlyRepositoryView: RepositoryViewData = {
+  repository: { name: 'repo-1', title: 'Repo 1', type: 'github', target: 'folder', workflows: [] },
+  repoType: 'github',
+  status: RepoViewStatus.Ready,
+  isInstanceManaged: false,
+  isReadOnlyRepo: true,
+  isMissingRepo: false,
+};
+
+jest.mock('@grafana/runtime', () => ({
+  ...jest.requireActual('@grafana/runtime'),
+  getDataSourceSrv: () => ({
+    get: jest.fn(),
+    getInstanceSettings: jest.fn().mockReturnValue({
+      uid: 'datasource-uid',
+      name: 'datasource-name',
+    }),
+  }),
+}));
+
+describe('NavToolbarActions', () => {
+  beforeEach(() => {
+    jest.mocked(useGetResourceRepositoryView).mockReturnValue(noRepositoryView);
+  });
+
+  describe('Given an already saved dashboard', () => {
+    it('Should show correct buttons when not in editing', async () => {
+      setup();
+
+      expect(screen.queryByText('Save dashboard')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Add')).not.toBeInTheDocument();
+      expect(await screen.findByText('Edit')).toBeInTheDocument();
+      expect(await screen.findByText('Share')).toBeInTheDocument();
+    });
+
+    it('Should show the correct buttons when playing a playlist', async () => {
+      jest.mocked(playlistSrv).useState.mockReturnValueOnce({ isPlaying: true });
+      setup();
+
+      expect(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.prev)).toBeInTheDocument();
+      expect(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.stop)).toBeInTheDocument();
+      expect(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.next)).toBeInTheDocument();
+      expect(screen.queryByText('Edit')).not.toBeInTheDocument();
+      expect(screen.queryByText('Share')).not.toBeInTheDocument();
+    });
+
+    it('Should call the playlist srv when using playlist controls', async () => {
+      jest.mocked(playlistSrv).useState.mockReturnValueOnce({ isPlaying: true });
+      setup();
+
+      // Previous dashboard
+      expect(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.prev)).toBeInTheDocument();
+      await userEvent.click(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.prev));
+      expect(playlistSrv.prev).toHaveBeenCalledTimes(1);
+
+      // Next dashboard
+      expect(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.next)).toBeInTheDocument();
+      await userEvent.click(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.next));
+      expect(playlistSrv.next).toHaveBeenCalledTimes(1);
+
+      // Stop playlist
+      expect(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.stop)).toBeInTheDocument();
+      await userEvent.click(await screen.findByTestId(selectors.pages.Dashboard.DashNav.playlistControls.stop));
+      expect(playlistSrv.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it('Should hide the playlist controls when it is not playing', async () => {
+      setup();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.prev)).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.stop)).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.next)).not.toBeInTheDocument();
+    });
+
+    it('Should show correct buttons when editing', async () => {
+      setup();
+
+      await userEvent.click(await screen.findByText('Edit'));
+
+      expect(await screen.findByText('Save dashboard')).toBeInTheDocument();
+      expect(await screen.findByText('Exit edit')).toBeInTheDocument();
+      expect(await screen.findByText('Add')).toBeInTheDocument();
+      expect(screen.queryByText('Edit')).not.toBeInTheDocument();
+      expect(screen.queryByText('Share')).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.prev)).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.stop)).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.next)).not.toBeInTheDocument();
+    });
+
+    it('Should show correct buttons when in settings menu', async () => {
+      setup();
+
+      await userEvent.click(await screen.findByText('Edit'));
+      await userEvent.click(await screen.findByText('Settings'));
+
+      expect(await screen.findByText('Save dashboard')).toBeInTheDocument();
+      expect(await screen.findByText('Back to dashboard')).toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.prev)).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.stop)).not.toBeInTheDocument();
+      expect(screen.queryByText(selectors.pages.Dashboard.DashNav.playlistControls.next)).not.toBeInTheDocument();
+    });
+
+    it('shows Save dashboard but not the panel-edit back button while editing a panel', async () => {
+      const { dashboard } = setup();
+
+      await act(() => {
+        dashboard.onEnterEditMode();
+        const panel = dashboard.state.body.getVizPanels()[0];
+        dashboard.setState({ editPanel: buildPanelEditScene(panel) });
+      });
+
+      expect(await screen.findByText('Save dashboard')).toBeInTheDocument();
+      // The panel-edit back button lives in the dashboard controls row, not the toolbar. Match it by
+      // its stable selector — its visible text is shared with the view-panel and settings back buttons.
+      expect(
+        screen.queryByTestId(selectors.components.NavToolbar.editDashboard.backToDashboardButton)
+      ).not.toBeInTheDocument();
+    });
+    describe('edit dashboard button tracking', () => {
+      it('should call DashboardInteractions.editButtonClicked with outlineExpanded:true if grafana.dashboard.sidebar.outline.collapsed is undefined', async () => {
+        setup();
+        await userEvent.click(await screen.findByTestId(selectors.components.NavToolbar.editDashboard.editButton));
+        expect(DashboardInteractions.editButtonClicked).toHaveBeenCalledWith({
+          dashboardUid: 'dash-1',
+          outlineExpanded: true,
+        });
+      });
+
+      it('should call DashboardInteractions.editButtonClicked with outlineExpanded:true if grafana.dashboard.sidebar.outline.collapsed is false', async () => {
+        localStorageMock.setItem('grafana.dashboard.sidebar.outline.collapsed', 'false');
+        setup();
+        await userEvent.click(await screen.findByTestId(selectors.components.NavToolbar.editDashboard.editButton));
+        expect(DashboardInteractions.editButtonClicked).toHaveBeenCalledWith({
+          dashboardUid: 'dash-1',
+          outlineExpanded: true,
+        });
+      });
+
+      it('should call DashboardInteractions.editButtonClicked with outlineExpanded:false if grafana.dashboard.sidebar.outline.collapsed is true', async () => {
+        localStorageMock.setItem('grafana.dashboard.sidebar.outline.collapsed', 'true');
+        setup();
+        await userEvent.click(await screen.findByTestId(selectors.components.NavToolbar.editDashboard.editButton));
+        expect(DashboardInteractions.editButtonClicked).toHaveBeenCalledWith({
+          dashboardUid: 'dash-1',
+          outlineExpanded: false,
+        });
+      });
+    });
+
+    describe('where dashboard is not editable', () => {
+      it('should set dashboard to editable on make editable button press', async () => {
+        const { dashboard } = setup({}, true);
+        await userEvent.click(await screen.findByTestId(selectors.components.NavToolbar.editDashboard.editButton));
+
+        expect(dashboard.state.editable).toBe(true);
+        expect(dashboard.state.meta.canEdit).toBe(true);
+        expect(dashboard.state.meta.canSave).toBe(true);
+      });
+    });
+  });
+
+  describe('Given new sharing button', () => {
+    it('Should show new share button', async () => {
+      setup();
+
+      expect(await screen.queryByTestId(selectors.pages.Dashboard.DashNav.shareButton)).not.toBeInTheDocument();
+      const newShareButton = screen.getByTestId(selectors.pages.Dashboard.DashNav.newShareButton.container);
+      expect(newShareButton).toBeInTheDocument();
+    });
+    it('Should show new export button', async () => {
+      setup();
+      const newExportButton = screen.getByRole('button', { name: /export dashboard/i });
+      expect(newExportButton).toBeInTheDocument();
+    });
+  });
+
+  describe('Snapshot', () => {
+    it('should show link button when is a snapshot', () => {
+      setup({
+        isSnapshot: true,
+      });
+
+      expect(screen.queryByTestId('button-snapshot')).toBeInTheDocument();
+    });
+  });
+
+  describe('Read-only badge', () => {
+    beforeEach(() => {
+      jest.mocked(useGetResourceRepositoryView).mockReturnValue(readOnlyRepositoryView);
+    });
+
+    it('shows the badge next to the disabled Edit button for a user who could otherwise edit', async () => {
+      setup();
+
+      expect(await screen.findByRole('button', { name: 'Edit' })).toHaveAttribute('aria-disabled', 'true');
+      expect(screen.getByText('Read only')).toBeInTheDocument();
+    });
+
+    it('hides the badge from a user who cannot edit the dashboard anyway', async () => {
+      setup({ canEdit: false, canMakeEditable: false });
+
+      expect(await screen.findByText('Share')).toBeInTheDocument();
+      expect(screen.queryByText('Read only')).not.toBeInTheDocument();
+    });
+  });
+});
+
+function setup(meta?: DashboardMeta, editable?: boolean) {
+  const dashboard = new DashboardScene({
+    $timeRange: new SceneTimeRange({ from: 'now-6h', to: 'now' }),
+    meta: {
+      canEdit: true,
+      isNew: false,
+      canMakeEditable: true,
+      canSave: true,
+      canShare: true,
+      canStar: true,
+      canAdmin: true,
+      canDelete: true,
+      ...meta,
+    },
+    title: 'hello',
+    editable: editable || true,
+    uid: 'dash-1',
+    body: DefaultGridLayoutManager.fromVizPanels([
+      new VizPanel({
+        title: 'Panel A',
+        key: 'panel-1',
+        pluginId: 'table',
+        $data: new SceneQueryRunner({ key: 'data-query-runner', queries: [{ refId: 'A' }] }),
+      }),
+      new VizPanel({
+        title: 'Panel B',
+        key: 'panel-2',
+        pluginId: 'table',
+      }),
+    ]),
+  });
+
+  const context = getGrafanaContextMock();
+
+  locationService.push('/');
+
+  render(
+    <TestProvider grafanaContext={context}>
+      <LocationServiceProvider service={locationService}>
+        <UrlSyncContextProvider scene={dashboard}>
+          <ToolbarActions dashboard={dashboard} />
+        </UrlSyncContextProvider>
+      </LocationServiceProvider>
+    </TestProvider>
+  );
+
+  const actions = context.chrome.state.getValue().actions;
+
+  return { dashboard, actions };
+}
+
+describe('when previewing an unbuilt dashboard plan', () => {
+  afterEach(() => {
+    setTestFlags({});
+  });
+
+  // Render through the shared wrapper to cover planning behavior in both toolbar variants.
+  function setupPlanning() {
+    const onBuild = jest.fn();
+    const onDismiss = jest.fn();
+    const dashboard = new DashboardScene({
+      $timeRange: new SceneTimeRange({ from: 'now-6h', to: 'now' }),
+      meta: { canEdit: true, canSave: true, canShare: true, canStar: true },
+      title: 'hello',
+      editable: true,
+      uid: 'dash-1',
+      isEditing: true,
+      planning: {
+        planId: 'plan-1',
+        planTitle: 'Kafka overview',
+        onBuild,
+        onDismiss,
+      },
+      body: DefaultGridLayoutManager.fromVizPanels([
+        new VizPanel({ title: 'Panel A', key: 'panel-1', pluginId: 'table' }),
+      ]),
+    });
+
+    const context = getGrafanaContextMock();
+    locationService.push('/');
+
+    render(
+      <TestProvider grafanaContext={context}>
+        <LocationServiceProvider service={locationService}>
+          <UrlSyncContextProvider scene={dashboard}>
+            <NavToolbarActions dashboard={dashboard} />
+          </UrlSyncContextProvider>
+        </LocationServiceProvider>
+      </TestProvider>
+    );
+
+    // AppChromeUpdate hands the toolbar to app chrome rather than rendering it in place.
+    render(<TestProvider grafanaContext={context}>{context.chrome.state.getValue().actions}</TestProvider>);
+
+    return { dashboard, onBuild, onDismiss };
+  }
+
+  it.each([true, false])('offers only Build and Dismiss (dashboardNewLayouts=%s)', async (newLayouts) => {
+    setTestFlags({ dashboardNewLayouts: newLayouts });
+    setupPlanning();
+
+    expect(await screen.findByText('Kafka overview')).toBeInTheDocument();
+    expect(screen.getByTestId(selectors.components.NavToolbar.editDashboard.planningBuildButton)).toBeInTheDocument();
+    expect(screen.getByTestId(selectors.components.NavToolbar.editDashboard.planningDismissButton)).toBeInTheDocument();
+    expect(screen.queryByTestId(selectors.components.NavToolbar.editDashboard.saveButton)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(selectors.components.NavToolbar.editDashboard.settingsButton)).not.toBeInTheDocument();
+  });
+
+  it('wires the banner actions to the plan callbacks', async () => {
+    const { onBuild, onDismiss } = setupPlanning();
+
+    await userEvent.click(screen.getByTestId(selectors.components.NavToolbar.editDashboard.planningBuildButton));
+    expect(onBuild).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(screen.getByTestId(selectors.components.NavToolbar.editDashboard.planningDismissButton));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});

@@ -1,0 +1,195 @@
+import { useState } from 'react';
+
+import { AppEvents } from '@grafana/data';
+import { t } from '@grafana/i18n';
+import { locationService } from '@grafana/runtime';
+import { Dropdown, Menu } from '@grafana/ui';
+import { appEvents } from 'app/core/app_events';
+import { useDispatch } from 'app/types/store';
+
+import { alertingFolderActionsApi } from '../../api/alertingFolderActionsApi';
+import { shouldUseAlertingListViewV2, shouldUsePrometheusRulesPrimary } from '../../featureToggles';
+import { useFolderBulkActionAbility } from '../../hooks/abilities/otherAbilities';
+import { useGlobalRuleAbility } from '../../hooks/abilities/rules/ruleAbilities';
+import { FolderBulkAction, RuleAction } from '../../hooks/abilities/types';
+import { useFolder } from '../../hooks/useFolder';
+import { fetchAllPromAndRulerRulesAction, fetchAllPromRulesAction, fetchRulerRulesAction } from '../../state/actions';
+import { GRAFANA_RULES_SOURCE_NAME } from '../../utils/datasource';
+import { getFolderActionResultMessage } from '../../utils/folderActionMessages';
+import { createRelativeUrl } from '../../utils/url';
+import MoreButton from '../MoreButton';
+import { GrafanaRuleFolderExporter } from '../export/GrafanaRuleFolderExporter';
+
+import { DeleteModal } from './DeleteModal';
+import { PauseUnpauseActionMenuItem } from './PauseUnpauseActionMenuItem';
+interface Props {
+  folderUID: string;
+}
+
+export const FolderActionsButton = ({ folderUID }: Props) => {
+  // state
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+
+  // feature toggles
+  const listView2Enabled = shouldUseAlertingListViewV2();
+
+  const { granted: canExportRules } = useGlobalRuleAbility(RuleAction.ExportRules);
+
+  const [deleteGrafanaRulesFromFolder, deleteState] =
+    alertingFolderActionsApi.endpoints.deleteGrafanaRulesFromFolder.useMutation();
+
+  const { folder } = useFolder(folderUID);
+  const folderName = folder?.title || 'unknown folder';
+  const viewComponent = listView2Enabled ? 'list' : 'grouped';
+
+  // URLs
+  const redirectToListView = useRedirectToListView(viewComponent);
+
+  if (!folder) {
+    return null;
+  }
+
+  const onConfirmDelete = async () => {
+    const result = await deleteGrafanaRulesFromFolder({ namespace: folderUID }).unwrap();
+    const message = getFolderActionResultMessage('delete', { affected: result.deleted, skipped: result.skipped });
+    appEvents.emit(AppEvents.alertSuccess, [message]);
+    await redirectToListView();
+  };
+
+  const menuItems = (
+    <>
+      <BulkActions folderUID={folderUID} onClickDelete={setIsDeleteModalOpen} isLoading={deleteState.isLoading} />
+      {canExportRules && (
+        <>
+          <Menu.Divider />
+          <ExportFolderButton onClickExport={() => setIsExporting(true)} />
+        </>
+      )}
+    </>
+  );
+
+  return (
+    <>
+      <Dropdown placement="bottom" overlay={<Menu>{menuItems}</Menu>}>
+        <MoreButton
+          fill="text"
+          size="sm"
+          aria-label={t('alerting.list-view.folder-actions.button.aria-label', 'Folder actions')}
+          title={t('alerting.list-view.folder-actions.button.title', 'Actions')}
+        />
+      </Dropdown>
+      {isExporting && <GrafanaRuleFolderExporter folder={folder} onClose={() => setIsExporting(false)} />}
+      <DeleteModal
+        isOpen={isDeleteModalOpen}
+        onConfirm={onConfirmDelete}
+        onDismiss={() => setIsDeleteModalOpen(false)}
+        folderName={folderName}
+      />
+    </>
+  );
+};
+
+function useRedirectToListView(view: string) {
+  const dispatch = useDispatch();
+  const prometheusRulesPrimary = shouldUsePrometheusRulesPrimary();
+  const redirectToListView = async () => {
+    if (prometheusRulesPrimary) {
+      await dispatch(fetchRulerRulesAction({ rulesSourceName: GRAFANA_RULES_SOURCE_NAME }));
+      await dispatch(fetchAllPromRulesAction(false));
+    } else {
+      await dispatch(fetchAllPromAndRulerRulesAction(false));
+    }
+    locationService.push(createRelativeUrl('/alerting/list', { view }, { skipSubPath: true }));
+  };
+
+  return redirectToListView;
+}
+
+function ExportFolderButton({ onClickExport }: { onClickExport: () => void }) {
+  return (
+    <Menu.Item
+      aria-label={t('alerting.list-view.folder-actions.export.aria-label', 'Export rules folder')}
+      data-testid="export-folder"
+      key="export-folder"
+      label={t('alerting.list-view.folder-actions.export.label', 'Export rules folder')}
+      icon="download-alt"
+      onClick={onClickExport}
+    />
+  );
+}
+
+function BulkActions({
+  folderUID,
+  onClickDelete,
+  isLoading,
+}: {
+  folderUID: string;
+  onClickDelete: (showModal: boolean) => void;
+  isLoading: boolean;
+}) {
+  // feature toggles
+  const listView2Enabled = shouldUseAlertingListViewV2();
+
+  // abilities
+  const { granted: canPause } = useFolderBulkActionAbility(FolderBulkAction.Pause);
+  const { granted: canDelete } = useFolderBulkActionAbility(FolderBulkAction.Delete);
+
+  // mutations
+  const [pauseFolder, updateState] = alertingFolderActionsApi.endpoints.pauseFolder.useMutation();
+  const [unpauseFolder, unpauseState] = alertingFolderActionsApi.endpoints.unpauseFolder.useMutation();
+
+  // URLs
+  const viewComponent = listView2Enabled ? 'list' : 'grouped';
+  const redirectToListView = useRedirectToListView(viewComponent);
+
+  if (!canPause && !canDelete) {
+    return null;
+  }
+
+  return (
+    <>
+      <Menu.Divider />
+      {canPause && (
+        <>
+          <PauseUnpauseActionMenuItem
+            folderUID={folderUID}
+            action="pause"
+            executeAction={async (folderUID) => {
+              const result = await pauseFolder({ namespace: folderUID }).unwrap();
+              const message = getFolderActionResultMessage('pause', {
+                affected: result.updated,
+                skipped: result.skipped,
+              });
+              appEvents.emit(AppEvents.alertSuccess, [message]);
+              await redirectToListView();
+            }}
+            isLoading={updateState.isLoading}
+          />
+          <PauseUnpauseActionMenuItem
+            folderUID={folderUID}
+            action="unpause"
+            executeAction={async (folderUID) => {
+              const result = await unpauseFolder({ namespace: folderUID }).unwrap();
+              const message = getFolderActionResultMessage('resume', {
+                affected: result.updated,
+                skipped: result.skipped,
+              });
+              appEvents.emit(AppEvents.alertSuccess, [message]);
+              await redirectToListView();
+            }}
+            isLoading={unpauseState.isLoading}
+          />
+        </>
+      )}
+      {canDelete && (
+        <Menu.Item
+          label={t('alerting.folder-bulk-actions.delete.button.label', 'Delete all rules')}
+          icon="trash-alt"
+          onClick={() => onClickDelete(true)}
+          disabled={isLoading}
+        />
+      )}
+    </>
+  );
+}

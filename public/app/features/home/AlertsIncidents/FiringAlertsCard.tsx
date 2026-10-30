@@ -1,0 +1,188 @@
+import { t, Trans } from '@grafana/i18n';
+import { useFlagGrafanaGrowthHomepage } from '@grafana/runtime/internal';
+import { Badge, LinkButton, Stack, Tooltip } from '@grafana/ui';
+import { SeverityBars } from 'app/features/alerting/unified/triage/scene/filters/SeverityBars';
+import { type SeverityLevel } from 'app/features/alerting/unified/triage/scene/filters/severity';
+import { type AlertmanagerAlert } from 'app/plugins/datasource/alertmanager/types';
+import { ListRow } from 'app/plugins/panel/dashlist/ListRow';
+
+import { TimeAgoCell } from '../TimeAgoCell';
+import { ctaClicked } from '../analytics/main';
+
+import { CreateAndViewAlertsButtons } from './CreateAndViewAlertsButtons';
+import { SummaryCard, SummaryCardPrefix } from './SummaryCard';
+import { type FilterScope, formatFilterLabel } from './filterSelection';
+import { severityLevelColor } from './severity';
+import { type FiringAlertsData } from './useFiringAlerts';
+
+/** Extract the path (with query string) from an absolute generatorURL, falling back to the raw value. */
+function alertDetailHref(alert: AlertmanagerAlert) {
+  const raw = alert.generatorURL;
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const url = new URL(raw);
+    return url.pathname + url.search;
+  } catch {
+    return raw;
+  }
+}
+
+function severityLabel(level?: SeverityLevel): string {
+  switch (level) {
+    case 'critical':
+      return t('home.firing-alerts-card.severity-critical', 'Critical');
+    case 'major':
+      return t('home.firing-alerts-card.severity-high', 'High');
+    case 'minor':
+      return t('home.firing-alerts-card.severity-minor', 'Minor');
+    case 'low':
+      return t('home.firing-alerts-card.severity-low', 'Low');
+    default:
+      return t('home.firing-alerts-card.severity-unknown', 'Unknown');
+  }
+}
+
+/**
+ * Empty-state copy scoped to the active filter. A picked label overrides the
+ * "your teams" default filter, so the copy names the picked label instead
+ * of claiming it's the user's own teams.
+ */
+function emptyMessage(filterScope: FilterScope, hasTeams: boolean): string {
+  switch (filterScope.kind) {
+    case 'all':
+      return t('home.firing-alerts-card.empty', 'You have no firing alerts.');
+    case 'label':
+      return t('home.firing-alerts-card.empty-selected-label', 'No firing alerts with {{label}}.', {
+        label: formatFilterLabel(filterScope.label),
+        interpolation: { escapeValue: false },
+      });
+    case 'default':
+      return hasTeams
+        ? t('home.firing-alerts-card.empty-teams', 'No firing alerts for your teams.')
+        : t('home.firing-alerts-card.empty', 'You have no firing alerts.');
+  }
+}
+
+/** Render-only card body; data comes from useFiringAlerts so callers control where the hook runs. */
+export function FiringAlertsCard({
+  data,
+  hideFooterActions = false,
+}: {
+  data: FiringAlertsData;
+  hideFooterActions?: boolean;
+}) {
+  const redesignEnabled = useFlagGrafanaGrowthHomepage();
+  const {
+    count,
+    criticalCount,
+    highCount,
+    visibleAlerts,
+    hasAlerts,
+    hasTeams,
+    filterScope,
+    loading,
+    error,
+    refetch,
+    canCreate,
+    newRuleHref,
+    viewAllHref,
+  } = data;
+
+  return (
+    <SummaryCard
+      title={t('home.firing-alerts-card.title', 'Firing alerts')}
+      count={count}
+      headerExtra={
+        <Stack>
+          {criticalCount > 0 && (
+            <Badge
+              text={t('home.firing-alerts-card.critical-count', '', {
+                count: criticalCount,
+                defaultValue_one: '{{count}} critical',
+                defaultValue_other: '{{count}} critical',
+              })}
+              color="red"
+            />
+          )}
+          {highCount > 0 && (
+            <Badge
+              text={t('home.firing-alerts-card.high-count', '', {
+                count: highCount,
+                defaultValue_one: '{{count}} high',
+                defaultValue_other: '{{count}} high',
+              })}
+              color="orange"
+            />
+          )}
+        </Stack>
+      }
+      loading={loading}
+      error={
+        error
+          ? {
+              title: t('home.firing-alerts-card.error-title', 'Could not load firing alerts'),
+              onRetry: () => refetch(),
+            }
+          : undefined
+      }
+      items={visibleAlerts}
+      getItemKey={({ alert }) => alert.fingerprint}
+      renderItem={({ alert, level, startedAt }) => {
+        const detailHref = alertDetailHref(alert);
+        return (
+          <ListRow
+            isCompact
+            showDivider={redesignEnabled}
+            title={alert.labels.alertname}
+            subtitle={alert.labels.team}
+            // when redesignEnabled is false, we want to show the subtitle inline with the title
+            // when its true, we want to show the subtitle below the title
+            oneRow={!redesignEnabled}
+            prefix={
+              redesignEnabled ? (
+                <Tooltip content={severityLabel(level)}>
+                  <span>
+                    <SeverityBars level={level} />
+                    <span className="sr-only">{severityLabel(level)}</span>
+                  </span>
+                </Tooltip>
+              ) : (
+                <SummaryCardPrefix>
+                  <Badge text={severityLabel(level)} color={severityLevelColor(level)} />
+                </SummaryCardPrefix>
+              )
+            }
+            trailing={<TimeAgoCell date={startedAt} />}
+            href={detailHref}
+            onClick={() => ctaClicked({ surface: 'alerts_card', action: 'alert_detail', placement: 'list' })}
+          />
+        );
+      }}
+      emptyMessage={emptyMessage(filterScope, hasTeams)}
+      emptyAction={
+        canCreate ? (
+          <LinkButton
+            variant="primary"
+            icon="plus"
+            href={newRuleHref}
+            onClick={() => ctaClicked({ surface: 'alerts_card', action: 'create_rule', placement: 'empty_state' })}
+          >
+            <Trans i18nKey="home.firing-alerts-card.create">Create an alert rule</Trans>
+          </LinkButton>
+        ) : undefined
+      }
+      footer={
+        !hideFooterActions && (
+          <CreateAndViewAlertsButtons
+            hasAlerts={hasAlerts}
+            canCreate={canCreate}
+            newRuleHref={newRuleHref}
+            viewAllHref={viewAllHref}
+          />
+        )
+      }
+    />
+  );
+}

@@ -1,0 +1,146 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TMPDIR: ${{ github.workspace }}/../tmp
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare runner
+        run: |
+          mkdir -p "$TMPDIR"
+          sudo fallocate -l 8G /swapfile2 && sudo chmod 600 /swapfile2 && sudo mkswap /swapfile2 && sudo swapon /swapfile2 || true
+          free -g; nproc; df -h .
+
+      - name: Set up Node.js
+        uses: ./.github/actions/setup-node
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore backend build
+        id: backend-cache
+        uses: actions/cache@v5
+        with:
+          key: "e2e-backend-${{ runner.os }}-${{ hashFiles('**/go.mod', '**/go.sum', 'go.work', 'go.work.sum', 'pkg/**/*.go', 'apps/**/*.go', '!**_test.go', 'Makefile', 'embed.go') }}"
+          path: bin
+
+      # The backend compiles while the frontend installs and builds
+      - name: Start backend build
+        if: steps.backend-cache.outputs.cache-hit != 'true'
+        run: |
+          nohup bash -c 'make build-go > go-build.log 2>&1; echo $? > go-build.exit' > /dev/null 2>&1 &
+
+      - name: Install yarn dependencies
+        uses: ./.github/actions/yarn-install
+
+      - name: Build frontend
+        env:
+          NO_SOURCEMAP: '1'
+        run: |
+          yarn themes-generate
+          yarn nx run-many -t build --projects='tag:scope:plugin,@test-plugins/*'
+          yarn build:rspack
+
+      - name: Wait for backend build
+        if: steps.backend-cache.outputs.cache-hit != 'true'
+        run: |
+          while [ ! -f go-build.exit ]; do sleep 5; done
+          tail -20 go-build.log
+          exit "$(cat go-build.exit)"
+
+      - name: Start Grafana server
+        env:
+          # Upstream splits the suite into 8 short shards; one longer run must outlive the 10-minute session rotation
+          GF_AUTH_TOKEN_ROTATION_INTERVAL_MINUTES: '120'
+        run: |
+          mkdir -p grafana-server
+          cp -r bin conf tools grafana-server/
+          ln -s "$PWD/public" grafana-server/public
+          mkdir -p grafana-server/conf/provisioning/{datasources,dashboards,alerting,plugins}
+          cp scripts/grafana-server/custom.ini grafana-server/conf/custom.ini
+          cp devenv/datasources.yaml grafana-server/conf/provisioning/datasources/
+          cp devenv/dashboards.yaml grafana-server/conf/provisioning/dashboards/
+          cp devenv/alert_rules.yaml grafana-server/conf/provisioning/alerting/
+          cp devenv/plugins.yaml grafana-server/conf/provisioning/plugins/
+          mkdir -p grafana-server/data/plugins
+          cp -r e2e-playwright/test-plugins/. grafana-server/data/plugins/
+          grafana-server/bin/grafana server \
+            --homepath="$PWD/grafana-server" \
+            cfg:server.http_port=3001 \
+            > grafana-server/grafana.log 2>&1 &
+
+          # A second server on a sub path with the Luxon date implementation, for the tests that need them
+          mkdir -p grafana-server/data-subpath
+          GF_SERVER_HTTP_PORT=3002 \
+          GF_SERVER_ROOT_URL=http://localhost:3002/grafana/ \
+          GF_SERVER_SERVE_FROM_SUB_PATH=true \
+          GF_PATHS_DATA="$PWD/grafana-server/data-subpath" \
+          GF_PATHS_PLUGINS="$PWD/grafana-server/data/plugins" \
+          GF_FEATURE_TOGGLES_ENABLE=datetime.useLuxon \
+          GF_AUTH_ANONYMOUS_ENABLED=true \
+          GF_AUTH_ANONYMOUS_ORG_ROLE=Admin \
+          grafana-server/bin/grafana server \
+            --homepath="$PWD/grafana-server" \
+            > grafana-server/grafana-subpath.log 2>&1 &
+
+      - name: Install Playwright browsers
+        uses: ./.github/actions/setup-playwright
+
+      - name: Wait for Grafana server to start
+        run: |
+          for i in $(seq 1 120); do
+            curl -s -f http://localhost:3001/api/health > /dev/null && \
+              curl -s -f http://localhost:3002/grafana/api/health > /dev/null && exit 0
+            sleep 1
+          done
+          tail -50 grafana-server/grafana.log grafana-server/grafana-subpath.log
+          exit 1
+
+      - name: Run e2e tests
+        run: >-
+          yarn e2e:playwright --project=panels --project=dashboards --project=various
+          'panels-suite/(gauge|stat|timeseries|table-|panelEdit_(base|queries|toolbarActions|transforms)|state-timeline|status-history|barchart-|histogram|trend|xychart)'
+          dashboards-suite/
+          'various-suite/(inspect-drawer|keybinds)'
+        env:
+          GRAFANA_URL: http://localhost:3001
+          GRAFANA_SUBPATH_URL: http://localhost:3002/grafana
+          CI: true
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+            test-results.json
+            grafana-server/*.log
+            go-build.log
+          retention-days: 30
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.json
+          retention-days: 30

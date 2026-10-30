@@ -1,0 +1,320 @@
+package resource
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	grpccodes "google.golang.org/grpc/codes"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+
+	"github.com/grafana/grafana/pkg/apimachinery/utils"
+	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/storage/unified/resourceclient/resourceutil"
+	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+	"github.com/grafana/grafana/pkg/util/scheduler"
+)
+
+// Package-level errors.
+var (
+	ErrNotImplementedYet = errors.New("not implemented yet")
+
+	ErrResourceAlreadyExists error = &apierrors.StatusError{
+		ErrStatus: metav1.Status{
+			Status:  metav1.StatusFailure,
+			Reason:  metav1.StatusReasonAlreadyExists,
+			Message: "the resource already exists",
+			Code:    http.StatusConflict,
+		},
+	}
+)
+
+func NewBadRequestError(msg string) *resourcepb.ErrorResult {
+	return &resourcepb.ErrorResult{
+		Message: msg,
+		Code:    http.StatusBadRequest,
+		Reason:  string(metav1.StatusReasonBadRequest),
+	}
+}
+
+// NewServiceUnavailableError reports that the server cannot answer yet, as
+// opposed to the request being wrong.
+func NewServiceUnavailableError(msg string) *resourcepb.ErrorResult {
+	return &resourcepb.ErrorResult{
+		Message: msg,
+		Code:    http.StatusServiceUnavailable,
+		Reason:  string(metav1.StatusReasonServiceUnavailable),
+	}
+}
+
+func NewNotFoundError(key *resourcepb.ResourceKey) *resourcepb.ErrorResult {
+	return &resourcepb.ErrorResult{
+		Code:   http.StatusNotFound,
+		Reason: string(metav1.StatusReasonNotFound),
+		Details: &resourcepb.ErrorDetails{
+			Group: key.Group,
+			Kind:  key.Resource, // yup, resource as kind same is true in apierrors.NewNotFound()
+			Name:  key.Name,
+		},
+	}
+}
+
+// The helpers live in pkg/storage/unified/resourceclient/resourceutil. These forwarders keep
+// existing callers compiling.
+
+func NewResourceVersionExpiredError(rv int64) error {
+	return resourceutil.NewResourceVersionExpiredError(rv)
+}
+
+func IsResourceVersionExpired(err error) bool {
+	return resourceutil.IsResourceVersionExpired(err)
+}
+
+func IsConflict(err error) bool {
+	return resourceutil.IsConflict(err)
+}
+
+func ErrorFromResponse(respErr *resourcepb.ErrorResult, err error) error {
+	return resourceutil.ErrorFromResponse(respErr, err)
+}
+
+func AsErrorResult(err error) *resourcepb.ErrorResult {
+	return resourceutil.AsErrorResult(err)
+}
+
+func StatusError(res *resourcepb.ErrorResult) error {
+	return resourceutil.StatusError(res)
+}
+
+func StatusErrorFromResponse(respErr *resourcepb.ErrorResult, err error) error {
+	return resourceutil.StatusErrorFromResponse(respErr, err)
+}
+
+func NewTooManyRequestsError(msg string) *resourcepb.ErrorResult {
+	return &resourcepb.ErrorResult{
+		Message: msg,
+		Code:    http.StatusTooManyRequests,
+		Reason:  string(metav1.StatusReasonTooManyRequests),
+	}
+}
+
+func NewConflictStatusError(group, resource, name, message string) *apierrors.StatusError {
+	return apierrors.NewConflict(schema.GroupResource{
+		Group:    group,
+		Resource: resource,
+	}, name, fmt.Errorf("%s", message))
+}
+
+func newInvalidFieldError(
+	obj utils.GrafanaMetaAccessor,
+	detail string,
+	path string,
+	morePath ...string,
+) *resourcepb.ErrorResult {
+	gvk := obj.GetGroupVersionKind()
+	return &resourcepb.ErrorResult{
+		Message: detail,
+		Code:    http.StatusUnprocessableEntity,
+		Reason:  string(metav1.StatusReasonInvalid),
+		Details: &resourcepb.ErrorDetails{
+			Name:  obj.GetName(),
+			Group: gvk.Group,
+			Kind:  gvk.Kind,
+			Uid:   string(obj.GetUID()),
+			Causes: []*resourcepb.ErrorCause{
+				{
+					Reason: string(field.ErrorTypeForbidden),
+					Field:  field.NewPath(path, morePath...).String(),
+				},
+			},
+		},
+	}
+}
+
+// SelectableFieldNotIndexedReason is a cause reason, not a top-level one: the
+// top-level reason has to stay a Kubernetes reason so grpcCodeFromErrorResult can
+// map it without falling back to the HTTP code.
+const SelectableFieldNotIndexedReason = "SelectableFieldNotIndexed"
+
+// NewSelectableFieldNotIndexedError reports that the index cannot answer a filter
+// on the given fields.
+func NewSelectableFieldNotIndexedError(fields []string) *resourcepb.ErrorResult {
+	causes := make([]*resourcepb.ErrorCause, 0, len(fields))
+	for _, f := range fields {
+		causes = append(causes, &resourcepb.ErrorCause{
+			Reason: SelectableFieldNotIndexedReason,
+			Field:  f,
+		})
+	}
+	return &resourcepb.ErrorResult{
+		Message: fmt.Sprintf("the index does not hold the selectable fields %v, so it cannot answer a filter on them", fields),
+		Code:    http.StatusBadRequest,
+		Reason:  string(metav1.StatusReasonBadRequest),
+		Details: &resourcepb.ErrorDetails{Causes: causes},
+	}
+}
+
+// IsSelectableFieldNotIndexed reports whether a search was refused because the
+// index does not hold a field the request filtered on.
+func IsSelectableFieldNotIndexed(res *resourcepb.ErrorResult) bool {
+	for _, c := range res.GetDetails().GetCauses() {
+		if c.GetReason() == SelectableFieldNotIndexedReason {
+			return true
+		}
+	}
+	return false
+}
+
+func newRequiredFieldError(
+	obj utils.GrafanaMetaAccessor,
+	detail string,
+	path string,
+	morePath ...string,
+) *resourcepb.ErrorResult {
+	gvk := obj.GetGroupVersionKind()
+	return &resourcepb.ErrorResult{
+		Message: detail,
+		Code:    http.StatusUnprocessableEntity,
+		Reason:  string(metav1.StatusReasonInvalid),
+		Details: &resourcepb.ErrorDetails{
+			Name:  obj.GetName(),
+			Group: gvk.Group,
+			Kind:  gvk.Kind,
+			Uid:   string(obj.GetUID()),
+			Causes: []*resourcepb.ErrorCause{
+				{
+					Reason: string(field.ErrorTypeRequired),
+					Field:  field.NewPath(path, morePath...).String(),
+				},
+			},
+		},
+	}
+}
+
+func HandleQueueError[T any](err error, makeResp func(*resourcepb.ErrorResult) *T) (*T, error) {
+	if errors.Is(err, scheduler.ErrTenantQueueFull) {
+		return makeResp(NewTooManyRequestsError("tenant queue is full, please try again later")), nil
+	}
+	return makeResp(AsErrorResult(err)), nil
+}
+
+var (
+	ErrNamespaceRequired                 = "namespace is required"
+	ErrResourceVersionInvalid            = "resource version must be positive"
+	ErrActionRequired                    = "action is required"
+	ErrActionInvalid                     = "action is invalid: must be one of 'created', 'updated', or 'deleted'"
+	ErrNameMustBeEmptyWhenNamespaceEmpty = "name must be empty when namespace is empty"
+)
+
+type ValidationError struct {
+	Field string
+	Value string
+	Msg   string
+}
+
+func (e ValidationError) Error() string {
+	return fmt.Sprintf("%s '%s' is invalid: %s", e.Field, e.Value, e.Msg)
+}
+
+func NewValidationError(field, value, msg string) error {
+	return ValidationError{Field: field, Value: value, Msg: msg}
+}
+
+var errorMappingLog = log.New("resource-error-mapping")
+
+// grpcCodeFromErrorResult returns a grpc status code based on the ErrorResult. If no ErrorResult is given "OK" is
+// returned. ErrorResult reason takes priority over the embedded http code due to a generally lossy http to grpc code
+// conversion.
+// A non nil ErrorResult will never return "OK".
+func grpcCodeFromErrorResult(res *resourcepb.ErrorResult) grpccodes.Code {
+	if res == nil {
+		return grpccodes.OK
+	}
+	httpCode, reason := res.Code, res.Reason
+	if code, ok := grpcCodeFromReason(metav1.StatusReason(reason)); ok {
+		return code
+	}
+	if reason != "" {
+		errorMappingLog.Warn("Unrecognized error reason, falling back to HTTP status", "httpCode", httpCode, "reason", reason)
+	}
+
+	switch httpCode {
+	case http.StatusOK:
+		// An embedded error must not be labeled as a success.
+		errorMappingLog.Warn("ErrorResult is non nil with a 200 OK http code", "reason", reason)
+		return grpccodes.Internal
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+		return grpccodes.InvalidArgument
+	case http.StatusUnauthorized:
+		return grpccodes.Unauthenticated
+	case http.StatusForbidden:
+		return grpccodes.PermissionDenied
+	case http.StatusNotFound:
+		return grpccodes.NotFound
+	case http.StatusRequestTimeout:
+		return grpccodes.DeadlineExceeded
+	case http.StatusConflict:
+		return grpccodes.AlreadyExists
+	case http.StatusPreconditionFailed:
+		return grpccodes.FailedPrecondition
+	case http.StatusGone, http.StatusRequestedRangeNotSatisfiable:
+		return grpccodes.OutOfRange
+	case http.StatusUnprocessableEntity:
+		return grpccodes.InvalidArgument
+	case http.StatusTooManyRequests:
+		return grpccodes.ResourceExhausted
+	case http.StatusInternalServerError:
+		return grpccodes.Internal
+	case http.StatusNotImplemented:
+		return grpccodes.Unimplemented
+	case http.StatusServiceUnavailable:
+		return grpccodes.Unavailable
+	case http.StatusGatewayTimeout:
+		return grpccodes.DeadlineExceeded
+	case 499:
+		return grpccodes.Canceled
+	}
+
+	if httpCode >= 400 && httpCode < 500 {
+		errorMappingLog.Warn("Unmapped HTTP status, assuming InvalidArgument", "httpCode", httpCode)
+		return grpccodes.InvalidArgument
+	}
+	errorMappingLog.Warn("Unmapped HTTP status, assuming Internal", "httpCode", httpCode)
+	return grpccodes.Internal
+}
+
+func grpcCodeFromReason(reason metav1.StatusReason) (grpccodes.Code, bool) {
+	switch reason {
+	case metav1.StatusReasonUnauthorized:
+		return grpccodes.Unauthenticated, true
+	case metav1.StatusReasonForbidden:
+		return grpccodes.PermissionDenied, true
+	case metav1.StatusReasonNotFound:
+		return grpccodes.NotFound, true
+	case metav1.StatusReasonAlreadyExists:
+		return grpccodes.AlreadyExists, true
+	case metav1.StatusReasonConflict:
+		return grpccodes.Aborted, true
+	case metav1.StatusReasonGone, metav1.StatusReasonExpired:
+		return grpccodes.OutOfRange, true
+	case metav1.StatusReasonBadRequest, metav1.StatusReasonInvalid,
+		metav1.StatusReasonNotAcceptable, metav1.StatusReasonUnsupportedMediaType,
+		metav1.StatusReasonRequestEntityTooLarge:
+		return grpccodes.InvalidArgument, true
+	case metav1.StatusReasonTimeout:
+		return grpccodes.DeadlineExceeded, true
+	case metav1.StatusReasonServerTimeout, metav1.StatusReasonServiceUnavailable:
+		return grpccodes.Unavailable, true
+	case metav1.StatusReasonTooManyRequests:
+		return grpccodes.ResourceExhausted, true
+	case metav1.StatusReasonMethodNotAllowed:
+		return grpccodes.Unimplemented, true
+	case metav1.StatusReasonInternalError, metav1.StatusReasonStoreReadError:
+		return grpccodes.Internal, true
+	default:
+		return grpccodes.Unknown, false
+	}
+}

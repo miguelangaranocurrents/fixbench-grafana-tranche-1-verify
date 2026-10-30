@@ -1,0 +1,288 @@
+import { type ChangeEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { type UseFormSetValue, useForm } from 'react-hook-form';
+
+import { selectors } from '@grafana/e2e-selectors';
+import { Trans, t } from '@grafana/i18n';
+import { Button, Input, Switch, Field, Label, TextArea, Stack, Box } from '@grafana/ui';
+import { FolderPicker } from 'app/core/components/Select/FolderPicker';
+import { AnnoKeyUseCrossDashboardVariables } from 'app/features/apiserver/types';
+import { validationSrv } from 'app/features/manage-dashboards/services/ValidationSrv';
+
+import { type DashboardScene } from '../scene/DashboardScene';
+
+import { type SaveDashboardDrawer } from './SaveDashboardDrawer';
+import { getSaveDashboardErrorInfo } from './saveErrors';
+import {
+  type DashboardChangeInfo,
+  NameAlreadyExistsError,
+  SaveButton,
+  SaveDashboardErrorAlert,
+  nextMetaAfterFolderPick,
+} from './shared';
+import { useParkSaveFormDraft } from './useParkSaveFormDraft';
+import { useSaveDashboard } from './useSaveDashboard';
+
+interface SaveDashboardAsFormDTO {
+  firstName?: string;
+  title: string;
+  description: string;
+  folder: { uid?: string; title?: string };
+  copyTags: boolean;
+}
+
+export interface Props {
+  dashboard: DashboardScene;
+  changeInfo: DashboardChangeInfo;
+  /** Owns cancel (restoring Save As folder/meta mutations) and carries title/description across a swap to another save form */
+  drawer: SaveDashboardDrawer;
+  /** The drawer's view is held: a folder pick's lookup is still loading or dead-ended, so where this save would land is not known yet and saving must wait */
+  isHeld: boolean;
+}
+
+export function SaveDashboardAsForm({ dashboard, changeInfo, drawer, isHeld }: Props) {
+  const { changedSaveModel } = changeInfo;
+  const draft = drawer.saveFormDraft;
+
+  const { register, handleSubmit, setValue, formState, getValues, watch, trigger } = useForm<SaveDashboardAsFormDTO>({
+    mode: 'onBlur',
+    defaultValues: {
+      title: draft?.title ?? (changeInfo.isNew ? changedSaveModel.title! : `${changedSaveModel.title} Copy`),
+      description: draft?.description ?? changedSaveModel.description ?? '',
+      folder: {
+        uid: dashboard.state.meta.folderUid,
+        title: dashboard.state.meta.folderTitle,
+      },
+      // The Copy tags switch below is hidden for new dashboards, which have no source to copy
+      // from: their tags are the user's own, so the default must keep them.
+      copyTags: changeInfo.isNew,
+    },
+  });
+
+  const { errors, isValid } = formState;
+  const formValues = watch();
+
+  const { state, onSaveDashboard } = useSaveDashboard(false);
+
+  const [contentSent, setContentSent] = useState<{ title?: string; folderUid?: string }>({});
+
+  const validationTimeoutRef = useRef<NodeJS.Timeout>(undefined);
+
+  // Validate title on form mount to catch invalid default values
+  useEffect(() => {
+    trigger('title');
+  }, [trigger]);
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (validationTimeoutRef.current) {
+        clearTimeout(validationTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useParkSaveFormDraft(drawer, formValues.title, formValues.description);
+
+  const onFolderChange = useCallback(
+    (uid: string | undefined, title: string | undefined) => {
+      setValue('folder', { uid, title });
+      // Meta is where the drawer resolves the repository from
+      dashboard.setState({ meta: nextMetaAfterFolderPick(dashboard.state.meta, uid, title) });
+      // Re-validate title when folder changes to check for duplicates in new folder
+      trigger('title');
+    },
+    [dashboard, setValue, trigger]
+  );
+
+  const handleTitleChange = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      setValue('title', e.target.value, { shouldDirty: true });
+      if (validationTimeoutRef.current) {
+        clearTimeout(validationTimeoutRef.current);
+      }
+      validationTimeoutRef.current = setTimeout(() => {
+        trigger('title');
+      }, 400);
+    },
+    [setValue, trigger]
+  );
+
+  const onSave = async (overwrite: boolean) => {
+    if (isHeld) {
+      return;
+    }
+
+    if (validationTimeoutRef.current) {
+      clearTimeout(validationTimeoutRef.current);
+    }
+
+    const isTitleValid = await trigger('title');
+
+    // This prevents the race between the new input and old validation state
+    if (!isTitleValid) {
+      return;
+    }
+
+    const data = getValues();
+
+    // Only forward the selection annotation. Spreading full getK8SMetadata() would include
+    // name/resourceVersion and turn Save As into an update of the source dashboard.
+    const useCrossDashboardVariables =
+      dashboard.state.meta.k8s?.annotations?.[AnnoKeyUseCrossDashboardVariables] ??
+      dashboard.serializer.getK8SMetadata()?.annotations?.[AnnoKeyUseCrossDashboardVariables];
+
+    const result = await onSaveDashboard(dashboard, {
+      overwrite,
+      folderUid: data.folder.uid,
+      rawDashboardJSON: changedSaveModel,
+
+      // save as config
+      saveAsCopy: true,
+      isNew: changeInfo.isNew,
+      copyTags: data.copyTags,
+      title: data.title,
+      description: data.description,
+      ...(useCrossDashboardVariables !== undefined
+        ? {
+            k8s: {
+              annotations: {
+                [AnnoKeyUseCrossDashboardVariables]: useCrossDashboardVariables,
+              },
+            },
+          }
+        : {}),
+    });
+
+    if (result.status === 'success') {
+      dashboard.closeModal();
+    } else {
+      setContentSent({
+        title: data.title,
+        folderUid: data.folder.uid,
+      });
+    }
+  };
+
+  const cancelButton = (
+    <Button variant="secondary" onClick={drawer.onClose} fill="outline">
+      <Trans i18nKey="dashboard-scene.save-dashboard-as-form.cancel-button.cancel">Cancel</Trans>
+    </Button>
+  );
+
+  const saveButton = (overwrite: boolean) => {
+    return (
+      <SaveButton isValid={isValid} isLoading={state.loading} disabled={isHeld} onSave={onSave} overwrite={overwrite} />
+    );
+  };
+  function renderFooter(error?: Error) {
+    const formValuesMatchContentSent =
+      formValues.title.trim() === contentSent.title?.trim() && formValues.folder.uid === contentSent.folderUid;
+    // Once the user edits the title or folder the error no longer describes what they'd be saving.
+    const errorInfo = formValuesMatchContentSent ? getSaveDashboardErrorInfo(error) : undefined;
+
+    if (errorInfo?.kind === 'already-exists') {
+      return <NameAlreadyExistsError />;
+    }
+    return (
+      <>
+        {errorInfo && <SaveDashboardErrorAlert info={errorInfo} />}
+        <Stack alignItems="center">
+          {cancelButton}
+          {saveButton(false)}
+        </Stack>
+      </>
+    );
+  }
+
+  return (
+    <form onSubmit={handleSubmit(() => onSave(false))}>
+      <Stack direction="column" gap={2}>
+        <Field
+          noMargin
+          label={<TitleFieldLabel onChange={setValue} />}
+          invalid={!!errors.title}
+          error={errors.title?.message}
+        >
+          <Input
+            {...register('title', {
+              required: t('dashboard-scene.save-dashboard-as-form.required', 'Required'),
+              validate: validateDashboardName,
+              onChange: handleTitleChange,
+            })}
+            aria-label={t(
+              'dashboard-scene.save-dashboard-as-form.aria-label-save-dashboard-title-field',
+              'Save dashboard title field'
+            )}
+            data-testid={selectors.components.Drawer.DashboardSaveDrawer.saveAsTitleInput}
+          />
+        </Field>
+        <Field
+          noMargin
+          label={<DescriptionLabel onChange={setValue} />}
+          invalid={!!errors.description}
+          error={errors.description?.message}
+        >
+          <TextArea
+            {...register('description', { required: false })}
+            aria-label={t(
+              'dashboard-scene.save-dashboard-as-form.aria-label-save-dashboard-description-field',
+              'Save dashboard description field'
+            )}
+            autoFocus
+          />
+        </Field>
+
+        <Field noMargin label={t('dashboard-scene.save-dashboard-as-form.label-folder', 'Folder')}>
+          <FolderPicker onChange={onFolderChange} value={formValues.folder?.uid} />
+        </Field>
+        {!changeInfo.isNew && (
+          <Field noMargin label={t('dashboard-scene.save-dashboard-as-form.label-copy-tags', 'Copy tags')}>
+            <Switch {...register('copyTags')} />
+          </Field>
+        )}
+        <Box paddingTop={2}>{renderFooter(state.error)}</Box>
+      </Stack>
+    </form>
+  );
+}
+
+interface TitleLabelProps {
+  onChange: UseFormSetValue<SaveDashboardAsFormDTO>;
+}
+
+function TitleFieldLabel(props: TitleLabelProps) {
+  return (
+    <Stack justifyContent="space-between">
+      <Label htmlFor="description">
+        <Trans i18nKey="dashboard-scene.title-field-label.title">Title</Trans>
+      </Label>
+    </Stack>
+  );
+}
+
+interface DescriptionLabelProps {
+  onChange: UseFormSetValue<SaveDashboardAsFormDTO>;
+}
+
+function DescriptionLabel(props: DescriptionLabelProps) {
+  return (
+    <Stack justifyContent="space-between">
+      <Label htmlFor="description">
+        <Trans i18nKey="dashboard-scene.description-label.description">Description</Trans>
+      </Label>
+    </Stack>
+  );
+}
+
+async function validateDashboardName(title: string, formValues: SaveDashboardAsFormDTO) {
+  if (title === formValues.folder.title?.trim()) {
+    return 'Dashboard name cannot be the same as folder name';
+  }
+
+  try {
+    await validationSrv.validateNewDashboardName(formValues.folder.uid ?? 'general', title);
+    return true;
+  } catch (e) {
+    return e instanceof Error ? e.message : 'Dashboard name is invalid';
+  }
+}

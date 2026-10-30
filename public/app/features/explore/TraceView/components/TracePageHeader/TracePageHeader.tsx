@@ -1,0 +1,735 @@
+// Copyright (c) 2017 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { css, cx } from '@emotion/css';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import * as React from 'react';
+
+import {
+  type CoreApp,
+  type TraceSearchProps,
+  type DataFrame,
+  dateTimeFormat,
+  dateTimeFormatTimeAgo,
+  type GrafanaTheme2,
+  type LinkModel,
+  PluginExtensionPoints,
+} from '@grafana/data';
+import { selectors } from '@grafana/e2e-selectors';
+import { Trans, t } from '@grafana/i18n';
+import {
+  reportInteraction,
+  renderLimitedComponents,
+  usePluginComponents,
+  usePluginLinks,
+  config,
+  logError,
+} from '@grafana/runtime';
+import { AdHocFiltersComboboxRenderer } from '@grafana/scenes';
+import { type TimeZone } from '@grafana/schema';
+import {
+  Badge,
+  type BadgeColor,
+  Button,
+  CollapsableSection,
+  copyTextToClipboard,
+  Dropdown,
+  Icon,
+  Label,
+  Menu,
+  Tooltip,
+  useStyles2,
+  useTheme2,
+} from '@grafana/ui';
+import { useAppNotification } from 'app/core/copy/appNotification';
+
+import { downloadTraceAsJson } from '../../../../inspector/utils/download';
+import { LogsLinkButton } from '../TraceTimelineViewer/SpanDetail/LogsLink';
+import {
+  type ViewRangeTimeUpdate,
+  type TUpdateViewRangeTimeFunction,
+  type ViewRange,
+} from '../TraceTimelineViewer/types';
+import { SpanErrorIcon } from '../common/SpanErrorIcon';
+import { getHeaderTags, getRootSpan } from '../model/trace-viewer';
+import { type Trace, type TraceViewPluginExtensionContext } from '../types/trace';
+import { formatDuration } from '../utils/date';
+import { getServiceColorKey, getServiceDisplayName } from '../utils/service-name';
+
+import TracePageSearchBar from './SearchBar/TracePageSearchBar';
+import SpanGraph from './SpanGraph';
+import { TraceBanner } from './TraceBanner/TraceBanner';
+import { findTraceBanner, HttpStatusClass } from './TraceBanner/findTraceBanner';
+import { TraceFilterPills } from './TraceFilterPills';
+import { useTraceAdHocFiltersController } from './useTraceAdHocFiltersController';
+
+export type TracePageHeaderProps = {
+  trace: Trace | null;
+  data: DataFrame;
+  app: CoreApp | string;
+  timeZone: TimeZone;
+  search: TraceSearchProps;
+  setSearch: (newSearch: TraceSearchProps) => void;
+  showSpanFilters: boolean;
+  setShowSpanFilters: (isOpen: boolean) => void;
+  setFocusedSpanIdForSearch: (spanID: string) => void;
+  onGoToSpan: (spanID: string) => void;
+  spanFilterMatches: Set<string> | undefined;
+  datasourceType: string;
+  datasourceName: string;
+  datasourceUid: string;
+  setHeaderHeight: (height: number) => void;
+  updateNextViewRangeTime: (update: ViewRangeTimeUpdate) => void;
+  updateViewRangeTime: TUpdateViewRangeTimeFunction;
+  viewRange: ViewRange;
+  hideHeaderDetails?: boolean;
+  /** Trace-level related-logs link (no span id filter). */
+  logsLinkModel?: LinkModel;
+};
+
+export const TracePageHeader = memo((props: TracePageHeaderProps) => {
+  const {
+    trace,
+    data,
+    app,
+    timeZone,
+    search,
+    setSearch,
+    showSpanFilters,
+    setFocusedSpanIdForSearch,
+    onGoToSpan,
+    spanFilterMatches,
+    datasourceType,
+    datasourceName,
+    datasourceUid,
+    setHeaderHeight,
+    updateNextViewRangeTime,
+    updateViewRangeTime,
+    viewRange,
+    hideHeaderDetails = false,
+    logsLinkModel,
+  } = props;
+
+  const styles = useStyles2(getStyles);
+  const theme = useTheme2();
+  const notifyApp = useAppNotification();
+  const [copyTraceIdClicked, setCopyTraceIdClicked] = useState(false);
+  const [isOverviewOpen, setIsOverviewOpen] = useState(true);
+  const [focusedSpanIndexForSearch, setFocusedSpanIndexForSearch] = useState(-1);
+
+  const goToBannerSpan = useCallback(
+    (spanId: string) => {
+      reportInteraction('grafana_traces_trace_view_go_to_span_clicked', {
+        app,
+        datasourceType,
+        grafana_version: config.buildInfo.version,
+        location: 'trace-banner',
+      });
+      onGoToSpan(spanId);
+    },
+    [app, datasourceType, onGoToSpan]
+  );
+
+  // Create controller for adhoc filters
+  const controller = useTraceAdHocFiltersController(trace, search, setSearch);
+
+  // Build context for plugin extensions if trace is available
+  const traceContext: TraceViewPluginExtensionContext | undefined = trace
+    ? {
+        ...trace,
+        datasource: {
+          name: datasourceName,
+          uid: datasourceUid,
+          type: datasourceType,
+        },
+      }
+    : undefined;
+
+  const { links: extensionLinks } = usePluginLinks({
+    extensionPointId: PluginExtensionPoints.TraceViewHeaderActions,
+    context: traceContext,
+    limitPerPlugin: 2,
+  });
+
+  const { components: extensionComponents } = usePluginComponents<TraceViewPluginExtensionContext>({
+    extensionPointId: PluginExtensionPoints.TraceViewHeaderActions,
+  });
+
+  const traceBanner = useMemo(() => (trace ? findTraceBanner(trace.spans) : undefined), [trace]);
+
+  useEffect(() => {
+    setHeaderHeight(document.querySelector('.' + styles.header)?.scrollHeight ?? 0);
+  }, [
+    setHeaderHeight,
+    showSpanFilters,
+    styles.header,
+    extensionComponents,
+    extensionLinks,
+    logsLinkModel,
+    traceBanner,
+  ]);
+
+  // Memoize service count to avoid recomputing on every render
+  // Uses getServiceColorKey to count namespace/serviceName pairs as distinct services
+  const serviceCount = useMemo(() => {
+    return new Set(trace?.spans.map((span) => (span.process ? getServiceColorKey(span.process) : ''))).size;
+  }, [trace?.spans]);
+
+  if (!trace) {
+    return null;
+  }
+
+  const { method, status, url } = getHeaderTags(trace.spans);
+  const rootSpan = getRootSpan(trace.spans);
+  const serviceName = rootSpan ? getServiceDisplayName(rootSpan.process) : '';
+  const operationName = rootSpan?.operationName ?? '';
+  const traceTitle = [serviceName, operationName].filter(Boolean).join(' ');
+  const statusValue = status?.length ? status[0].value.toString() : undefined;
+  const statusClass = statusValue?.charAt(0);
+  // Match the banner: severity comes from every span, not only the root / first HTTP span.
+  const showErrorIcon = traceBanner?.severity === 'error';
+  const showWarningIcon = traceBanner?.severity === 'warning';
+  const showSuccessIcon = !traceBanner && statusClass === HttpStatusClass.Success;
+
+  // Convert date from micro to milli seconds
+  const formattedTimestamp = dateTimeFormat(trace.startTime / 1000, { timeZone, defaultWithMS: true });
+
+  let statusColor: BadgeColor = 'green';
+  if (statusClass === HttpStatusClass.ClientError) {
+    statusColor = 'orange';
+  } else if (statusClass === HttpStatusClass.ServerError) {
+    statusColor = 'red';
+  }
+
+  const copyTraceId = () => {
+    navigator.clipboard.writeText(trace.traceID);
+    setCopyTraceIdClicked(true);
+    setTimeout(() => {
+      setCopyTraceIdClicked(false);
+    }, 5000);
+  };
+
+  const exportTrace = () => {
+    const traceFormat = downloadTraceAsJson(data, 'Trace-' + trace.traceID.substring(trace.traceID.length - 6));
+    reportInteraction('grafana_traces_download_traces_clicked', {
+      app,
+      grafana_version: config.buildInfo.version,
+      trace_format: traceFormat,
+      location: 'trace-view',
+    });
+  };
+
+  const shareDropdownMenu = (
+    <Menu>
+      <Menu.Group label={t('explore.trace-page-header.share-group', 'Share')}>
+        <Menu.Item
+          label={t('explore.trace-page-header.share-copy-link', 'Copy link')}
+          icon="link"
+          testId={selectors.components.TraceViewer.shareMenu.copyLinkButton}
+          onClick={async () => {
+            try {
+              await copyTextToClipboard(window.location.href);
+              notifyApp.success(t('explore.trace-page-header.link-copied', 'Link copied to clipboard'));
+            } catch (e) {
+              logError(e instanceof Error ? e : new Error(String(e)));
+              notifyApp.error(t('explore.trace-page-header.link-copy-failed', 'Could not copy link to clipboard'));
+            }
+          }}
+        />
+        <Menu.Item
+          label={t('explore.trace-page-header.share-export-json', 'Export as JSON')}
+          icon="download-alt"
+          testId={selectors.components.TraceViewer.shareMenu.exportJsonButton}
+          onClick={() => {
+            exportTrace();
+            notifyApp.success(t('explore.trace-page-header.export-started', 'Export started'));
+          }}
+        />
+      </Menu.Group>
+      {config.feedbackLinksEnabled && (
+        <Menu.Group label={t('explore.trace-page-header.feedback-group', 'Feedback')}>
+          <Menu.Item
+            label={t('explore.trace-page-header.give-feedback-item', 'Give feedback')}
+            icon="comment-alt-message"
+            url="https://forms.gle/RZDEx8ScyZNguDoC8"
+            target="_blank"
+            testId={selectors.components.TraceViewer.shareMenu.feedbackLink}
+          />
+        </Menu.Group>
+      )}
+    </Menu>
+  );
+
+  return (
+    <header className={styles.header}>
+      {/* Main title row */}
+      <div className={styles.titleRow}>
+        <div className={styles.titleSection}>
+          {showErrorIcon && (
+            <SpanErrorIcon ariaLabel={t('explore.trace-page-header.error-indicator', 'Trace has errors')} />
+          )}
+          {showWarningIcon && (
+            <Icon
+              name="exclamation-triangle"
+              className={styles.warningIcon}
+              aria-label={t('explore.trace-page-header.warning-indicator', 'Trace has client errors')}
+            />
+          )}
+          {showSuccessIcon && (
+            <Icon
+              name="check-circle"
+              className={styles.successIcon}
+              aria-label={t('explore.trace-page-header.success-indicator', 'Trace succeeded')}
+            />
+          )}
+          <h1 className={styles.title} aria-label={traceTitle}>
+            {serviceName && (
+              <span className={styles.serviceName}>{operationName ? `${serviceName} ` : serviceName}</span>
+            )}
+            {operationName && <span className={styles.operationName}>{operationName}</span>}
+          </h1>
+          <div className={styles.badges}>
+            {method && method.length > 0 && <Badge text={method[0].value} color="blue" />}
+            {statusValue && <Badge text={statusValue} color={statusColor} />}
+          </div>
+        </div>
+
+        {/* Action buttons */}
+        {!hideHeaderDetails && (
+          <div className={styles.actions}>
+            {/* Plugin extension actions */}
+            {extensionLinks.length > 0 && (
+              <div className={styles.actions}>
+                {extensionLinks.map((link) => (
+                  <Tooltip key={link.id} content={link.description || link.title}>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      fill="outline"
+                      icon={link.icon}
+                      onClick={(event) => {
+                        if (link.path) {
+                          window.open(link.path, '_blank');
+                        }
+                        link.onClick?.(event);
+                      }}
+                    >
+                      {link.title}
+                    </Button>
+                  </Tooltip>
+                ))}
+              </div>
+            )}
+
+            <div className={styles.pluginActions}>
+              {traceContext
+                ? renderLimitedComponents<TraceViewPluginExtensionContext>({
+                    props: traceContext,
+                    components: extensionComponents,
+                    limit: 2,
+                    wrapper: PluginActionItem,
+                  })
+                : null}
+            </div>
+
+            {logsLinkModel && <LogsLinkButton linkModel={logsLinkModel} traceDatasourceUid={datasourceUid} forTrace />}
+
+            <Dropdown overlay={shareDropdownMenu} placement="bottom-end">
+              <Button
+                size="sm"
+                variant="secondary"
+                fill="text"
+                icon="ellipsis-v"
+                tooltip={t('explore.trace-page-header.share-tooltip', 'Share and feedback')}
+                aria-label={t('explore.trace-page-header.aria-label-share-dropdown', 'Open share and feedback menu')}
+                aria-haspopup="menu"
+                data-testid={selectors.components.TraceViewer.shareMenu.triggerButton}
+              />
+            </Dropdown>
+          </div>
+        )}
+      </div>
+
+      {!hideHeaderDetails && traceBanner && (
+        <TraceBanner highlight={traceBanner} traceDuration={trace.duration} onGoToSpan={goToBannerSpan} />
+      )}
+
+      {/* Metadata row */}
+      {!hideHeaderDetails && (
+        <>
+          <div className={styles.metadataRow}>
+            <div className={styles.metadataItem}>
+              <span className={styles.metadataLabel}>{t('explore.trace-page-header.trace-id', 'Trace ID')}</span>
+              <span className={styles.metadataValue}>
+                <button className={styles.traceIdButton} onClick={copyTraceId}>
+                  {trace.traceID}
+                  <Icon name={copyTraceIdClicked ? 'check' : 'copy'} size="sm" className={styles.copyIcon} />
+                </button>
+              </span>
+            </div>
+
+            <div className={styles.metadataItem}>
+              <span className={styles.metadataField}>
+                <Icon name="clock-nine" size="xs" className={styles.metadataIcon} aria-hidden />
+                <span className={styles.metadataLabel}>{t('explore.trace-page-header.start-time', 'Start time')}</span>
+              </span>
+              <span
+                className={cx(
+                  styles.metadataValue,
+                  css({
+                    gap: theme.spacing(0.5),
+                  })
+                )}
+              >
+                <span>{formattedTimestamp}</span>
+                <span className={styles.timestampDetail}>({dateTimeFormatTimeAgo(trace.startTime / 1000)})</span>
+              </span>
+            </div>
+
+            <div className={styles.metadataItem}>
+              <span className={styles.metadataField}>
+                <Icon name="stopwatch" type="default" size="sm" className={styles.metadataIcon} aria-hidden />
+                <span className={styles.metadataLabel}>{t('explore.trace-page-header.duration', 'Duration')}</span>
+              </span>
+              <span className={styles.metadataValue}>{formatDuration(trace.duration)}</span>
+            </div>
+
+            <div className={styles.metadataItem}>
+              <span className={styles.metadataLabel}>{t('explore.trace-page-header.services', 'Services')}</span>
+              <span className={styles.metadataValue}>{serviceCount}</span>
+            </div>
+
+            <div className={styles.metadataItem}>
+              <span className={styles.metadataLabel}>{t('explore.trace-page-header.spans', 'Spans')}</span>
+              <span className={styles.metadataValue}>{trace.spans.length}</span>
+            </div>
+
+            {url && url.length > 0 && (
+              <div className={styles.metadataItem}>
+                <span className={styles.metadataLabel}>
+                  {url[0].key === 'http.route' && t('explore.trace-page-header.route', 'Route')}
+                  {url[0].key === 'http.url' && t('explore.trace-page-header.url', 'URL')}
+                  {url[0].key === 'http.target' && t('explore.trace-page-header.target', 'Target')}
+                  {url[0].key === 'http.path' && t('explore.trace-page-header.path', 'Path')}
+                </span>
+                <span className={styles.metadataValue}>
+                  <Tooltip
+                    content={
+                      <div>
+                        <div>
+                          <Trans
+                            i18nKey="explore.trace-page-header.tooltip-url"
+                            values={{
+                              route: 'http.route',
+                              url: 'http.url',
+                              target: 'http.target',
+                              path: 'http.path',
+                            }}
+                          >
+                            {'{{route}}'} or {'{{url}}'} or {'{{target}}'} or {'{{path}}'}
+                          </Trans>
+                        </div>
+                        <div>({url[0].value})</div>
+                      </div>
+                    }
+                    interactive={true}
+                  >
+                    <span className={styles.url}>{url[0].value}</span>
+                  </Tooltip>
+                </span>
+              </div>
+            )}
+          </div>
+
+          <CollapsableSection
+            label={<span className={styles.overviewLabel}>{t('explore.trace-page-header.overview', 'Overview')}</span>}
+            isOpen={isOverviewOpen}
+            onToggle={setIsOverviewOpen}
+            className={styles.overviewCollapsableSection}
+            contentClassName={styles.overviewCollapsableSectionContent}
+          >
+            <SpanGraph
+              trace={trace}
+              viewRange={viewRange}
+              updateNextViewRangeTime={updateNextViewRangeTime}
+              updateViewRangeTime={updateViewRangeTime}
+            />
+          </CollapsableSection>
+        </>
+      )}
+
+      {!hideHeaderDetails && (
+        <div className={styles.filtersContainer}>
+          <Label>{t('explore.trace-page-header.filters', 'Filters')}</Label>
+          <div className={styles.adhocFiltersRow} data-testid={selectors.components.TraceViewer.filtersRow}>
+            {controller && <AdHocFiltersComboboxRenderer controller={controller} />}
+          </div>
+          {trace && (
+            <div className={styles.searchAndPillsRow}>
+              <TraceFilterPills trace={trace} search={search} setSearch={setSearch} />
+              <TracePageSearchBar
+                trace={trace}
+                search={search}
+                spanFilterMatches={spanFilterMatches}
+                setShowSpanFilterMatchesOnly={(showMatchesOnly: boolean) =>
+                  setSearch({ ...search, matchesOnly: showMatchesOnly })
+                }
+                focusedSpanIndexForSearch={focusedSpanIndexForSearch}
+                setFocusedSpanIndexForSearch={setFocusedSpanIndexForSearch}
+                setFocusedSpanIdForSearch={setFocusedSpanIdForSearch}
+                datasourceType={datasourceType}
+                showSpanFilters={showSpanFilters}
+              />
+            </div>
+          )}
+        </div>
+      )}
+    </header>
+  );
+});
+
+TracePageHeader.displayName = 'TracePageHeader';
+
+function PluginActionItem({ children }: { children: React.ReactNode }) {
+  const styles = useStyles2(getStyles);
+  return <div className={styles.pluginActionItem}>{children}</div>;
+}
+
+const getStyles = (theme: GrafanaTheme2) => {
+  return {
+    header: css({
+      label: 'TracePageHeader',
+      backgroundColor: theme.colors.background.primary,
+      padding: '0.5em',
+      position: 'sticky',
+      top: 0,
+      zIndex: 5,
+      textAlign: 'left',
+    }),
+
+    titleRow: css({
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: theme.spacing(1),
+      gap: theme.spacing(2),
+    }),
+
+    titleSection: css({
+      display: 'flex',
+      alignItems: 'center',
+      gap: theme.spacing(1),
+      flex: 1,
+      minWidth: 0, // Allow text truncation
+    }),
+
+    title: css({
+      display: 'flex',
+      alignItems: 'baseline',
+      gap: theme.spacing(1),
+      color: theme.colors.text.primary,
+      fontSize: theme.typography.h4.fontSize,
+      fontWeight: theme.typography.fontWeightMedium,
+      lineHeight: theme.typography.h4.lineHeight,
+      margin: 0,
+      minWidth: 0,
+      overflow: 'hidden',
+    }),
+
+    serviceName: css({
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }),
+
+    operationName: css({
+      color: theme.colors.text.secondary,
+      fontSize: theme.typography.body.fontSize,
+      fontWeight: theme.typography.fontWeightRegular,
+      lineHeight: theme.typography.body.lineHeight,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }),
+
+    warningIcon: css({
+      color: theme.colors.warning.text,
+      flexShrink: 0,
+    }),
+
+    successIcon: css({
+      color: theme.colors.success.text,
+      flexShrink: 0,
+    }),
+
+    badges: css({
+      display: 'flex',
+      gap: theme.spacing(0.5),
+      alignItems: 'center',
+      flexShrink: 0,
+    }),
+
+    actions: css({
+      display: 'flex',
+      alignItems: 'center',
+      gap: theme.spacing(1),
+      flexShrink: 0,
+    }),
+
+    pluginActions: css({
+      display: 'flex',
+      alignItems: 'center',
+      gap: theme.spacing(1),
+      flexShrink: 0,
+    }),
+
+    pluginActionItem: css({
+      display: 'flex',
+      alignItems: 'center',
+      '&:has([data-testid="assistant-button"])': {
+        padding: 1,
+        borderRadius: theme.shape.radius.default,
+        background: 'linear-gradient(90deg, rgb(168, 85, 247), rgb(249, 115, 22))',
+      },
+      '& [data-testid="assistant-button"]': {
+        border: 'none !important',
+      },
+      '& [data-testid="assistant-button"]::before, & [data-testid="assistant-button"]::after': {
+        display: 'none',
+      },
+    }),
+
+    metadataRow: css({
+      display: 'flex',
+      alignItems: 'center',
+      columnGap: theme.spacing(3),
+      rowGap: theme.spacing(0.5),
+      fontSize: theme.typography.bodySmall.fontSize,
+      lineHeight: theme.typography.bodySmall.lineHeight,
+      color: theme.colors.text.secondary,
+      flexWrap: 'wrap',
+    }),
+
+    metadataItem: css({
+      display: 'flex',
+      alignItems: 'center',
+      gap: theme.spacing(0.5),
+      lineHeight: 1,
+    }),
+
+    metadataField: css({
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: theme.spacing(0.5),
+      lineHeight: 1,
+    }),
+
+    metadataIcon: css({
+      color: theme.colors.text.secondary,
+      display: 'block',
+      flexShrink: 0,
+      lineHeight: 0,
+      transform: 'translateY(-1px)',
+    }),
+
+    metadataLabel: css({
+      fontWeight: theme.typography.fontWeightMedium,
+      color: theme.colors.text.secondary,
+      lineHeight: 1,
+    }),
+
+    metadataValue: css({
+      color: theme.colors.text.primary,
+      display: 'flex',
+      alignItems: 'center',
+      gap: theme.spacing(1),
+      lineHeight: 1,
+    }),
+
+    traceIdButton: css({
+      background: 'none',
+      border: 'none',
+      color: theme.colors.text.primary,
+      cursor: 'pointer',
+      textDecoration: 'none',
+      display: 'flex',
+      alignItems: 'center',
+      gap: theme.spacing(0.5),
+      padding: 0,
+      font: 'inherit',
+      lineHeight: theme.typography.bodySmall.lineHeight,
+
+      '&:hover': {
+        color: theme.colors.emphasize(theme.colors.text.primary, 0.15),
+      },
+    }),
+
+    copyIcon: css({
+      opacity: 0.7,
+    }),
+
+    copiedText: css({
+      color: theme.colors.success.text,
+      fontSize: theme.typography.bodySmall.fontSize,
+      fontWeight: theme.typography.fontWeightMedium,
+    }),
+
+    timestampDetail: css({
+      color: theme.colors.text.disabled,
+    }),
+
+    url: css({
+      maxWidth: '240px',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      display: 'block',
+      lineHeight: theme.typography.bodySmall.lineHeight,
+      color: theme.colors.text.primary,
+    }),
+    overviewLabel: css({
+      fontSize: theme.typography.bodySmall.fontSize,
+      fontWeight: theme.typography.fontWeightMedium,
+      color: theme.colors.text.primary,
+
+      display: 'flex',
+      alignItems: 'center',
+    }),
+    overviewCollapsableSection: css({
+      flexDirection: 'row',
+      justifyContent: 'flex-start',
+      gap: theme.spacing(0.5),
+    }),
+    overviewCollapsableSectionContent: css({
+      padding: theme.spacing(0, 1, 2, 1),
+    }),
+    filtersContainer: css({
+      display: 'flex',
+      flexDirection: 'column',
+      gap: theme.spacing(0.5),
+    }),
+    adhocFiltersRow: css({
+      display: 'flex',
+      width: '100%',
+    }),
+    searchAndPillsRow: css({
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: theme.spacing(2),
+      width: '100%',
+      marginTop: theme.spacing(0.5),
+    }),
+  };
+};

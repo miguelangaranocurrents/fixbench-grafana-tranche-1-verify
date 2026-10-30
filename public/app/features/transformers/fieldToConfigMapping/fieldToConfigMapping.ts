@@ -1,0 +1,405 @@
+import { isArray } from 'lodash';
+
+import {
+  anyToNumber,
+  colorManipulator,
+  type DataFrame,
+  FieldColorModeId,
+  type FieldConfig,
+  getFieldDisplayName,
+  MappingType,
+  ReducerID,
+  sortThresholds,
+  ThresholdsMode,
+  type ValueMapping,
+  type ValueMap,
+  type Field,
+  FieldType,
+} from '@grafana/data';
+import { config as grafanaConfig } from '@grafana/runtime';
+
+const MAX_DECIMALS = 15;
+
+interface ThresholdArguments {
+  color: string;
+}
+
+export interface HandlerArguments {
+  threshold?: ThresholdArguments;
+}
+
+export interface FieldToConfigMapping {
+  fieldName: string;
+  reducerId?: ReducerID;
+  handlerKey: string | null;
+  handlerArguments?: HandlerArguments;
+}
+
+/**
+ * Transforms a frame with fields to a map of field configs
+ *
+ * Input
+ * | Unit        | Min | Max |
+ * --------------------------------
+ * | Temperature |  0  | 30  |
+ * | Pressure    |  0  | 100 |
+ *
+ * Outputs
+ * {
+    { min: 0, max: 100 },
+ * }
+ */
+
+export function getFieldConfigFromFrame(
+  frame: DataFrame,
+  rowIndex: number,
+  evaluatedMappings: EvaluatedMappingResult
+): FieldConfig {
+  const config: FieldConfig = {};
+  const context: FieldToConfigContext = {};
+
+  for (const field of frame.fields) {
+    const fieldName = getFieldDisplayName(field, frame);
+    const mapping = evaluatedMappings.index[fieldName];
+    const handler = mapping.handler;
+
+    if (!handler) {
+      continue;
+    }
+
+    const configValue = field.values[rowIndex];
+
+    if (configValue === null || configValue === undefined) {
+      continue;
+    }
+
+    const newValue = handler.processor(configValue, config, context, mapping.handlerArguments);
+    if (newValue != null) {
+      (config as any)[handler.targetProperty ?? handler.key] = newValue;
+    }
+  }
+
+  if (context.mappingValues) {
+    config.mappings = combineValueMappings(context);
+  }
+
+  // Threshold steps are pushed in the order their fields appear in the frame.
+  // Downstream consumers (getActiveThreshold, the filled-region gradient, ...)
+  // assume steps are sorted ascending by value, so mapping more than one field
+  // to a threshold could otherwise emit out-of-order steps and break rendering.
+  if (config.thresholds) {
+    config.thresholds.steps = sortThresholds(config.thresholds.steps);
+  }
+
+  return config;
+}
+
+interface FieldToConfigContext {
+  mappingValues?: unknown[];
+  mappingColors?: string[];
+  mappingTexts?: string[];
+}
+
+type FieldToConfigMapHandlerProcessor = (
+  value: any,
+  config: FieldConfig,
+  context: FieldToConfigContext,
+  handlerArguments: HandlerArguments
+) => unknown;
+
+export interface FieldToConfigMapHandler {
+  key: string;
+  targetProperty?: string;
+  name?: string;
+  processor: FieldToConfigMapHandlerProcessor;
+  defaultReducer?: ReducerID;
+}
+
+export enum FieldConfigHandlerKey {
+  Name = 'field.name',
+  Value = 'field.value',
+  Label = 'field.label',
+  Ignore = '__ignore',
+}
+
+export const configMapHandlers: FieldToConfigMapHandler[] = [
+  {
+    key: FieldConfigHandlerKey.Name,
+    name: 'Field name',
+    processor: () => {},
+  },
+  {
+    key: FieldConfigHandlerKey.Value,
+    name: 'Field value',
+    processor: () => {},
+  },
+  {
+    key: FieldConfigHandlerKey.Label,
+    name: 'Field label',
+    processor: () => {},
+  },
+  {
+    key: FieldConfigHandlerKey.Ignore,
+    name: 'Ignore',
+    processor: () => {},
+  },
+  {
+    key: 'max',
+    processor: toNumericOrUndefined,
+  },
+  {
+    key: 'min',
+    processor: toNumericOrUndefined,
+  },
+  {
+    key: 'unit',
+    processor: (value) => value.toString(),
+  },
+  {
+    key: 'decimals',
+    processor: toDecimalsOrUndefined,
+  },
+  {
+    key: 'displayName',
+    name: 'Display name',
+    processor: (value) => value.toString(),
+  },
+  {
+    key: 'color',
+    processor: toFixedColorOrUndefined,
+  },
+  {
+    key: 'threshold1',
+    name: 'Threshold',
+    targetProperty: 'thresholds',
+    processor: (value, config, _, handlerArguments) => {
+      const numeric = anyToNumber(value);
+
+      if (isNaN(numeric)) {
+        return;
+      }
+
+      if (!config.thresholds) {
+        config.thresholds = {
+          mode: ThresholdsMode.Absolute,
+          steps: [],
+        };
+      }
+
+      config.thresholds.steps.push({
+        value: numeric,
+        color: handlerArguments.threshold?.color ?? 'red',
+      });
+
+      return config.thresholds;
+    },
+  },
+  {
+    key: 'mappings.value',
+    name: 'Value mappings / Value',
+    targetProperty: 'mappings',
+    defaultReducer: ReducerID.allValues,
+    processor: (value, config, context) => {
+      if (!isArray(value)) {
+        return;
+      }
+
+      context.mappingValues = value;
+      return config.mappings;
+    },
+  },
+  {
+    key: 'mappings.color',
+    name: 'Value mappings / Color',
+    targetProperty: 'mappings',
+    defaultReducer: ReducerID.allValues,
+    processor: (value, config, context) => {
+      if (!isArray(value)) {
+        return;
+      }
+
+      context.mappingColors = value;
+      return config.mappings;
+    },
+  },
+  {
+    key: 'mappings.text',
+    name: 'Value mappings / Display text',
+    targetProperty: 'mappings',
+    defaultReducer: ReducerID.allValues,
+    processor: (value, config, context) => {
+      if (!isArray(value)) {
+        return;
+      }
+
+      context.mappingTexts = value;
+      return config.mappings;
+    },
+  },
+];
+
+function combineValueMappings(context: FieldToConfigContext): ValueMapping[] {
+  const valueMap: ValueMap = {
+    type: MappingType.ValueToText,
+    options: {},
+  };
+
+  if (!context.mappingValues) {
+    return [];
+  }
+
+  for (let i = 0; i < context.mappingValues.length; i++) {
+    const value = context.mappingValues[i];
+    if (value != null) {
+      valueMap.options[value.toString()] = {
+        color: context.mappingColors && context.mappingColors[i],
+        text: context.mappingTexts && context.mappingTexts[i],
+        index: i,
+      };
+    }
+  }
+
+  return [valueMap];
+}
+
+let configMapHandlersIndex: Record<string, FieldToConfigMapHandler> | null = null;
+
+function getConfigMapHandlersIndex() {
+  if (configMapHandlersIndex === null) {
+    configMapHandlersIndex = {};
+    for (const def of configMapHandlers) {
+      configMapHandlersIndex[def.key] = def;
+    }
+  }
+
+  return configMapHandlersIndex;
+}
+
+function toNumericOrUndefined(value: unknown) {
+  const numeric = anyToNumber(value);
+
+  if (isNaN(numeric)) {
+    return;
+  }
+
+  return numeric;
+}
+
+// The Decimals field option only accepts whole numbers from 0 to MAX_DECIMALS.
+// A value outside that range reaches Number.prototype.toFixed through the
+// display processor, which throws a RangeError for negative values and blanks
+// the panel, so skip the mapping rather than write a value the option itself
+// would reject.
+function toDecimalsOrUndefined(value: unknown) {
+  const numeric = anyToNumber(value);
+
+  if (!Number.isInteger(numeric) || numeric < 0 || numeric > MAX_DECIMALS) {
+    return;
+  }
+
+  return numeric;
+}
+
+// Panels resolve a fixed color through the theme and then colorManipulator,
+// which throws on anything it cannot parse (such as -3) and blanks the panel.
+// Run the value through the same two steps and skip it if they throw. A looser
+// check such as tinycolor accepts formats like 'ff0000' that still crash.
+// decomposeColor only checks the prefix, so 'rgb(foo)' parses to NaN channels
+// without throwing; skip those too.
+function toFixedColorOrUndefined(value: unknown) {
+  if (typeof value !== 'string') {
+    return;
+  }
+
+  let channels: number[];
+  try {
+    channels = colorManipulator.decomposeColor(grafanaConfig.theme2.visualization.getColorByName(value)).values;
+  } catch {
+    return;
+  }
+
+  if (channels.length < 3 || !channels.every(Number.isFinite)) {
+    return;
+  }
+
+  return { fixedColor: value, mode: FieldColorModeId.Fixed };
+}
+
+export function lookUpConfigHandler(key: string | null): FieldToConfigMapHandler | null {
+  if (!key) {
+    return null;
+  }
+
+  return getConfigMapHandlersIndex()[key];
+}
+
+interface EvaluatedMapping {
+  automatic: boolean;
+  handler: FieldToConfigMapHandler | null;
+  handlerArguments: HandlerArguments;
+  reducerId: ReducerID;
+}
+export interface EvaluatedMappingResult {
+  index: Record<string, EvaluatedMapping>;
+  nameField?: Field;
+  valueField?: Field;
+}
+
+export function evaluateFieldMappings(
+  frame: DataFrame,
+  mappings: FieldToConfigMapping[],
+  withNameAndValue?: boolean
+): EvaluatedMappingResult {
+  const result: EvaluatedMappingResult = {
+    index: {},
+  };
+
+  // Look up name and value field in mappings
+  let nameFieldMappping = mappings.find((x) => x.handlerKey === FieldConfigHandlerKey.Name);
+  let valueFieldMapping = mappings.find((x) => x.handlerKey === FieldConfigHandlerKey.Value);
+
+  for (const field of frame.fields) {
+    const fieldName = getFieldDisplayName(field, frame);
+    const mapping = mappings.find((x) => x.fieldName === fieldName);
+    const key = mapping ? mapping.handlerKey : fieldName.toLowerCase();
+    let handler = lookUpConfigHandler(key);
+
+    // Name and value handlers are a special as their auto logic is based on first matching criteria
+    if (withNameAndValue) {
+      // If we have a handler it means manually specified field
+      if (handler) {
+        if (handler.key === FieldConfigHandlerKey.Name) {
+          result.nameField = field;
+        }
+        if (handler.key === FieldConfigHandlerKey.Value) {
+          result.valueField = field;
+        }
+      } else if (!mapping) {
+        // We have no name field and no mapping for it, pick first string
+        if (!result.nameField && !nameFieldMappping && field.type === FieldType.string) {
+          result.nameField = field;
+          handler = lookUpConfigHandler(FieldConfigHandlerKey.Name);
+        }
+
+        if (!result.valueField && !valueFieldMapping && field.type === FieldType.number) {
+          result.valueField = field;
+          handler = lookUpConfigHandler(FieldConfigHandlerKey.Value);
+        }
+      }
+    }
+
+    // If no handle and when in name and value mode (Rows to fields) default to labels
+    if (!handler && withNameAndValue) {
+      handler = lookUpConfigHandler(FieldConfigHandlerKey.Label);
+    }
+
+    result.index[fieldName] = {
+      automatic: !mapping,
+      handler: handler,
+      handlerArguments: mapping?.handlerArguments ?? {},
+      reducerId: mapping?.reducerId ?? handler?.defaultReducer ?? ReducerID.lastNotNull,
+    };
+  }
+
+  return result;
+}

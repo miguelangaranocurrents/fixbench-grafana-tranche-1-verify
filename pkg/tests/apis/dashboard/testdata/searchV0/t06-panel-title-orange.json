@@ -1,0 +1,17 @@
+{
+  "totalHits": 1,
+  "hits": [
+    {
+      "resource": "dashboards",
+      "name": "timeseries-by-value-color-schemes",
+      "title": "Panel Tests - Graph NG - By value color schemes",
+      "tags": [
+        "gdev",
+        "panel-tests",
+        "graph-ng"
+      ],
+      "score": 0.087
+    }
+  ],
+  "maxScore": 0.087
+}

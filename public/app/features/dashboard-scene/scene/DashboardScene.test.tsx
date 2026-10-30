@@ -1,0 +1,4263 @@
+import { waitFor } from '@testing-library/react';
+import { createBrowserHistory } from 'history';
+
+import {
+  CoreApp,
+  type GrafanaConfig,
+  LiveChannelEventType,
+  LoadingState,
+  type NavIndex,
+  getDefaultTimeRange,
+  locationUtil,
+  store,
+} from '@grafana/data';
+import { config, locationService, RefreshEvent } from '@grafana/runtime';
+import {
+  sceneGraph,
+  SceneGridLayout,
+  type SceneObject,
+  SceneTimeRange,
+  SceneQueryRunner,
+  SceneVariableSet,
+  TestVariable,
+  VizPanel,
+  SceneGridRow,
+  behaviors,
+  SceneDataTransformer,
+  LocalValueVariable,
+  MultiValueVariable,
+} from '@grafana/scenes';
+import { type Dashboard, DashboardCursorSync, type LibraryPanel } from '@grafana/schema';
+import { type Spec as DashboardV2Spec, type VariableKind } from '@grafana/schema/apis/dashboard.grafana.app/v2';
+import { setTestFlags } from '@grafana/test-utils/unstable';
+import { appEvents } from 'app/core/app_events';
+import { LS_PANEL_COPY_KEY, LS_STYLES_COPY_KEY } from 'app/core/constants';
+import { AnnoKeyManagerKind, AnnoKeyUseCrossDashboardVariables, ManagerKind } from 'app/features/apiserver/types';
+import { getDashboardSrv } from 'app/features/dashboard/services/DashboardSrv';
+import { type DecoratedRevisionModel } from 'app/features/dashboard/types/revisionModels';
+import { dashboardWatcher } from 'app/features/live/dashboard/dashboardWatcher';
+import { DashboardEventAction } from 'app/features/live/dashboard/types';
+import { VariablesChanged } from 'app/features/variables/types';
+import { ShowConfirmModalEvent } from 'app/types/events';
+
+import { buildPanelEditScene } from '../panel-edit/PanelEditor';
+import { openPanelEditor } from '../panel-edit/openPanelEditor';
+import { SaveDashboardDrawer } from '../saving/SaveDashboardDrawer';
+import { createWorker } from '../saving/createDetectChangesWorker';
+import { buildGridItemForPanel, transformSaveModelToScene } from '../serialization/transformSaveModelToScene';
+import * as DashboardTemplateExtensionModule from '../settings/enterprise-components/DashboardTemplateExtension';
+import { openShareDrawer } from '../sharing/ShareDrawer/openShareDrawer';
+import { getCloneKey } from '../utils/clone';
+import { dashboardSceneGraph } from '../utils/dashboardSceneGraph';
+import { findVizPanelByKey } from '../utils/findVizPanel';
+import { DashboardInteractions } from '../utils/interactions';
+import { toControlSourceRef } from '../utils/predefinedVariables';
+import { createDeferred } from '../utils/test-utils';
+import { getLibraryPanelBehavior, isLibraryPanel } from '../utils/utils';
+import * as utils from '../utils/utils';
+
+import { DashboardControls } from './DashboardControls';
+import { DashboardScene } from './DashboardScene';
+import { LibraryPanelBehavior } from './LibraryPanelBehavior';
+import { DashboardFiltersOverviewDrawer } from './dashboard-filters-overview/DashboardFiltersOverviewDrawer';
+import { dashboardViews } from './dashboardViewRegistry';
+import { AutoGridItem } from './layout-auto-grid/AutoGridItem';
+import { AutoGridLayout } from './layout-auto-grid/AutoGridLayout';
+import { AutoGridLayoutManager } from './layout-auto-grid/AutoGridLayoutManager';
+import { DashboardGridItem } from './layout-default/DashboardGridItem';
+import { DefaultGridLayoutManager } from './layout-default/DefaultGridLayoutManager';
+import { RowActions } from './layout-default/row-actions/RowActions';
+import { PanelTimeRange } from './panel-timerange/PanelTimeRange';
+import { DashboardPlanningEvent } from './planningEvents';
+import { type DashboardSceneLike, type DashboardSceneState } from './types/dashboard';
+
+const mockRestoreDashboardVersion = jest.fn();
+
+jest.mock('app/features/dashboard/api/dashboard_api', () => ({
+  getDashboardAPI: () => ({
+    restoreDashboardVersion: mockRestoreDashboardVersion,
+  }),
+}));
+jest.mock('../serialization/transformSaveModelToScene');
+jest.mock('../serialization/transformSceneToSaveModel');
+jest.mock('@grafana/runtime', () => ({
+  ...jest.requireActual('@grafana/runtime'),
+  getDataSourceSrv: () => {
+    return {
+      getInstanceSettings: jest.fn().mockResolvedValue({ uid: 'ds1' }),
+    };
+  },
+  config: {
+    ...jest.requireActual('@grafana/runtime').config,
+    panels: {
+      'briangann-datatable-panel': {
+        id: 'briangann-datatable-panel',
+        state: 'deprecated',
+        angular: { detected: true, hideDeprecation: false },
+      },
+    },
+  },
+}));
+
+jest.mock('@grafana/runtime/unstable', () => ({
+  ...jest.requireActual('@grafana/runtime/unstable'),
+  getDataSourceInstanceSettings: jest.fn().mockResolvedValue({ uid: 'ds1' }),
+}));
+
+jest.mock('app/core/services/context_srv', () => ({
+  contextSrv: {
+    hasEditPermissionInFolders: true,
+  },
+}));
+
+jest.mock('app/features/playlist/PlaylistSrv', () => ({
+  ...jest.requireActual('app/features/playlist/PlaylistSrv'),
+  playlistSrv: {
+    isPlaying: false,
+    next: jest.fn(),
+    prev: jest.fn(),
+    stop: jest.fn(),
+  },
+}));
+
+const mockFetchPredefinedVariables = jest.fn();
+jest.mock('../utils/predefinedVariables', () => ({
+  ...jest.requireActual('../utils/predefinedVariables'),
+  fetchPredefinedVariables: (...args: unknown[]) => {
+    const result = mockFetchPredefinedVariables(...args);
+    // Preserve null (fetch failure); only default when the mock is unset.
+    return result === undefined ? Promise.resolve([]) : result;
+  },
+}));
+
+locationUtil.initialize({
+  config: { appSubUrl: '/subUrl' } as GrafanaConfig,
+  getVariablesUrlParams: jest.fn(),
+  getTimeRangeForUrl: jest.fn(),
+});
+
+const worker = createWorker();
+mockResultsOfDetectChangesWorker({ hasChanges: true });
+
+describe('DashboardScene', () => {
+  describe('DashboardSrv.getCurrent compatibility', () => {
+    it('Should set to compatibility wrapper', () => {
+      const scene = buildTestScene();
+      scene.activate();
+
+      expect(getDashboardSrv().getCurrent()?.uid).toBe('dash-1');
+    });
+  });
+
+  describe('Editing and discarding', () => {
+    describe('Given scene in view mode', () => {
+      it('Should set isEditing to false', () => {
+        const scene = buildTestScene();
+        scene.activate();
+
+        expect(scene.state.isEditing).toBeFalsy();
+      });
+
+      it('Should not start the detect changes worker', () => {
+        const scene = buildTestScene();
+        scene.activate();
+
+        // @ts-expect-error it is a private property
+        expect(scene._changesWorker).toBeUndefined();
+      });
+    });
+
+    describe('Edit session history', () => {
+      it('clears history on entering edit mode and preserves it on repeated enters', () => {
+        const scene = buildTestScene();
+        const sidebar = scene.state.sidebar;
+        const action = {
+          source: scene,
+          meta: { actionId: 'test.edit' } as const,
+          perform: jest.fn(),
+          undo: jest.fn(),
+        };
+        sidebar.setState({ undoStack: [action], redoStack: [action] });
+
+        scene.onEnterEditMode();
+
+        expect(sidebar.state.undoStack).toHaveLength(0);
+        expect(sidebar.state.redoStack).toHaveLength(0);
+
+        sidebar.setState({ undoStack: [action], redoStack: [action] });
+
+        scene.onEnterEditMode();
+        scene.onEnterEditMode();
+
+        expect(sidebar.state.undoStack).toEqual([action]);
+        expect(sidebar.state.redoStack).toEqual([action]);
+      });
+    });
+
+    describe('Edit session start tracking', () => {
+      afterEach(() => {
+        jest.restoreAllMocks();
+      });
+
+      it('reports edit_session_started with source "user" when entering edit mode manually', () => {
+        const scene = buildTestScene();
+        scene.activate();
+        const spy = jest.spyOn(DashboardInteractions, 'editSessionStarted');
+
+        scene.onEnterEditMode();
+
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ source: 'user' }));
+      });
+
+      it('reports source "assistant" when the assistant enters edit mode', () => {
+        const scene = buildTestScene();
+        scene.activate();
+        const spy = jest.spyOn(DashboardInteractions, 'editSessionStarted');
+
+        scene.onEnterEditMode('assistant');
+
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ source: 'assistant' }));
+      });
+
+      it('does not report again when already in edit mode', () => {
+        const scene = buildTestScene();
+        scene.activate();
+        scene.onEnterEditMode();
+        const spy = jest.spyOn(DashboardInteractions, 'editSessionStarted');
+
+        scene.onEnterEditMode();
+
+        expect(spy).not.toHaveBeenCalled();
+      });
+
+      it('exposes the edit session source', () => {
+        const scene = buildTestScene();
+        scene.activate();
+
+        expect(scene.getEditSessionSource()).toBeUndefined();
+
+        scene.onEnterEditMode('assistant');
+
+        expect(scene.getEditSessionSource()).toBe('assistant');
+      });
+
+      it('tags the session from the editSource url param when a new dashboard auto-enters edit mode', () => {
+        const scene = buildTestScene();
+        locationService.push('/dashboard/new?editSource=assistant');
+        const spy = jest.spyOn(DashboardInteractions, 'editSessionStarted');
+
+        scene.activate();
+
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ source: 'assistant' }));
+        expect(scene.getEditSessionSource()).toBe('assistant');
+      });
+
+      it('defaults to source "user" when a new dashboard auto-enters edit mode without the param', () => {
+        const scene = buildTestScene();
+        locationService.push('/dashboard/new');
+        const spy = jest.spyOn(DashboardInteractions, 'editSessionStarted');
+
+        scene.activate();
+
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ source: 'user' }));
+        expect(scene.getEditSessionSource()).toBe('user');
+      });
+
+      it('skips the auto-edit entirely when editSource marks a plan preview', () => {
+        // A plan preview opens /dashboard/new only so RENDER_PLAN can populate it and never
+        // intends to edit -- it must not flash into edit mode and back out again. Every other
+        // /dashboard/new caller (no param, editSource=user, editSource=assistant) is unaffected.
+        const scene = buildTestScene();
+        locationService.push('/dashboard/new?editSource=plan-preview');
+        const spy = jest.spyOn(DashboardInteractions, 'editSessionStarted');
+
+        scene.activate();
+
+        expect(spy).not.toHaveBeenCalled();
+        expect(scene.state.isEditing).toBeFalsy();
+        expect(scene.state.isDirty).toBeFalsy();
+        expect(scene.getEditSessionSource()).toBeUndefined();
+      });
+    });
+
+    describe('Given scene in edit mode', () => {
+      let scene: DashboardScene;
+      let deactivateScene: () => void;
+
+      beforeEach(() => {
+        scene = buildTestScene();
+        locationService.push('/d/dash-1');
+        deactivateScene = scene.activate();
+        scene.onEnterEditMode();
+        jest.clearAllMocks();
+      });
+
+      it('Should set isEditing to true', () => {
+        expect(scene.state.isEditing).toBe(true);
+      });
+
+      it('Can exit edit mode', () => {
+        scene.exitEditMode({ skipConfirm: true });
+        expect(locationService.getLocation().pathname).toBe('/d/dash-1');
+      });
+
+      it('Can discard changes and keep editing', () => {
+        // @ts-expect-error private property used for unit test
+        const changeTracker = scene._changeTracker;
+        const stopSpy = jest.spyOn(changeTracker, 'stopTrackingChanges');
+        const startSpy = jest.spyOn(changeTracker, 'startTrackingChanges');
+
+        // Make a change
+        scene.setState({ title: 'Updated title' });
+        expect(scene.state.isDirty).toBe(true);
+
+        // Put the scene into panel edit to verify we clear it
+        const panel = findVizPanelByKey(scene, 'panel-1')!;
+        const editPanel = buildPanelEditScene(panel);
+        scene.setState({ editPanel });
+
+        // Add an overlay as well to verify it is cleared
+        scene.setState({ overlay: new SaveDashboardDrawer({ dashboardRef: scene.getRef() }) });
+        expect(scene.state.overlay).toBeDefined();
+
+        scene.discardChangesAndKeepEditing();
+
+        // Still editing, but no longer dirty
+        expect(scene.state.isEditing).toBe(true);
+        expect(scene.state.isDirty).toBe(false);
+
+        // Restored state from when edit mode started
+        expect(scene.state.title).toBe('hello');
+
+        // Clears sidebar related state
+        expect(scene.state.editPanel).toBeUndefined();
+        expect(scene.state.overlay).toBeUndefined();
+
+        // Resets tracking
+        expect(stopSpy).toHaveBeenCalled();
+        expect(startSpy).toHaveBeenCalled();
+      });
+
+      it('activateSidebar activates an inactive sidebar and releases it on exit', () => {
+        const sidebar = scene.state.sidebar;
+        expect(sidebar.isActive).toBe(false);
+
+        scene.activateSidebar();
+        expect(sidebar.isActive).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(sidebar.isActive).toBe(false);
+      });
+
+      it('activateSidebar is a no-op when the sidebar is already active', () => {
+        const sidebar = scene.state.sidebar;
+        const activateSpy = jest.spyOn(sidebar, 'activate');
+        sidebar.activate();
+
+        scene.activateSidebar();
+
+        expect(activateSpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('re-activates the swapped-in sidebar when discarding and keeping edit', () => {
+        const sidebar = scene.state.sidebar;
+        scene.activateSidebar();
+        expect(sidebar.isActive).toBe(true);
+
+        scene.discardChangesAndKeepEditing();
+
+        // The original pane is released, but a fresh clone is swapped in and re-activated so
+        // programmatic mutations keep working while we stay in edit mode.
+        expect(sidebar.isActive).toBe(false);
+        const newSidebar = scene.state.sidebar;
+        expect(newSidebar).not.toBe(sidebar);
+        expect(newSidebar.isActive).toBe(true);
+      });
+
+      it('Exiting already saved dashboard should not restore initial state', async () => {
+        scene.setState({ title: 'Updated title' });
+        expect(scene.state.isDirty).toBe(true);
+
+        await scene.saveCompleted({} as Dashboard, {
+          slug: 'slug',
+          uid: 'dash-1',
+          url: 'sss',
+          version: 2,
+          status: 'aaa',
+        });
+
+        expect(scene.state.isDirty).toBe(false);
+        scene.exitEditMode({ skipConfirm: true });
+        expect(scene.state.title).toEqual('Updated title');
+        expect(scene.state.meta.version).toEqual(2);
+      });
+
+      it('Should exit edit mode after saving from unsaved changes modal when dashboardNewLayouts is enabled', async () => {
+        setTestFlags({ dashboardNewLayouts: true });
+
+        scene.setState({ meta: { ...scene.state.meta, canSave: true } });
+
+        const publishSpy = jest.spyOn(appEvents, 'publish');
+        const hasActualSaveChangesSpy = jest.spyOn(utils, 'hasActualSaveChanges').mockReturnValue(true);
+
+        try {
+          scene.setState({ title: 'Updated title' });
+          expect(scene.state.isDirty).toBe(true);
+          scene.exitEditMode({ skipConfirm: false });
+
+          const modalCall = publishSpy.mock.calls.find((call) => call[0] instanceof ShowConfirmModalEvent);
+          expect(modalCall).toBeDefined();
+
+          const modalEvent = modalCall![0] as ShowConfirmModalEvent;
+          expect(modalEvent.payload.altActionText).toBeDefined();
+
+          modalEvent.payload.onAltAction?.();
+
+          await waitFor(() => expect(scene.state.overlay).toBeInstanceOf(SaveDashboardDrawer));
+
+          const overlay = scene.state.overlay as SaveDashboardDrawer;
+          expect(overlay.state.onSaveSuccess).toBeDefined();
+
+          overlay.state.onSaveSuccess!();
+          expect(scene.state.isEditing).toBe(false);
+        } finally {
+          publishSpy.mockRestore();
+          hasActualSaveChangesSpy.mockRestore();
+          setTestFlags({});
+        }
+      });
+
+      it('Should not show Save option in unsaved changes modal when user cannot save', () => {
+        setTestFlags({ dashboardNewLayouts: true });
+
+        scene.setState({ meta: { ...scene.state.meta, canSave: false } });
+
+        const publishSpy = jest.spyOn(appEvents, 'publish');
+        const hasActualSaveChangesSpy = jest.spyOn(utils, 'hasActualSaveChanges').mockReturnValue(true);
+
+        scene.setState({ title: 'Updated title' });
+        expect(scene.state.isDirty).toBe(true);
+        scene.exitEditMode({ skipConfirm: false });
+
+        const modalCall = publishSpy.mock.calls.find((call) => call[0] instanceof ShowConfirmModalEvent);
+        expect(modalCall).toBeDefined();
+
+        const modalEvent = modalCall![0] as ShowConfirmModalEvent;
+        expect(modalEvent.payload.altActionText).toBeUndefined();
+        expect(modalEvent.payload.onAltAction).toBeUndefined();
+
+        publishSpy.mockRestore();
+        hasActualSaveChangesSpy.mockRestore();
+        setTestFlags({});
+      });
+
+      it('Should start the detect changes worker', () => {
+        expect(worker.onmessage).toBeDefined();
+      });
+
+      it('Should terminate the detect changes worker when deactivate', () => {
+        expect(worker.terminate).toHaveBeenCalledTimes(0);
+        deactivateScene();
+        expect(worker.terminate).toHaveBeenCalledTimes(1);
+      });
+
+      it('A change to griditem pos should set isDirty true', () => {
+        const gridItem = sceneGraph.findObject(scene, (p) => p.state.key === 'griditem-1') as DashboardGridItem;
+        gridItem.setState({ x: 10, y: 0, width: 10, height: 10 });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const gridItem2 = sceneGraph.findObject(scene, (p) => p.state.key === 'griditem-1') as DashboardGridItem;
+        expect(gridItem2.state.x).toBe(0);
+      });
+
+      it('A change to gridlayout children order should set isDirty true', () => {
+        const layout = sceneGraph.findObject(scene, (p) => p instanceof SceneGridLayout) as SceneGridLayout;
+        const originalPanelOrder = layout.state.children.map((c) => c.state.key);
+
+        // Change the order of the children. This happen when panels move around, then the children are re-ordered
+        layout.setState({
+          children: [layout.state.children[1], layout.state.children[0], layout.state.children[2]],
+        });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const resoredLayout = sceneGraph.findObject(scene, (p) => p instanceof SceneGridLayout) as SceneGridLayout;
+        expect(resoredLayout.state.children.map((c) => c.state.key)).toEqual(originalPanelOrder);
+      });
+
+      it('Should exit edit mode and discard panel changes if leaving the dashboard while in panel edit', async () => {
+        const panel = findVizPanelByKey(scene, 'panel-1')!;
+        const editPanel = buildPanelEditScene(panel!);
+        scene.setState({ editPanel });
+
+        panel.setState({ title: 'new title' });
+        scene.exitEditMode({ skipConfirm: true });
+
+        const discardPanel = findVizPanelByKey(scene, panel.state.key)!;
+        expect(discardPanel.state.title).toBe('Panel A');
+      });
+
+      it.each`
+        prop             | value
+        ${'title'}       | ${'new title'}
+        ${'description'} | ${'new description'}
+        ${'tags'}        | ${['tag3', 'tag4']}
+        ${'editable'}    | ${false}
+        ${'links'}       | ${[]}
+      `(
+        'A change to $prop should set isDirty true',
+        ({ prop, value }: { prop: keyof DashboardSceneState; value: unknown }) => {
+          const prevState = scene.state[prop];
+          scene.setState({ [prop]: value });
+
+          expect(scene.state.isDirty).toBe(true);
+
+          scene.exitEditMode({ skipConfirm: true });
+          expect(scene.state[prop]).toEqual(prevState);
+        }
+      );
+
+      it('A change to folderUid should set isDirty true', () => {
+        const prevMeta = { ...scene.state.meta };
+
+        // The worker detects changes in the model, so the folder change should be detected anyway
+        mockResultsOfDetectChangesWorker({ hasChanges: false });
+
+        scene.setState({
+          meta: {
+            ...prevMeta,
+            folderUid: 'new-folder-uid',
+            folderTitle: 'new-folder-title',
+          },
+        });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(scene.state.meta).toEqual(prevMeta);
+      });
+
+      it('A change to cross-dashboard variables selection should set isDirty true', () => {
+        const prevMeta = { ...scene.state.meta };
+        mockResultsOfDetectChangesWorker({ hasChanges: false });
+
+        const annotation = '{"global":"all","folder":"all"}';
+        scene.setState({
+          meta: {
+            ...prevMeta,
+            k8s: {
+              ...prevMeta.k8s,
+              annotations: {
+                ...prevMeta.k8s?.annotations,
+                [AnnoKeyUseCrossDashboardVariables]: annotation,
+              },
+            },
+          },
+        });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(scene.state.meta).toEqual(prevMeta);
+      });
+
+      it('A change to refresh picker interval settings should set isDirty true', () => {
+        const refreshPicker = dashboardSceneGraph.getRefreshPicker(scene)!;
+        const prevState = [...refreshPicker.state.intervals!];
+        refreshPicker.setState({ intervals: ['10s'] });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(dashboardSceneGraph.getRefreshPicker(scene)!.state.intervals).toEqual(prevState);
+      });
+
+      it('A enabling/disabling live now setting should set isDirty true', () => {
+        const liveNowTimer = scene.state.$behaviors?.find(
+          (b) => b instanceof behaviors.LiveNowTimer
+        ) as behaviors.LiveNowTimer;
+        liveNowTimer.enable();
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const restoredLiveNowTimer = scene.state.$behaviors?.find(
+          (b) => b instanceof behaviors.LiveNowTimer
+        ) as behaviors.LiveNowTimer;
+        expect(restoredLiveNowTimer.state.enabled).toBeFalsy();
+      });
+
+      it('A change to time picker visibility settings should set isDirty true', () => {
+        const dashboardControls = scene.state.controls!;
+        const prevState = dashboardControls.state.hideTimeControls;
+        dashboardControls.setState({ hideTimeControls: true });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(scene.state.controls!.state.hideTimeControls).toEqual(prevState);
+      });
+
+      it('A change to time zone should set isDirty true', () => {
+        const timeRange = sceneGraph.getTimeRange(scene)!;
+        const prevState = timeRange.state.timeZone;
+        timeRange.setState({ timeZone: 'UTC' });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(sceneGraph.getTimeRange(scene)!.state.timeZone).toBe(prevState);
+      });
+
+      it('A change to a cursor sync config should set isDirty true', () => {
+        const cursorSync = dashboardSceneGraph.getCursorSync(scene)!;
+        const initialState = cursorSync.state;
+
+        cursorSync.setState({
+          sync: DashboardCursorSync.Tooltip,
+        });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        expect(dashboardSceneGraph.getCursorSync(scene)!.state).toEqual(initialState);
+      });
+
+      it('A change to a any VizPanel state should set isDirty true', () => {
+        const panel = sceneGraph.findObject(scene, (p) => p instanceof VizPanel) as VizPanel;
+        const prevTitle = panel.state.title;
+        panel.setState({ title: 'new title' });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const restoredPanel = sceneGraph.findObject(scene, (p) => p instanceof VizPanel) as VizPanel;
+        expect(restoredPanel.state.title).toBe(prevTitle);
+      });
+
+      it('A change to any DashboardGridItem state should set isDirty true', () => {
+        const dashboardGridItem = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof DashboardGridItem
+        ) as DashboardGridItem;
+        const prevValue = dashboardGridItem.state.variableName;
+
+        dashboardGridItem.setState({ variableName: 'var1', repeatDirection: 'h', maxPerRow: 2 });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const restoredDashboardGridItem = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof DashboardGridItem
+        ) as DashboardGridItem;
+        expect(restoredDashboardGridItem.state.variableName).toBe(prevValue);
+      });
+
+      it('A change to any library panel name should set isDirty true', () => {
+        const panel = findVizPanelByKey(scene, 'panel-5')!;
+        const behavior = getLibraryPanelBehavior(panel)!;
+        const prevValue = behavior.state.name;
+
+        behavior.setState({ name: 'new name' });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+
+        const restoredPanel = findVizPanelByKey(scene, 'panel-5')!;
+        const restoredBehavior = getLibraryPanelBehavior(restoredPanel)!;
+        expect(restoredBehavior.state.name).toBe(prevValue);
+      });
+
+      it('A change to any PanelTimeRange state should set isDirty true', () => {
+        const panelTimeRange = sceneGraph.findObject(scene, (p) => p instanceof PanelTimeRange) as PanelTimeRange;
+        const prevValue = panelTimeRange.state.from;
+
+        panelTimeRange.setState({ from: 'now-1h', to: 'now' });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const restoredPanelTimeRange = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof PanelTimeRange
+        ) as PanelTimeRange;
+        expect(restoredPanelTimeRange.state.from).toEqual(prevValue);
+      });
+
+      it('A change to any SceneQueryRunner state should set isDirty true', () => {
+        const queryRunner = sceneGraph.findObject(scene, (p) => p instanceof SceneQueryRunner) as SceneQueryRunner;
+        const prevValue = queryRunner.state.queries;
+
+        queryRunner.setState({ queries: [{ refId: 'A', datasource: { uid: 'fake-uid', type: 'test' } }] });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const restoredQueryRunner = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof SceneQueryRunner
+        ) as SceneQueryRunner;
+        expect(restoredQueryRunner.state.queries).toEqual(prevValue);
+      });
+
+      it('A change to any SceneDataTransformer state should set isDirty true', () => {
+        const dataTransformer = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof SceneDataTransformer
+        ) as SceneDataTransformer;
+        const prevValue = dataTransformer.state.transformations;
+
+        dataTransformer.setState({ transformations: [{ id: 'fake-transformation', options: {} }] });
+
+        expect(scene.state.isDirty).toBe(true);
+
+        scene.exitEditMode({ skipConfirm: true });
+        const restoredDataTransformer = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof SceneDataTransformer
+        ) as SceneDataTransformer;
+        expect(restoredDataTransformer.state.transformations).toEqual(prevValue);
+      });
+
+      it('A change to any SceneDataTransformer data should NOT set isDirty true', () => {
+        const dataTransformer = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof SceneDataTransformer
+        ) as SceneDataTransformer;
+        const prevValue = dataTransformer.state.data;
+        const newData = { state: LoadingState.Done, timeRange: getDefaultTimeRange(), series: [] };
+
+        dataTransformer.setState({ data: newData });
+
+        expect(scene.state.isDirty).toBeFalsy();
+
+        scene.exitEditMode({ skipConfirm: true });
+
+        const restoredDataTransformer = sceneGraph.findObject(
+          scene,
+          (p) => p instanceof SceneDataTransformer
+        ) as SceneDataTransformer;
+        expect(restoredDataTransformer.state.data).toEqual(prevValue);
+      });
+
+      it.each([
+        { hasChanges: true, hasTimeChanges: false, hasVariableValueChanges: false },
+        { hasChanges: true, hasTimeChanges: true, hasVariableValueChanges: false },
+        { hasChanges: true, hasTimeChanges: false, hasVariableValueChanges: true },
+      ])('should set the state to true if there are changes detected in the saving model', (diffResults) => {
+        mockResultsOfDetectChangesWorker(diffResults);
+        scene.setState({ title: 'hello' });
+        expect(scene.state.isDirty).toBeTruthy();
+      });
+
+      it.each([
+        { hasChanges: false, hasTimeChanges: false, hasVariableValueChanges: false },
+        { hasChanges: false, hasTimeChanges: true, hasVariableValueChanges: false },
+        { hasChanges: false, hasTimeChanges: false, hasVariableValueChanges: true },
+      ])('should not set the state to true if there are no change detected in the dashboard', (diffResults) => {
+        mockResultsOfDetectChangesWorker(diffResults);
+        scene.setState({ title: 'hello' });
+        expect(scene.state.isDirty).toBeFalsy();
+      });
+
+      it('Should create and add a new panel to the dashboard', async () => {
+        // addPanel parents the panel through the edit-action bus when new layouts are on, and this scene never activates the sidebar.
+        setTestFlags({ dashboardNewLayouts: false });
+        scene.exitEditMode({ skipConfirm: true });
+        expect(scene.state.isEditing).toBe(false);
+
+        const panel = await scene.onCreateNewPanel();
+
+        expect(scene.state.isEditing).toBe(true);
+        expect(scene.state.body.getVizPanels().length).toBe(7);
+        expect(panel.state.key).toBe('panel-7');
+        setTestFlags({});
+      });
+
+      it('Should select new row', () => {
+        scene.state.sidebar.activate();
+
+        const row = scene.onCreateNewRow();
+        expect(scene.state.sidebar.getSelectedObject()).toBe(row);
+      });
+
+      it('Should fail to copy a panel if it does not have a grid item parent', () => {
+        // With new layouts on, a panel with no grid parent throws instead of returning.
+        setTestFlags({ dashboardNewLayouts: false });
+        const vizPanel = new VizPanel({
+          title: 'Panel Title',
+          key: 'panel-5',
+          pluginId: 'timeseries',
+        });
+
+        scene.copyPanel(vizPanel);
+
+        expect(store.exists(LS_PANEL_COPY_KEY)).toBe(false);
+        setTestFlags({});
+      });
+
+      it('Should fail to copy a library panel if it does not have a grid item parent', () => {
+        // With new layouts on, a panel with no grid parent throws instead of returning.
+        setTestFlags({ dashboardNewLayouts: false });
+        const libVizPanel = new VizPanel({
+          title: 'Library Panel',
+          pluginId: 'table',
+          key: 'panel-4',
+          $behaviors: [new LibraryPanelBehavior({ name: 'libraryPanel', uid: 'uid' })],
+        });
+
+        scene.copyPanel(libVizPanel);
+
+        expect(store.exists(LS_PANEL_COPY_KEY)).toBe(false);
+        setTestFlags({});
+      });
+
+      it('Should copy a panel', () => {
+        const vizPanel = findVizPanelByKey(scene, 'panel-1')!;
+        scene.copyPanel(vizPanel as VizPanel);
+
+        expect(store.exists(LS_PANEL_COPY_KEY)).toBe(true);
+      });
+
+      it('Should copy a library viz panel', () => {
+        const libVizPanel = findVizPanelByKey(scene, 'panel-6')!;
+
+        expect(isLibraryPanel(libVizPanel)).toBe(true);
+
+        scene.copyPanel(libVizPanel);
+
+        expect(store.exists(LS_PANEL_COPY_KEY)).toBe(true);
+      });
+
+      it('Should paste a panel', () => {
+        store.set(LS_PANEL_COPY_KEY, JSON.stringify({ key: 'panel-7' }));
+        jest.mocked(buildGridItemForPanel).mockReturnValue(
+          new DashboardGridItem({
+            key: 'griditem-9',
+            body: new VizPanel({
+              title: 'Panel A',
+              key: 'panel-9',
+              pluginId: 'table',
+            }),
+          })
+        );
+
+        scene.pastePanel();
+
+        expect(buildGridItemForPanel).toHaveBeenCalledTimes(1);
+
+        const addedPanel = findVizPanelByKey(scene, 'panel-7')!;
+        expect(addedPanel).toBeDefined();
+        expect(store.exists(LS_PANEL_COPY_KEY)).toBe(false);
+      });
+
+      it('Should paste a library viz panel', () => {
+        // New layouts paste through the layout manager, which does not use the buildGridItemForPanel mock.
+        setTestFlags({ dashboardNewLayouts: false });
+        store.set(LS_PANEL_COPY_KEY, JSON.stringify({ key: 'panel-7' }));
+        jest.mocked(buildGridItemForPanel).mockReturnValue(
+          new DashboardGridItem({
+            body: new VizPanel({
+              title: 'Library Panel',
+              pluginId: 'table',
+              key: 'panel-4',
+              $behaviors: [new LibraryPanelBehavior({ name: 'libraryPanel', uid: 'uid' })],
+            }),
+          })
+        );
+
+        scene.pastePanel();
+
+        expect(buildGridItemForPanel).toHaveBeenCalledTimes(1);
+
+        const addedPanel = findVizPanelByKey(scene, 'panel-7')!;
+        expect(addedPanel).toBeDefined();
+        expect(addedPanel.state.key).toBe('panel-7');
+        expect(store.exists(LS_PANEL_COPY_KEY)).toBe(false);
+        setTestFlags({});
+      });
+
+      it('Should do nothing when pasting with an empty clipboard', () => {
+        store.delete(LS_PANEL_COPY_KEY);
+
+        expect(() => scene.pastePanel()).not.toThrow();
+        expect(buildGridItemForPanel).not.toHaveBeenCalled();
+      });
+
+      describe('Copy/Paste panel styles', () => {
+        const createTimeseriesPanel = () => {
+          return new VizPanel({
+            title: 'Timeseries Panel',
+            key: `panel-timeseries-${Math.random()}`,
+            pluginId: 'timeseries',
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'palette-classic' },
+                custom: {
+                  lineWidth: 1,
+                  fillOpacity: 10,
+                },
+              },
+              overrides: [],
+            },
+          });
+        };
+
+        beforeEach(() => {
+          store.delete(LS_STYLES_COPY_KEY);
+        });
+
+        it('Should copy panel styles when feature flag is enabled', () => {
+          const spy = jest.spyOn(DashboardInteractions, 'panelStylesMenuClicked');
+          const timeseriesPanel = createTimeseriesPanel();
+
+          scene.copyPanelStyles(timeseriesPanel);
+
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(true);
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('timeseries');
+          expect(stored.styles).toBeDefined();
+          expect(spy).not.toHaveBeenCalled(); // Analytics only called from menu
+        });
+
+        it('Should not copy styles for unsupported panel types', () => {
+          const vizPanel = findVizPanelByKey(scene, 'panel-1')!;
+          scene.copyPanelStyles(vizPanel);
+
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(false);
+        });
+
+        it('Should copy panel styles for trend panels', () => {
+          const trendPanel = new VizPanel({
+            title: 'Trend Panel',
+            key: `panel-trend-${Math.random()}`,
+            pluginId: 'trend',
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'fixed' },
+                custom: { lineWidth: 2, fillOpacity: 20 },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(trendPanel);
+
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(true);
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('trend');
+          expect(stored.styles).toBeDefined();
+        });
+
+        it('Should copy panel styles for candlestick panels', () => {
+          const candlestickPanel = new VizPanel({
+            title: 'Candlestick Panel',
+            key: `panel-candlestick-${Math.random()}`,
+            pluginId: 'candlestick',
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'fixed' },
+                custom: { lineWidth: 2, fillOpacity: 5 },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(candlestickPanel);
+
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(true);
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('candlestick');
+          expect(stored.styles).toBeDefined();
+        });
+
+        it('Should copy and paste styles for stat panels', () => {
+          const statPanel = new VizPanel({
+            title: 'Stat Panel',
+            key: `panel-stat-${Math.random()}`,
+            pluginId: 'stat',
+            options: {
+              orientation: 'horizontal',
+              textMode: 'value_and_name',
+              colorMode: 'background',
+              graphMode: 'none',
+              justifyMode: 'center',
+              showPercentChange: true,
+              percentChangeColorMode: 'inverted',
+              wideLayout: false,
+              text: { titleSize: 16, valueSize: 24 },
+              reduceOptions: { calcs: ['mean'] }, // should NOT be captured
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'thresholds' },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(statPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('stat');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'thresholds' });
+          expect(stored.styles.options.orientation).toBe('horizontal');
+          expect(stored.styles.options.colorMode).toBe('background');
+          expect(stored.styles.options.showPercentChange).toBe(true);
+          expect(stored.styles.options.text).toEqual({ titleSize: 16, valueSize: 24 });
+          expect(stored.styles.options.reduceOptions).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Stat Panel 2',
+            key: `panel-stat2-${Math.random()}`,
+            pluginId: 'stat',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({
+              colorMode: 'background',
+              showPercentChange: true,
+              text: { titleSize: 16, valueSize: 24 },
+            })
+          );
+        });
+
+        it('Should copy and paste styles for gauge panels', () => {
+          const gaugePanel = new VizPanel({
+            title: 'Gauge Panel',
+            key: `panel-gauge-${Math.random()}`,
+            pluginId: 'gauge',
+            options: {
+              orientation: 'horizontal',
+              shape: 'circle',
+              barShape: 'rounded',
+              barWidthFactor: 0.8,
+              effects: { barGlow: true, centerGlow: false, gradient: true },
+              segmentCount: 3,
+              showThresholdMarkers: false,
+              showThresholdLabels: true,
+              sparkline: false,
+              textMode: 'value',
+              text: { titleSize: 14, valueSize: 20 },
+              reduceOptions: { calcs: ['mean'] }, // should NOT be captured
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'thresholds' },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(gaugePanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('gauge');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'thresholds' });
+          expect(stored.styles.options.shape).toBe('circle');
+          expect(stored.styles.options.barWidthFactor).toBe(0.8);
+          expect(stored.styles.options.effects).toEqual({ barGlow: true, centerGlow: false, gradient: true });
+          expect(stored.styles.options.showThresholdMarkers).toBe(false);
+          expect(stored.styles.options.reduceOptions).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Gauge Panel 2',
+            key: `panel-gauge2-${Math.random()}`,
+            pluginId: 'gauge',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ shape: 'circle', barWidthFactor: 0.8, showThresholdMarkers: false })
+          );
+        });
+
+        it('Should copy and paste styles for bar gauge panels', () => {
+          const barGaugePanel = new VizPanel({
+            title: 'Bar Gauge Panel',
+            key: `panel-bargauge-${Math.random()}`,
+            pluginId: 'bargauge',
+            options: {
+              orientation: 'horizontal',
+              displayMode: 'gradient',
+              valueMode: 'color',
+              namePlacement: 'auto',
+              showUnfilled: false,
+              sizing: 'auto',
+              text: { titleSize: 14, valueSize: 20 },
+              legend: { showLegend: true, placement: 'bottom' },
+              reduceOptions: { calcs: ['mean'] }, // should NOT be captured
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'thresholds' },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(barGaugePanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('bargauge');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'thresholds' });
+          expect(stored.styles.options.displayMode).toBe('gradient');
+          expect(stored.styles.options.showUnfilled).toBe(false);
+          expect(stored.styles.options.text).toEqual({ titleSize: 14, valueSize: 20 });
+          expect(stored.styles.options.reduceOptions).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Bar Gauge Panel 2',
+            key: `panel-bargauge2-${Math.random()}`,
+            pluginId: 'bargauge',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ displayMode: 'gradient', showUnfilled: false })
+          );
+        });
+
+        it('Should copy and paste styles for bar chart panels', () => {
+          const barChartPanel = new VizPanel({
+            title: 'Bar Chart Panel',
+            key: `panel-barchart-${Math.random()}`,
+            pluginId: 'barchart',
+            options: {
+              orientation: 'vertical',
+              showValue: 'auto',
+              stacking: 'none',
+              barWidth: 0.97,
+              barRadius: 0.1,
+              xTickLabelRotation: -45,
+              legend: { showLegend: true, placement: 'bottom' },
+              reduceOptions: { calcs: ['mean'] }, // should NOT be captured
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'palette-classic' },
+                custom: {
+                  lineWidth: 1,
+                  fillOpacity: 80,
+                  gradientMode: 'none',
+                  axisPlacement: 'auto',
+                  hideFrom: { tooltip: false, viz: false, legend: false }, // should NOT be captured
+                },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(barChartPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('barchart');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'palette-classic' });
+          expect(stored.styles.fieldConfig.defaults.custom.lineWidth).toBe(1);
+          expect(stored.styles.fieldConfig.defaults.custom.fillOpacity).toBe(80);
+          expect(stored.styles.fieldConfig.defaults.custom.axisPlacement).toBe('auto');
+          expect(stored.styles.fieldConfig.defaults.custom.hideFrom).toBeUndefined();
+          expect(stored.styles.options.orientation).toBe('vertical');
+          expect(stored.styles.options.barRadius).toBe(0.1);
+          expect(stored.styles.options.xTickLabelRotation).toBe(-45);
+          expect(stored.styles.options.reduceOptions).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Bar Chart Panel 2',
+            key: `panel-barchart2-${Math.random()}`,
+            pluginId: 'barchart',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ orientation: 'vertical', barRadius: 0.1 })
+          );
+        });
+
+        it('Should copy and paste styles for pie chart panels', () => {
+          const pieChartPanel = new VizPanel({
+            title: 'Pie Chart Panel',
+            key: `panel-piechart-${Math.random()}`,
+            pluginId: 'piechart',
+            options: {
+              pieType: 'donut',
+              sort: 'desc',
+              displayLabels: ['percent', 'name'],
+              legend: { showLegend: true, placement: 'right', values: ['percent'] },
+              reduceOptions: { calcs: ['mean'] }, // should NOT be captured
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'palette-classic' },
+                custom: { hideFrom: { tooltip: false, viz: false, legend: false } }, // should NOT be captured
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(pieChartPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('piechart');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'palette-classic' });
+          expect(stored.styles.fieldConfig.defaults.custom?.hideFrom).toBeUndefined();
+          expect(stored.styles.options.pieType).toBe('donut');
+          expect(stored.styles.options.displayLabels).toEqual(['percent', 'name']);
+          expect(stored.styles.options.legend).toEqual({ showLegend: true, placement: 'right', values: ['percent'] });
+          expect(stored.styles.options.reduceOptions).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Pie Chart Panel 2',
+            key: `panel-piechart2-${Math.random()}`,
+            pluginId: 'piechart',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ pieType: 'donut', displayLabels: ['percent', 'name'] })
+          );
+        });
+
+        it('Should copy and paste styles for histogram panels', () => {
+          const histogramPanel = new VizPanel({
+            title: 'Histogram Panel',
+            key: `panel-histogram-${Math.random()}`,
+            pluginId: 'histogram',
+            options: {
+              legend: { showLegend: true, placement: 'bottom' },
+              bucketCount: 20, // should NOT be captured (data config)
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'palette-classic' },
+                custom: {
+                  lineWidth: 2,
+                  fillOpacity: 60,
+                  gradientMode: 'opacity',
+                  axisPlacement: 'auto',
+                  hideFrom: { tooltip: false, viz: false, legend: false }, // should NOT be captured
+                },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(histogramPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('histogram');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'palette-classic' });
+          expect(stored.styles.fieldConfig.defaults.custom.lineWidth).toBe(2);
+          expect(stored.styles.fieldConfig.defaults.custom.fillOpacity).toBe(60);
+          expect(stored.styles.fieldConfig.defaults.custom.hideFrom).toBeUndefined();
+          expect(stored.styles.options.legend).toEqual({ showLegend: true, placement: 'bottom' });
+          expect(stored.styles.options.bucketCount).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Histogram Panel 2',
+            key: `panel-histogram2-${Math.random()}`,
+            pluginId: 'histogram',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ legend: { showLegend: true, placement: 'bottom' } })
+          );
+        });
+
+        it('Should copy and paste styles for heatmap panels', () => {
+          const heatmapPanel = new VizPanel({
+            title: 'Heatmap Panel',
+            key: `panel-heatmap-${Math.random()}`,
+            pluginId: 'heatmap',
+            options: {
+              color: { scheme: 'Oranges', fill: 'dark-orange', reverse: false, exponent: 0.5, steps: 64 },
+              cellGap: 2,
+              cellRadius: 4,
+              showValue: 'auto',
+              legend: { show: true },
+              yAxis: { decimals: 2 },
+              exemplars: { color: 'rgba(255,0,255,0.7)' },
+              selectionMode: 'x',
+              calculate: false, // should NOT be captured (data config)
+            },
+            fieldConfig: {
+              defaults: {
+                custom: {
+                  scaleDistribution: { type: 'linear' },
+                  hideFrom: { tooltip: false, viz: false, legend: false }, // should NOT be captured
+                },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(heatmapPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('heatmap');
+          expect(stored.styles.fieldConfig.defaults.custom.scaleDistribution).toEqual({ type: 'linear' });
+          expect(stored.styles.fieldConfig.defaults.custom.hideFrom).toBeUndefined();
+          expect(stored.styles.options.color).toEqual({
+            scheme: 'Oranges',
+            fill: 'dark-orange',
+            reverse: false,
+            exponent: 0.5,
+            steps: 64,
+          });
+          expect(stored.styles.options.cellGap).toBe(2);
+          expect(stored.styles.options.selectionMode).toBe('x');
+          expect(stored.styles.options.calculate).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Heatmap Panel 2',
+            key: `panel-heatmap2-${Math.random()}`,
+            pluginId: 'heatmap',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnOptionsChange = jest.fn();
+          target.onOptionsChange = mockOnOptionsChange;
+          target.onFieldConfigChange = jest.fn();
+
+          scene.pastePanelStyles(target);
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(expect.objectContaining({ cellGap: 2, selectionMode: 'x' }));
+        });
+
+        it('Should copy and paste styles for state timeline panels', () => {
+          const stateTimelinePanel = new VizPanel({
+            title: 'State Timeline Panel',
+            key: `panel-state-timeline-${Math.random()}`,
+            pluginId: 'state-timeline',
+            options: {
+              alignValue: 'center',
+              mergeValues: false,
+              rowHeight: 0.8,
+              showValue: 'always',
+              legend: { showLegend: true, placement: 'right' },
+              perPage: 10, // should NOT be captured (UX config)
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'palette-classic' },
+                custom: { lineWidth: 1, fillOpacity: 80, axisPlacement: 'left' },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(stateTimelinePanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('state-timeline');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'palette-classic' });
+          expect(stored.styles.fieldConfig.defaults.custom.lineWidth).toBe(1);
+          expect(stored.styles.fieldConfig.defaults.custom.fillOpacity).toBe(80);
+          expect(stored.styles.options.alignValue).toBe('center');
+          expect(stored.styles.options.mergeValues).toBe(false);
+          expect(stored.styles.options.rowHeight).toBe(0.8);
+          expect(stored.styles.options.perPage).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'State Timeline Panel 2',
+            key: `panel-state-timeline2-${Math.random()}`,
+            pluginId: 'state-timeline',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnOptionsChange = jest.fn();
+          target.onOptionsChange = mockOnOptionsChange;
+          target.onFieldConfigChange = jest.fn();
+
+          scene.pastePanelStyles(target);
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ alignValue: 'center', mergeValues: false, rowHeight: 0.8 })
+          );
+        });
+
+        it('Should copy and paste styles for status history panels', () => {
+          const statusHistoryPanel = new VizPanel({
+            title: 'Status History Panel',
+            key: `panel-status-history-${Math.random()}`,
+            pluginId: 'status-history',
+            options: {
+              colWidth: 0.8,
+              rowHeight: 0.7,
+              showValue: 'never',
+              legend: { showLegend: false },
+              perPage: 5, // should NOT be captured
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'fixed' },
+                custom: { lineWidth: 2, fillOpacity: 90 },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(statusHistoryPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('status-history');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'fixed' });
+          expect(stored.styles.fieldConfig.defaults.custom.lineWidth).toBe(2);
+          expect(stored.styles.options.colWidth).toBe(0.8);
+          expect(stored.styles.options.rowHeight).toBe(0.7);
+          expect(stored.styles.options.showValue).toBe('never');
+          expect(stored.styles.options.perPage).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'Status History Panel 2',
+            key: `panel-status-history2-${Math.random()}`,
+            pluginId: 'status-history',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnOptionsChange = jest.fn();
+          target.onOptionsChange = mockOnOptionsChange;
+          target.onFieldConfigChange = jest.fn();
+
+          scene.pastePanelStyles(target);
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ colWidth: 0.8, rowHeight: 0.7, showValue: 'never' })
+          );
+        });
+
+        it('Should copy and paste styles for XY chart panels', () => {
+          const xychartPanel = new VizPanel({
+            title: 'XY Chart Panel',
+            key: `panel-xychart-${Math.random()}`,
+            pluginId: 'xychart',
+            options: {
+              legend: { showLegend: true, placement: 'bottom' },
+              mapping: 'auto', // should NOT be captured (data config)
+              series: [], // should NOT be captured (data config)
+            },
+            fieldConfig: {
+              defaults: {
+                color: { mode: 'palette-classic' },
+                custom: {
+                  fillOpacity: 50,
+                  lineWidth: 2,
+                  pointShape: 'circle',
+                  pointSize: { fixed: 5 },
+                  show: 'points',
+                  axisPlacement: 'auto',
+                  hideFrom: { tooltip: false, viz: false, legend: false }, // should NOT be captured
+                },
+              },
+              overrides: [],
+            },
+          });
+
+          scene.copyPanelStyles(xychartPanel);
+
+          const stored = JSON.parse(store.get(LS_STYLES_COPY_KEY) || '{}');
+          expect(stored.panelType).toBe('xychart');
+          expect(stored.styles.fieldConfig.defaults.color).toEqual({ mode: 'palette-classic' });
+          expect(stored.styles.fieldConfig.defaults.custom.fillOpacity).toBe(50);
+          expect(stored.styles.fieldConfig.defaults.custom.pointShape).toBe('circle');
+          expect(stored.styles.fieldConfig.defaults.custom.show).toBe('points');
+          expect(stored.styles.fieldConfig.defaults.custom.hideFrom).toBeUndefined();
+          expect(stored.styles.options.legend).toEqual({ showLegend: true, placement: 'bottom' });
+          expect(stored.styles.options.mapping).toBeUndefined();
+          expect(stored.styles.options.series).toBeUndefined();
+
+          const target = new VizPanel({
+            title: 'XY Chart Panel 2',
+            key: `panel-xychart2-${Math.random()}`,
+            pluginId: 'xychart',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          const mockOnOptionsChange = jest.fn();
+          target.onFieldConfigChange = mockOnFieldConfigChange;
+          target.onOptionsChange = mockOnOptionsChange;
+
+          scene.pastePanelStyles(target);
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(mockOnOptionsChange).toHaveBeenCalledWith(
+            expect.objectContaining({ legend: { showLegend: true, placement: 'bottom' } })
+          );
+        });
+
+        it('Should paste styles from a trend panel into another trend panel', () => {
+          const trendPanel = new VizPanel({
+            title: 'Trend Panel',
+            key: `panel-trend-${Math.random()}`,
+            pluginId: 'trend',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          trendPanel.onFieldConfigChange = mockOnFieldConfigChange;
+
+          store.set(
+            LS_STYLES_COPY_KEY,
+            JSON.stringify({
+              panelType: 'trend',
+              styles: { fieldConfig: { defaults: { custom: { lineWidth: 3 } } } },
+            })
+          );
+
+          scene.pastePanelStyles(trendPanel);
+
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+        });
+
+        it('Should paste styles from a candlestick panel into another candlestick panel', () => {
+          const candlestickPanel = new VizPanel({
+            title: 'Candlestick Panel',
+            key: `panel-candlestick-${Math.random()}`,
+            pluginId: 'candlestick',
+            fieldConfig: { defaults: {}, overrides: [] },
+          });
+          const mockOnFieldConfigChange = jest.fn();
+          candlestickPanel.onFieldConfigChange = mockOnFieldConfigChange;
+
+          store.set(
+            LS_STYLES_COPY_KEY,
+            JSON.stringify({
+              panelType: 'candlestick',
+              styles: { fieldConfig: { defaults: { custom: { fillOpacity: 30 } } } },
+            })
+          );
+
+          scene.pastePanelStyles(candlestickPanel);
+
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+        });
+
+        it('Should not paste styles from a trend panel into a timeseries panel', () => {
+          const timeseriesPanel = createTimeseriesPanel();
+          const mockOnFieldConfigChange = jest.fn();
+          timeseriesPanel.onFieldConfigChange = mockOnFieldConfigChange;
+
+          store.set(
+            LS_STYLES_COPY_KEY,
+            JSON.stringify({
+              panelType: 'trend',
+              styles: { fieldConfig: { defaults: { custom: { lineWidth: 3 } } } },
+            })
+          );
+
+          scene.pastePanelStyles(timeseriesPanel);
+
+          expect(mockOnFieldConfigChange).not.toHaveBeenCalled();
+        });
+
+        it('Should return false for hasPanelStylesToPaste when no styles copied', () => {
+          expect(DashboardScene.hasPanelStylesToPaste('timeseries')).toBe(false);
+        });
+
+        it('Should return true for hasPanelStylesToPaste when styles exist for matching panel type', () => {
+          store.set(LS_STYLES_COPY_KEY, JSON.stringify({ panelType: 'timeseries', styles: {} }));
+
+          expect(DashboardScene.hasPanelStylesToPaste('timeseries')).toBe(true);
+        });
+
+        it('Should return false for hasPanelStylesToPaste for different panel type', () => {
+          store.set(LS_STYLES_COPY_KEY, JSON.stringify({ panelType: 'timeseries', styles: {} }));
+
+          expect(DashboardScene.hasPanelStylesToPaste('table')).toBe(false);
+        });
+
+        it('Should paste panel styles when feature flag is enabled', () => {
+          const spy = jest.spyOn(DashboardInteractions, 'panelStylesMenuClicked');
+          const timeseriesPanel = createTimeseriesPanel();
+          const mockOnFieldConfigChange = jest.fn();
+          timeseriesPanel.onFieldConfigChange = mockOnFieldConfigChange;
+
+          const styles = {
+            panelType: 'timeseries',
+            styles: {
+              fieldConfig: {
+                defaults: {
+                  color: { mode: 'palette-classic' },
+                  custom: {
+                    lineWidth: 2,
+                    fillOpacity: 10,
+                  },
+                },
+              },
+            },
+          };
+          store.set(LS_STYLES_COPY_KEY, JSON.stringify(styles));
+
+          scene.pastePanelStyles(timeseriesPanel);
+
+          expect(mockOnFieldConfigChange).toHaveBeenCalled();
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(true);
+          expect(spy).not.toHaveBeenCalled();
+        });
+
+        it('Should not paste styles when no styles are copied', () => {
+          const timeseriesPanel = createTimeseriesPanel();
+          const mockOnFieldConfigChange = jest.fn();
+          timeseriesPanel.onFieldConfigChange = mockOnFieldConfigChange;
+
+          scene.pastePanelStyles(timeseriesPanel);
+
+          expect(mockOnFieldConfigChange).not.toHaveBeenCalled();
+        });
+
+        it('Should not paste styles to different panel type', () => {
+          const spy = jest.spyOn(DashboardInteractions, 'panelStylesMenuClicked');
+          const timeseriesPanel = createTimeseriesPanel();
+          const mockOnFieldConfigChange = jest.fn();
+          timeseriesPanel.onFieldConfigChange = mockOnFieldConfigChange;
+
+          const styles = {
+            panelType: 'table',
+            styles: { fieldConfig: { defaults: {} } },
+          };
+          store.set(LS_STYLES_COPY_KEY, JSON.stringify(styles));
+
+          scene.pastePanelStyles(timeseriesPanel);
+
+          expect(mockOnFieldConfigChange).not.toHaveBeenCalled();
+          expect(spy).not.toHaveBeenCalled();
+        });
+
+        it('Should allow pasting styles multiple times', () => {
+          const spy = jest.spyOn(DashboardInteractions, 'panelStylesMenuClicked');
+          const timeseriesPanel1 = createTimeseriesPanel();
+          const timeseriesPanel2 = createTimeseriesPanel();
+          const mockOnFieldConfigChange1 = jest.fn();
+          const mockOnFieldConfigChange2 = jest.fn();
+          timeseriesPanel1.onFieldConfigChange = mockOnFieldConfigChange1;
+          timeseriesPanel2.onFieldConfigChange = mockOnFieldConfigChange2;
+
+          const styles = {
+            panelType: 'timeseries',
+            styles: { fieldConfig: { defaults: { custom: { lineWidth: 3 } } } },
+          };
+          store.set(LS_STYLES_COPY_KEY, JSON.stringify(styles));
+
+          scene.pastePanelStyles(timeseriesPanel1);
+          expect(mockOnFieldConfigChange1).toHaveBeenCalled();
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(true);
+
+          scene.pastePanelStyles(timeseriesPanel2);
+          expect(mockOnFieldConfigChange2).toHaveBeenCalled();
+          expect(store.exists(LS_STYLES_COPY_KEY)).toBe(true);
+          expect(spy).not.toHaveBeenCalled();
+        });
+
+        it('Should report analytics on paste error', () => {
+          const spy = jest.spyOn(DashboardInteractions, 'panelStylesMenuClicked');
+          jest.spyOn(console, 'error').mockImplementation();
+
+          store.set(LS_STYLES_COPY_KEY, 'invalid json');
+          scene.pastePanelStyles(createTimeseriesPanel());
+
+          expect(spy).toHaveBeenCalledWith('paste', 'timeseries', expect.any(Number), true);
+        });
+      });
+
+      it('Should unlink a library panel', () => {
+        const libPanel = new VizPanel({
+          title: 'Panel B',
+          pluginId: 'table',
+          $behaviors: [new LibraryPanelBehavior({ name: 'lib panel', uid: 'abc', isLoaded: true })],
+        });
+
+        const scene = buildTestScene({
+          body: DefaultGridLayoutManager.fromVizPanels([libPanel]),
+        });
+
+        expect(isLibraryPanel(libPanel)).toBe(true);
+
+        scene.unlinkLibraryPanel(libPanel);
+
+        expect(isLibraryPanel(libPanel)).toBe(false);
+      });
+
+      it('Should unlink a library panel for auto grid panels', () => {
+        const libPanel = new VizPanel({
+          title: 'Panel B',
+          pluginId: 'table',
+          $behaviors: [new LibraryPanelBehavior({ name: 'lib panel', uid: 'abc', isLoaded: true })],
+        });
+
+        const autoGridItem = new AutoGridItem({
+          key: 'auto-grid-item-1',
+          body: libPanel,
+        });
+
+        const scene = buildTestScene({
+          body: new AutoGridLayoutManager({
+            layout: new AutoGridLayout({ children: [autoGridItem] }),
+          }),
+        });
+
+        expect(isLibraryPanel(libPanel)).toBe(true);
+
+        scene.unlinkLibraryPanel(libPanel);
+
+        expect(isLibraryPanel(libPanel)).toBe(false);
+      });
+
+      it('Should create a library panel', () => {
+        const vizPanel = new VizPanel({
+          title: 'Panel A',
+          key: 'panel-1',
+          pluginId: 'table',
+        });
+
+        const gridItem = new DashboardGridItem({
+          key: 'griditem-1',
+          body: vizPanel,
+        });
+
+        const grid = new SceneGridLayout({ children: [gridItem] });
+        const scene = buildTestScene({
+          body: new DefaultGridLayoutManager({ grid }),
+        });
+
+        const libPanel = {
+          uid: 'uid',
+          name: 'name',
+        };
+
+        scene.createLibraryPanel(vizPanel, libPanel as LibraryPanel);
+
+        const newGridItem = grid.state.children[0] as DashboardGridItem;
+        const behavior = newGridItem.state.body.state.$behaviors![0] as LibraryPanelBehavior;
+
+        expect(grid.state.children.length).toBe(1);
+        expect(newGridItem.state.body).toBeInstanceOf(VizPanel);
+        expect(behavior.state.uid).toBe('uid');
+        expect(behavior.state.name).toBe('name');
+      });
+
+      it('Should create a library panel for auto grid panels', () => {
+        const vizPanel = new VizPanel({
+          title: 'Panel A',
+          key: 'panel-1',
+          pluginId: 'table',
+        });
+
+        const autoGridItem = new AutoGridItem({
+          key: 'auto-grid-item-1',
+          body: vizPanel,
+        });
+
+        const scene = buildTestScene({
+          body: new AutoGridLayoutManager({
+            layout: new AutoGridLayout({ children: [autoGridItem] }),
+          }),
+        });
+
+        const libPanel = {
+          uid: 'uid',
+          name: 'name',
+        };
+
+        scene.createLibraryPanel(vizPanel, libPanel as LibraryPanel);
+
+        const behavior = autoGridItem.state.body.state.$behaviors![0] as LibraryPanelBehavior;
+
+        expect(autoGridItem.state.body).toBeInstanceOf(VizPanel);
+        expect(behavior.state.uid).toBe('uid');
+        expect(behavior.state.name).toBe('name');
+      });
+    });
+  });
+
+  describe('Deleting dashboard', () => {
+    it('Should mark it non dirty before navigating to root', async () => {
+      const scene = buildTestScene();
+      scene.setState({ isDirty: true });
+
+      locationService.push('/d/adsdas');
+      await scene.onDashboardDelete();
+
+      expect(scene.state.isDirty).toBe(false);
+    });
+  });
+
+  describe('Enriching data requests', () => {
+    let scene: DashboardScene;
+
+    beforeEach(() => {
+      scene = buildTestScene();
+      scene.onEnterEditMode();
+    });
+
+    describe('Should add app, uid, panelId and panelPluginId', () => {
+      test('when viewing', () => {
+        const queryRunner = sceneGraph.findObject(scene, (o) => o.state.key === 'data-query-runner')!;
+        expect(scene.enrichDataRequest(queryRunner)).toEqual({
+          app: CoreApp.Dashboard,
+          dashboardUID: 'dash-1',
+          dashboardTitle: 'hello',
+          panelId: 1,
+          panelName: 'Panel A',
+          panelPluginId: 'table',
+        });
+      });
+
+      test('when editing', () => {
+        const panel = findVizPanelByKey(scene, 'panel-1');
+        const editPanel = buildPanelEditScene(panel!);
+        scene.setState({ editPanel });
+
+        const queryRunner = editPanel.getPanel().state.$data!;
+
+        expect(scene.enrichDataRequest(queryRunner)).toEqual({
+          app: CoreApp.Dashboard,
+          dashboardUID: 'dash-1',
+          dashboardTitle: 'hello',
+          panelId: 1,
+          panelName: 'Panel A',
+          panelPluginId: 'table',
+        });
+      });
+    });
+
+    it('Should hash the key of the cloned panels and set it as panelId', () => {
+      const queryRunner = sceneGraph.findObject(scene, (o) => o.state.key === 'data-query-runner2')!;
+      expect(scene.enrichDataRequest(queryRunner).panelId).toEqual(3670868617);
+    });
+  });
+
+  describe('When variables change', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('A change to variable values should trigger VariablesChanged event', () => {
+      const varA = new TestVariable({ name: 'A', query: 'A.*', value: 'A.AA', text: '', options: [], delayMs: 0 });
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [varA] }),
+      });
+
+      scene.activate();
+
+      const eventHandler = jest.fn();
+      appEvents.subscribe(VariablesChanged, eventHandler);
+
+      varA.changeValueTo('A.AB');
+
+      expect(eventHandler).toHaveBeenCalledTimes(1);
+    });
+
+    it('A change to the variable set should set isDirty true', () => {
+      const varA = new TestVariable({ name: 'A', query: 'A.*', value: 'A.AA', text: '', options: [], delayMs: 0 });
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [varA] }),
+      });
+
+      scene.activate();
+      scene.onEnterEditMode();
+
+      const variableSet = sceneGraph.getVariables(scene);
+      variableSet.setState({ variables: [] });
+
+      expect(scene.state.isDirty).toBe(true);
+    });
+
+    it('A change to a variable state should set isDirty true', () => {
+      mockResultsOfDetectChangesWorker({ hasChanges: true });
+      const variable = new TestVariable({ name: 'A' });
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [variable] }),
+      });
+
+      scene.activate();
+      scene.onEnterEditMode();
+
+      variable.setState({ name: 'new-name' });
+
+      expect(variable.state.name).toBe('new-name');
+      expect(scene.state.isDirty).toBe(true);
+    });
+
+    it('A change to variable name is restored to original name should set isDirty back to false', () => {
+      const variable = new TestVariable({ name: 'A' });
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [variable] }),
+      });
+
+      scene.activate();
+      scene.onEnterEditMode();
+
+      mockResultsOfDetectChangesWorker({ hasChanges: true });
+      variable.setState({ name: 'B' });
+      expect(scene.state.isDirty).toBe(true);
+      mockResultsOfDetectChangesWorker({ hasChanges: false });
+      variable.setState({ name: 'A' });
+      expect(scene.state.isDirty).toBe(false);
+    });
+
+    it('should trigger scene RefreshEvent when a scene variable changes', () => {
+      const varA = new TestVariable({ name: 'A', query: 'A.*', value: 'A.AA', text: '', options: [], delayMs: 0 });
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [varA] }),
+      });
+
+      scene.activate();
+
+      const eventHandler = jest.fn();
+      // this RefreshEvent is from the scenes library
+      scene.subscribeToEvent(RefreshEvent, eventHandler);
+      varA.changeValueTo('A.AB');
+      expect(eventHandler).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('When a dashboard is restored', () => {
+    let scene: DashboardScene;
+
+    beforeEach(async () => {
+      scene = buildTestScene();
+      scene.onEnterEditMode();
+    });
+
+    it('should restore the dashboard to the selected version and exit edit mode', () => {
+      const newVersion = 3;
+
+      const mockScene = new DashboardScene({
+        title: 'new name',
+        uid: 'dash-1',
+        version: 4,
+      });
+
+      mockRestoreDashboardVersion.mockResolvedValue({ version: newVersion });
+      jest.mocked(transformSaveModelToScene).mockReturnValue(mockScene);
+
+      return scene.onRestore(getVersionMock()).then((res) => {
+        expect(res).toBe(true);
+        expect(scene.state.version).toBe(newVersion);
+        expect(scene.state.isEditing).toBe(false);
+      });
+    });
+
+    it('should call dashboardWatcher.reloadPage even if dashboard is in editing mode', async () => {
+      // sometimes a dashboard can be in editing mode after user has already restored to a previous version
+
+      const newVersion = 3;
+      const mockScene = new DashboardScene({
+        title: 'new name',
+        uid: 'dash-1',
+        version: 4,
+      });
+      mockRestoreDashboardVersion.mockResolvedValue({ version: newVersion });
+      jest.mocked(transformSaveModelToScene).mockReturnValue(mockScene);
+
+      const reloadSpy = jest.spyOn(dashboardWatcher, 'reloadPage').mockImplementation(() => {});
+
+      dashboardWatcher.editing = false;
+      const dash = { uid: 'dash-1', hasUnsavedChanges: () => true };
+      const getDashboardSrvSpy = jest
+        .spyOn(require('app/features/dashboard/services/DashboardSrv'), 'getDashboardSrv')
+        .mockReturnValue({ getCurrent: () => dash });
+
+      dashboardWatcher.observer.next({
+        type: LiveChannelEventType.Message,
+        message: {
+          sessionId: 'other',
+          message: 'Restored from version 3',
+          uid: 'dash-1',
+          action: DashboardEventAction.Saved,
+          timestamp: Date.now(),
+        },
+      });
+
+      expect(reloadSpy).toHaveBeenCalled();
+      reloadSpy.mockRestore();
+      getDashboardSrvSpy.mockRestore();
+    });
+
+    it('should return early if API does not return a valid version number', () => {
+      mockRestoreDashboardVersion
+        .mockResolvedValueOnce({ version: null })
+        .mockResolvedValueOnce({ version: undefined })
+        .mockResolvedValueOnce({ version: Infinity })
+        .mockResolvedValueOnce({ version: NaN })
+        .mockResolvedValue({ version: '10' });
+
+      for (let i = 0; i < 5; i++) {
+        scene.onRestore(getVersionMock()).then((res) => {
+          expect(res).toBe(false);
+        });
+      }
+    });
+  });
+
+  describe('When restoring a template dashboard', () => {
+    it('delegates to the DashboardTemplateExtension instead of the dashboard API', async () => {
+      const scene = buildTestScene({ meta: { isDashboardTemplate: true } });
+      scene.onEnterEditMode();
+
+      const restoreSpy = jest.fn().mockResolvedValue(true);
+      jest.spyOn(DashboardTemplateExtensionModule, 'getDashboardTemplateExtension').mockReturnValue({
+        loadTemplate: jest.fn(),
+        listHistory: jest.fn(),
+        restore: restoreSpy,
+      });
+
+      const version = getVersionMock();
+      const result = await scene.onRestore(version);
+
+      expect(restoreSpy).toHaveBeenCalledWith(scene, version);
+      expect(result).toBe(true);
+    });
+  });
+
+  describe('lazy overlays', () => {
+    beforeEach(() => {
+      locationService.push('/d/dash-1/test');
+    });
+
+    it('opens the filters overview through modal loading', async () => {
+      const scene = buildTestScene();
+      const opening = scene.openFiltersOverview();
+      expect(scene.state.loadingView).toBe('overlay');
+
+      await opening;
+
+      expect(scene.state.overlay).toBeInstanceOf(DashboardFiltersOverviewDrawer);
+      expect(scene.state.loadingView).toBeUndefined();
+    });
+
+    it('does not open the filters overview after closing its loading drawer', async () => {
+      const scene = buildTestScene();
+      const opening = scene.openFiltersOverview();
+      expect(scene.state.loadingView).toBe('overlay');
+
+      scene.closeModal();
+      await opening;
+
+      expect(scene.state.loadingView).toBeUndefined();
+      expect(scene.state.overlay).toBeUndefined();
+    });
+
+    it('does not restore an old loading indicator when discarding an edit session', async () => {
+      const scene = buildTestScene();
+      const pending = createDeferred<SceneObject>();
+      const opening = scene.showModalAsync(() => pending.promise);
+      expect(scene.state.loadingView).toBe('overlay');
+      scene.onEnterEditMode();
+      scene.exitEditMode({ skipConfirm: true, restoreInitialState: true });
+      expect(scene.state.loadingView).toBeUndefined();
+
+      pending.resolve(new SceneGridLayout({ children: [] }));
+      await opening;
+      expect(scene.state.overlay).toBeUndefined();
+    });
+
+    it.each(['older first', 'newer first'])('only opens the latest request when loads finish %s', async (order) => {
+      const scene = buildTestScene();
+      const older = new SceneGridLayout({ children: [] });
+      const newer = new SceneGridLayout({ children: [] });
+      let resolveOlder!: (modal: SceneObject) => void;
+      let resolveNewer!: (modal: SceneObject) => void;
+      const first = scene.showModalAsync(() => new Promise((resolve) => (resolveOlder = resolve)));
+      const second = scene.showModalAsync(() => new Promise((resolve) => (resolveNewer = resolve)));
+
+      if (order === 'older first') {
+        resolveOlder(older);
+        await first;
+        expect(scene.state.overlay).toBeUndefined();
+        resolveNewer(newer);
+      } else {
+        resolveNewer(newer);
+        await second;
+        resolveOlder(older);
+      }
+
+      await Promise.all([first, second]);
+      expect(scene.state.overlay).toBe(newer);
+    });
+
+    it.each(
+      Object.entries<(scene: DashboardScene, deactivate: () => void) => void | (() => void)>({
+        close: (scene) => scene.closeModal(),
+        'overlay replacement': (scene) => {
+          scene.showModal(new SceneGridLayout({ children: [] }));
+          scene.closeModal();
+        },
+        'navigation away and back': () => {
+          locationService.push('/dashboards');
+          locationService.push('/d/dash-1/test');
+        },
+        'editor URL change': () => locationService.partial({ inspect: 'panel-1' }),
+        'edit mode change': (scene) => {
+          scene.onEnterEditMode();
+          scene.exitEditMode({ skipConfirm: true });
+        },
+        'layout replacement': (scene) => scene.switchLayout(DefaultGridLayoutManager.createEmpty(), true),
+        'save drawer close': (scene) => new SaveDashboardDrawer({ dashboardRef: scene.getRef() }).onClose(),
+        'panel view URL sync': (scene) => scene.urlSync?.updateFromUrl({ viewPanel: 'panel-1' }),
+        'share state replacement': (scene) => scene.setState({ shareView: 'snapshot' }),
+        'inspect state replacement': (scene) => scene.setState({ inspectPanelKey: 'panel-1' }),
+        'deactivation and reactivation': (scene, deactivate) => {
+          deactivate();
+          return scene.activate();
+        },
+      })
+    )('discards a pending overlay after %s', async (_name, run) => {
+      const scene = buildTestScene();
+      const deactivate = scene.activate();
+      const modal = new SceneGridLayout({ children: [] });
+      let resolveLoad!: (modal: SceneObject) => void;
+      const opening = scene.showModalAsync(() => new Promise((resolve) => (resolveLoad = resolve)));
+      const cleanup = run(scene, deactivate) ?? deactivate;
+
+      resolveLoad(modal);
+      await opening;
+      expect(scene.state.overlay).toBeUndefined();
+
+      await scene.showModalAsync(async () => modal);
+      expect(scene.state.overlay).toBe(modal);
+      cleanup();
+    });
+
+    it.each(['time and variables', 'identical URL'])('allows %s URL updates while loading', async (update) => {
+      const scene = buildTestScene();
+      const modal = new SceneGridLayout({ children: [] });
+      let resolveLoad!: (modal: SceneObject) => void;
+      const opening = scene.showModalAsync(() => new Promise((resolve) => (resolveLoad = resolve)));
+
+      if (update === 'time and variables') {
+        locationService.partial({ from: 'now-1h', 'var-server': 'server-2' });
+      } else {
+        locationService.replace('/d/dash-1/test');
+      }
+
+      resolveLoad(modal);
+      await opening;
+      expect(scene.state.overlay).toBe(modal);
+    });
+
+    it('does not overwrite an explicitly opened library panel drawer', async () => {
+      const scene = buildTestScene();
+      const opening = scene.showModalAsync(async () => new SceneGridLayout({ children: [] }));
+
+      scene.onShowAddLibraryPanelDrawer();
+      const drawer = scene.state.overlay;
+      expect(drawer).toBeDefined();
+      await opening;
+      expect(scene.state.overlay).toBe(drawer);
+    });
+
+    it('cancels a pending drawer when an existing consumer restores a full snapshot', async () => {
+      const scene = buildTestScene();
+      const pending = createDeferred<SceneObject>();
+      const opening = scene.showModalAsync(() => pending.promise);
+      const body = DefaultGridLayoutManager.createEmpty();
+
+      scene.setState({ ...scene.state, body, title: 'Restored dashboard' });
+      pending.resolve(new SceneGridLayout({ children: [] }));
+      await opening;
+
+      expect(scene.state.title).toBe('Restored dashboard');
+      expect(scene.state.body).toBe(body);
+      expect(scene.state.loadingView).toBeUndefined();
+      expect(scene.state.overlay).toBeUndefined();
+    });
+
+    it('allows ordinary dashboard data updates while loading', async () => {
+      const scene = buildTestScene();
+      const modal = new SceneGridLayout({ children: [] });
+      let resolveLoad!: (modal: SceneObject) => void;
+      const opening = scene.showModalAsync(() => new Promise((resolve) => (resolveLoad = resolve)));
+
+      scene.setState({ title: 'Updated title', isDirty: true });
+      resolveLoad(modal);
+      await opening;
+
+      expect(scene.state.overlay).toBe(modal);
+      expect(scene.state.title).toBe('Updated title');
+    });
+
+    it('keeps a newer pending request cancellable after an older request finishes', async () => {
+      const scene = buildTestScene();
+      const modal = new SceneGridLayout({ children: [] });
+      let resolveOlder!: (modal: SceneObject) => void;
+      let resolveNewer!: (modal: SceneObject) => void;
+      const first = scene.showModalAsync(() => new Promise((resolve) => (resolveOlder = resolve)));
+      const second = scene.showModalAsync(() => new Promise((resolve) => (resolveNewer = resolve)));
+
+      resolveOlder(modal);
+      await first;
+      scene.closeModal();
+      resolveNewer(modal);
+      await second;
+
+      expect(scene.state.overlay).toBeUndefined();
+      await scene.showModalAsync(async () => modal);
+      expect(scene.state.overlay).toBe(modal);
+    });
+
+    it('cancels pending drawer and pane requests before the panel editor import completes', async () => {
+      const scene = buildTestScene();
+      const modal = new SceneGridLayout({ children: [] });
+      const panel = findVizPanelByKey(scene, 'panel-1')!;
+      const deactivateSidebar = scene.state.sidebar.activate();
+      // This continuation runs before the panel editor's dynamic import resolves.
+      const opening = scene.showModalAsync(async () => modal);
+      const paneRequest = scene.state.sidebar.beginPaneRequest();
+      const editing = openPanelEditor(scene, panel);
+      expect(paneRequest.aborted).toBe(true);
+      expect(scene.state.editPanel).toBeUndefined();
+
+      await opening;
+      expect(scene.state.overlay === modal).toBe(false);
+      await editing;
+      expect(scene.state.editPanel?.state.panelRef.resolve()).toBe(panel);
+      deactivateSidebar();
+    });
+
+    it('preserves pending drawer and sidebar loads when URL sync clears already-closed settings', async () => {
+      const scene = buildTestScene();
+      const deactivateSidebar = scene.state.sidebar.activate();
+      const modal = new SceneGridLayout({ children: [] });
+      const opening = scene.showModalAsync(async () => modal);
+      const paneRequest = scene.state.sidebar.beginPaneRequest();
+
+      scene.urlSync?.updateFromUrl({ editview: null });
+
+      expect(scene.state.loadingView).toBe('overlay');
+      expect(paneRequest.aborted).toBe(false);
+      await opening;
+      expect(scene.state.overlay).toBe(modal);
+      deactivateSidebar();
+    });
+
+    it('propagates a load failure and allows a later request', async () => {
+      const scene = buildTestScene();
+      await expect(
+        scene.showModalAsync(async () => {
+          throw new Error('Chunk load failed');
+        })
+      ).rejects.toThrow('Chunk load failed');
+
+      const modal = new SceneGridLayout({ children: [] });
+      await scene.showModalAsync(async () => modal);
+      expect(scene.state.overlay).toBe(modal);
+    });
+
+    it.each(['save', 'share'])('does not let a pending %s drawer overwrite a newer modal', async (drawer) => {
+      const scene = buildTestScene();
+      scene.onEnterEditMode();
+      const opening = drawer === 'save' ? scene.openSaveDrawer({}) : openShareDrawer(scene, { shareView: 'link' });
+      const modal = new SceneGridLayout({ children: [] });
+      scene.showModal(modal);
+
+      await opening;
+      expect(scene.state.overlay).toBe(modal);
+    });
+  });
+
+  describe('lazy view cleanup', () => {
+    it('keeps a request started by loading completion cancellable', async () => {
+      const scene = buildTestScene();
+      const pending = createDeferred<SceneObject>();
+      let newer: Promise<void> | undefined;
+      const subscription = scene.subscribeToState((state, previous) => {
+        if (previous.loadingView && !state.loadingView && !newer) {
+          newer = scene.showModalAsync(() => pending.promise);
+        }
+      });
+      try {
+        await scene.showModalAsync(async () => undefined);
+        expect(scene.state.loadingView).toBe('overlay');
+        scene.closeModal();
+        pending.resolve(new SceneGridLayout({ children: [] }));
+        await newer;
+        expect(scene.state.loadingView).toBeUndefined();
+        expect(scene.state.overlay).toBeUndefined();
+        const modal = new SceneGridLayout({ children: [] });
+        await scene.showModalAsync(async () => modal);
+        expect(scene.state.overlay).toBe(modal);
+      } finally {
+        subscription.unsubscribe();
+      }
+    });
+
+    it('keeps browser Back and Forward updating the scene after repeated view commits', async () => {
+      const previousUrl = window.location.href;
+      window.history.replaceState({}, '', '/d/dash-1/test');
+      const history = createBrowserHistory();
+      const getHistory = jest.spyOn(locationService, 'getHistory').mockReturnValue(history);
+      const getLocation = jest.spyOn(locationService, 'getLocation').mockImplementation(() => history.location);
+      const scene = buildTestScene();
+      const unlisten = history.listen((location) => {
+        scene.urlSync?.updateFromUrl({ viewPanel: new URLSearchParams(location.search).get('viewPanel') });
+      });
+      try {
+        for (let i = 0; i < 3; i++) {
+          const modal = new SceneGridLayout({ children: [] });
+          await scene.showModalAsync(async () => modal);
+          expect(scene.state.overlay).toBe(modal);
+          scene.closeModal();
+        }
+        history.push('/d/dash-1/test?viewPanel=panel-1');
+        history.push('/d/dash-1/test?viewPanel=panel-2');
+        expect(scene.state.viewPanel).toBe('panel-2');
+
+        history.goBack();
+        await waitFor(() => expect(scene.state.viewPanel).toBe('panel-1'));
+        history.goForward();
+        await waitFor(() => expect(scene.state.viewPanel).toBe('panel-2'));
+      } finally {
+        unlisten();
+        getHistory.mockRestore();
+        getLocation.mockRestore();
+        window.history.replaceState({}, '', previousUrl);
+      }
+    });
+
+    it.each(['success', 'undefined', 'rejection', 'cancellation', 'commit failure'])(
+      'releases the history listener once after %s and allows another view',
+      async (outcome) => {
+        const scene = buildTestScene();
+        const history = locationService.getHistory();
+        const originalListen = history.listen.bind(history);
+        const disposers: jest.Mock[] = [];
+        const listen = jest.spyOn(history, 'listen').mockImplementation((listener) => {
+          const dispose = jest.fn(originalListen(listener));
+          disposers.push(dispose);
+          return dispose;
+        });
+        const pending = createDeferred<SceneObject | undefined>();
+        const modal = new SceneGridLayout({ children: [] });
+        const opening = scene.loadView({ key: 'overlay', load: () => pending.promise });
+        const commit = jest.spyOn(scene, 'setState');
+        try {
+          if (outcome === 'commit failure') {
+            commit.mockImplementationOnce(() => {
+              throw new Error('Commit failed');
+            });
+          }
+          if (outcome === 'cancellation') {
+            scene.cancelPendingViews();
+          }
+          if (outcome === 'rejection') {
+            pending.reject(new Error('Load failed'));
+          } else {
+            pending.resolve(outcome === 'undefined' ? undefined : modal);
+          }
+          if (outcome === 'rejection' || outcome === 'commit failure') {
+            await expect(opening).rejects.toThrow(outcome === 'rejection' ? 'Load failed' : 'Commit failed');
+          } else {
+            await opening;
+          }
+          expect(disposers).toHaveLength(1);
+          expect(disposers[0]).toHaveBeenCalledTimes(1);
+          expect(scene.state.loadingView).toBeUndefined();
+          expect(scene.state.overlay).toBe(outcome === 'success' ? modal : undefined);
+
+          await scene.showModalAsync(async () => modal);
+          expect(scene.state.overlay).toBe(modal);
+          expect(disposers[1]).toHaveBeenCalledTimes(1);
+        } finally {
+          commit.mockRestore();
+          listen.mockRestore();
+        }
+      }
+    );
+
+    it.each(['older first', 'newer first'])(
+      'preserves the newer editor when an older load rejects %s',
+      async (order) => {
+        const scene = buildTestScene();
+        const older = createDeferred<ReturnType<typeof buildPanelEditScene>>();
+        const newer = createDeferred<ReturnType<typeof buildPanelEditScene>>();
+        const first = scene.loadView({ key: 'editPanel', load: () => older.promise });
+        const second = scene.loadView({ key: 'editPanel', load: () => newer.promise });
+        const editor = buildPanelEditScene(findVizPanelByKey(scene, 'panel-2')!);
+        if (order === 'newer first') {
+          newer.resolve(editor);
+          await second;
+        }
+        older.reject(new Error('Old chunk failed'));
+        await expect(first).rejects.toThrow('Old chunk failed');
+        if (order === 'older first') {
+          expect(scene.state.loadingView).toBe('editPanel');
+          newer.resolve(editor);
+          await second;
+        }
+        expect(scene.state.editPanel).toBe(editor);
+        expect(scene.state.loadingView).toBeUndefined();
+      }
+    );
+  });
+
+  describe('lazy panel editor', () => {
+    beforeEach(() => {
+      locationService.push('/d/dash-1/test?editPanel=panel-1');
+    });
+
+    it('keeps the newer editor loading when a superseded request resolves', async () => {
+      const scene = buildTestScene();
+      const first = createDeferred<ReturnType<typeof buildPanelEditScene>>();
+      const second = createDeferred<ReturnType<typeof buildPanelEditScene>>();
+      const older = scene.loadView({ key: 'editPanel', load: () => first.promise });
+      const newer = scene.loadView({ key: 'editPanel', load: () => second.promise });
+      first.resolve(buildPanelEditScene(findVizPanelByKey(scene, 'panel-1')!));
+      await older;
+      expect(scene.state.loadingView).toBe('editPanel');
+      expect(scene.state.editPanel).toBeUndefined();
+      const panel = findVizPanelByKey(scene, 'panel-2')!;
+      second.resolve(buildPanelEditScene(panel));
+      await newer;
+      expect(scene.state.editPanel?.state.panelRef.resolve()).toBe(panel);
+      expect(scene.state.loadingView).toBeUndefined();
+    });
+
+    it('clears panel editor loading after a failed import and allows another request', async () => {
+      const scene = buildTestScene();
+      const pending = createDeferred<never>();
+      const opening = scene.loadView({ key: 'editPanel', load: () => pending.promise });
+      expect(scene.state.loadingView).toBe('editPanel');
+      pending.reject(new Error('Chunk load failed'));
+      await expect(opening).rejects.toThrow('Chunk load failed');
+      expect(scene.state.loadingView).toBeUndefined();
+      const panel = findVizPanelByKey(scene, 'panel-1')!;
+      await openPanelEditor(scene, panel);
+      expect(scene.state.editPanel?.state.panelRef.resolve()).toBe(panel);
+      expect(scene.state.loadingView).toBeUndefined();
+    });
+
+    it.each(
+      Object.entries<(scene: DashboardScene, deactivate: () => void) => void>({
+        close: (scene) => scene.cancelPendingViews(),
+        'editor URL removal': () => locationService.partial({ editPanel: null }),
+        'navigation away and back': () => {
+          locationService.push('/dashboards');
+          locationService.push('/d/dash-1/test?editPanel=panel-1');
+        },
+        rebuild: (scene) => scene.switchLayout(DefaultGridLayoutManager.createEmpty(), true),
+        deactivation: (_scene, deactivate) => deactivate(),
+      })
+    )('does not reopen the editor after %s while its chunk loads', async (_name, run) => {
+      const scene = buildTestScene({ isEditing: true });
+      const deactivate = scene.activate();
+      const panel = findVizPanelByKey(scene, 'panel-1')!;
+      const editing = openPanelEditor(scene, panel);
+
+      run(scene, deactivate);
+      expect(scene.state.loadingView).toBeUndefined();
+      await editing;
+
+      expect(scene.state.editPanel).toBeUndefined();
+      const modal = new SceneGridLayout({ children: [] });
+      await scene.showModalAsync(async () => modal);
+      expect(scene.state.overlay).toBe(modal);
+      if (scene.isActive) {
+        deactivate();
+      }
+    });
+
+    it('does not cancel a newer pending drawer when the editor chunk arrives', async () => {
+      const scene = buildTestScene();
+      const panel = findVizPanelByKey(scene, 'panel-1')!;
+      const editing = openPanelEditor(scene, panel);
+      const pending = createDeferred<SceneObject>();
+      const opening = scene.showModalAsync(() => pending.promise);
+
+      await editing;
+
+      expect(scene.state.loadingView).toBe('overlay');
+      expect(scene.state.editPanel).toBeUndefined();
+      const modal = new SceneGridLayout({ children: [] });
+      pending.resolve(modal);
+      await opening;
+      expect(scene.state.overlay).toBe(modal);
+    });
+
+    it('opens only the most recently requested panel and preserves new-panel state', async () => {
+      const scene = buildTestScene();
+      const firstPanel = findVizPanelByKey(scene, 'panel-1')!;
+      const secondPanel = findVizPanelByKey(scene, 'panel-2')!;
+      const openedPanels: string[] = [];
+      const subscription = scene.subscribeToState(({ editPanel }, previous) => {
+        if (editPanel && editPanel !== previous.editPanel) {
+          openedPanels.push(editPanel.getUrlKey());
+        }
+      });
+      const first = openPanelEditor(scene, firstPanel);
+      const second = openPanelEditor(scene, secondPanel, true);
+
+      await Promise.all([first, second]);
+      subscription.unsubscribe();
+
+      expect(openedPanels).toEqual(['2']);
+      expect(scene.state.editPanel?.state.panelRef.resolve()).toBe(secondPanel);
+      expect(scene.state.editPanel?.state.isNewPanel).toBe(true);
+    });
+
+    it('allows data-only edits and time-range URL changes while the editor loads', async () => {
+      const scene = buildTestScene();
+      const panel = findVizPanelByKey(scene, 'panel-1')!;
+      const editing = openPanelEditor(scene, panel);
+      scene.setState({ title: 'Updated title' });
+      locationService.partial({ from: 'now-6h', to: 'now', 'var-server': 'server-b' });
+
+      await editing;
+
+      expect(scene.state.editPanel?.state.panelRef.resolve()).toBe(panel);
+      expect(scene.state.title).toBe('Updated title');
+    });
+  });
+
+  describe('openSaveDrawer with template flags', () => {
+    it('opens the drawer in saveAsDashboardTemplate mode', async () => {
+      const scene = buildTestScene();
+      scene.onEnterEditMode();
+
+      await scene.openSaveDrawer({ saveAsDashboardTemplate: true });
+
+      const overlay = scene.state.overlay;
+      expect(overlay).toBeInstanceOf(SaveDashboardDrawer);
+      expect((overlay as SaveDashboardDrawer).state.saveAsDashboardTemplate).toBe(true);
+      expect((overlay as SaveDashboardDrawer).state.saveDashboardTemplate).toBeUndefined();
+    });
+
+    it('opens the drawer in saveDashboardTemplate mode', async () => {
+      const scene = buildTestScene();
+      scene.onEnterEditMode();
+
+      await scene.openSaveDrawer({ saveDashboardTemplate: true });
+
+      const overlay = scene.state.overlay;
+      expect(overlay).toBeInstanceOf(SaveDashboardDrawer);
+      expect((overlay as SaveDashboardDrawer).state.saveDashboardTemplate).toBe(true);
+      expect((overlay as SaveDashboardDrawer).state.saveAsDashboardTemplate).toBeUndefined();
+    });
+
+    it('does nothing when the scene is not in edit mode', async () => {
+      const scene = buildTestScene();
+      // Not entering edit mode
+      await scene.openSaveDrawer({ saveAsDashboardTemplate: true });
+      expect(scene.state.overlay).toBeUndefined();
+    });
+  });
+
+  describe('When checking dashboard managed by an external system', () => {
+    beforeEach(() => {
+      config.provisioningEnabled = true;
+    });
+
+    afterEach(() => {
+      config.provisioningEnabled = false;
+    });
+
+    it('should return true if the dashboard is managed', () => {
+      const scene = buildTestScene({
+        meta: {
+          k8s: {
+            annotations: {
+              [AnnoKeyManagerKind]: ManagerKind.Repo,
+            },
+          },
+        },
+      });
+      expect(scene.isManaged()).toBe(true);
+    });
+
+    it('dashboard should be editable if managed by repo', () => {
+      const scene = buildTestScene({
+        meta: {
+          k8s: {
+            annotations: {
+              [AnnoKeyManagerKind]: ManagerKind.Repo,
+            },
+          },
+        },
+      });
+      expect(scene.managedResourceCannotBeEdited()).toBe(false);
+    });
+
+    it('dashboard should not be editable if managed by systems that do not allow edits: kubectl', () => {
+      const scene = buildTestScene({
+        meta: {
+          k8s: {
+            annotations: {
+              [AnnoKeyManagerKind]: ManagerKind.Kubectl,
+            },
+          },
+        },
+      });
+      expect(scene.managedResourceCannotBeEdited()).toBe(true);
+    });
+
+    it('dashboard should not be editable if managed by systems that do not allow edits: terraform', () => {
+      const scene = buildTestScene({
+        meta: {
+          k8s: {
+            annotations: {
+              [AnnoKeyManagerKind]: ManagerKind.Terraform,
+            },
+          },
+        },
+      });
+      expect(scene.managedResourceCannotBeEdited()).toBe(true);
+    });
+
+    it('dashboard should not be editable if managed by systems that do not allow edits: plugin', () => {
+      const scene = buildTestScene({
+        meta: {
+          k8s: { annotations: { [AnnoKeyManagerKind]: ManagerKind.Plugin } },
+        },
+      });
+      expect(scene.managedResourceCannotBeEdited()).toBe(true);
+    });
+
+    it('dashboard should be editable if not managed', () => {
+      const scene = buildTestScene();
+      expect(scene.managedResourceCannotBeEdited()).toBe(false);
+    });
+  });
+
+  describe('getTransformationCounts', () => {
+    it('should count transformations from V1 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModel = createV1DashboardWithTransformations(['reduce', 'calculateField', 'reduce']);
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toEqual({ calculateField: 1, reduce: 2 });
+    });
+
+    it('should count transformations from V2 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModel = createV2DashboardWithTransformations(['filterByValue', 'organize', 'filterByValue']);
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toEqual({ filterByValue: 2, organize: 1 });
+    });
+
+    it('should return undefined when no transformations exist', () => {
+      const scene = buildTestScene();
+      const saveModelV1 = createV1DashboardWithExpressions([]);
+      const saveModelV2 = createV2DashboardWithExpressions([]);
+
+      const resultV1 = scene.getTransformationCounts(saveModelV1);
+      const resultV2 = scene.getTransformationCounts(saveModelV2);
+
+      expect(resultV1).toBeUndefined();
+      expect(resultV2).toBeUndefined();
+    });
+
+    it('should return undefined for empty V1 dashboard', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Empty Dashboard',
+        schemaVersion: 30,
+        panels: [],
+      } as unknown as Dashboard;
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined for empty V2 dashboard', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Empty Dashboard V2',
+        elements: {},
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toBeUndefined();
+    });
+
+    it('should handle multiple panels with transformations in V1', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard',
+        schemaVersion: 30,
+        panels: [
+          {
+            id: 1,
+            type: 'timeseries',
+            transformations: [
+              { id: 'reduce', options: {} },
+              { id: 'calculateField', options: {} },
+            ],
+          },
+          {
+            id: 2,
+            type: 'graph',
+            transformations: [{ id: 'reduce', options: {} }],
+          },
+        ],
+      } as unknown as Dashboard;
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toEqual({ calculateField: 1, reduce: 2 });
+    });
+
+    it('should handle multiple panels with transformations in V2', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard V2',
+        elements: {
+          'panel-1': {
+            kind: 'Panel',
+            spec: {
+              id: 1,
+              title: 'Panel 1',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [],
+                  transformations: [
+                    { kind: 'organize', spec: { id: 'organize', options: {} } },
+                    { kind: 'filterByValue', spec: { id: 'filterByValue', options: {} } },
+                  ],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+          'panel-2': {
+            kind: 'Panel',
+            spec: {
+              id: 2,
+              title: 'Panel 2',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [],
+                  transformations: [{ kind: 'organize', spec: { id: 'organize', options: {} } }],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+        },
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toEqual({ filterByValue: 1, organize: 2 });
+    });
+
+    it('should return object with correct structure', () => {
+      const scene = buildTestScene();
+      const saveModel = createV1DashboardWithTransformations(['organize', 'calculateField', 'filterByValue']);
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toEqual({
+        calculateField: 1,
+        filterByValue: 1,
+        organize: 1,
+      });
+    });
+
+    it('should skip LibraryPanel elements in V2', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard V2',
+        elements: {
+          'panel-1': {
+            kind: 'Panel',
+            spec: {
+              id: 1,
+              title: 'Panel 1',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [],
+                  transformations: [{ kind: 'organize', spec: { id: 'organize', options: {} } }],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+          'library-panel-1': {
+            kind: 'LibraryPanel',
+            spec: {
+              uid: 'library-uid',
+              name: 'Library Panel',
+            },
+          },
+        },
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getTransformationCounts(saveModel);
+
+      expect(result).toEqual({ organize: 1 });
+    });
+  });
+
+  describe('getExpressionCounts', () => {
+    it('should count all expression types from V1 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModel = createV1DashboardWithExpressions(['sql', 'sql', 'reduce']);
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ reduce: 1, sql: 2 });
+    });
+
+    it('should count all expression types from V2 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModel = createV2DashboardWithExpressions(['sql', 'math', 'sql']);
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ math: 1, sql: 2 });
+    });
+
+    it('should return undefined when no expressions exist for V1 and V2 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModelV1 = createV1DashboardWithExpressions([]);
+      const saveModelV2 = createV2DashboardWithExpressions([]);
+
+      const resultV1 = scene.getExpressionCounts(saveModelV1);
+      const resultV2 = scene.getExpressionCounts(saveModelV2);
+
+      expect(resultV1).toBeUndefined();
+      expect(resultV2).toBeUndefined();
+    });
+
+    it('should return undefined for empty V1 dashboard', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Empty Dashboard',
+        schemaVersion: 30,
+        panels: [],
+      } as unknown as Dashboard;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined for empty V2 dashboard', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Empty Dashboard V2',
+        elements: {},
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toBeUndefined();
+    });
+
+    it('should handle multiple panels with expressions in V1', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard',
+        schemaVersion: 30,
+        panels: [
+          {
+            id: 1,
+            type: 'timeseries',
+            targets: [
+              {
+                refId: 'A',
+                datasource: { type: '__expr__', uid: '__expr__' },
+                type: 'sql',
+              },
+            ],
+          },
+          {
+            id: 2,
+            type: 'graph',
+            targets: [
+              {
+                refId: 'A',
+                datasource: { type: '__expr__', uid: '__expr__' },
+                type: 'sql',
+              },
+              {
+                refId: 'B',
+                datasource: { type: '__expr__', uid: '__expr__' },
+                type: 'math',
+              },
+            ],
+          },
+        ],
+      } as unknown as Dashboard;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ math: 1, sql: 2 });
+    });
+
+    it('should handle multiple panels with expressions in V2', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard V2',
+        elements: {
+          'panel-1': {
+            kind: 'Panel',
+            spec: {
+              id: 1,
+              title: 'Panel 1',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [
+                    {
+                      kind: 'PanelQuery',
+                      spec: {
+                        query: {
+                          kind: 'DataQuery',
+                          group: '__expr__',
+                          datasource: { name: '__expr__' },
+                          spec: { type: 'sql' },
+                        },
+                        refId: 'A',
+                      },
+                    },
+                  ],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+          'panel-2': {
+            kind: 'Panel',
+            spec: {
+              id: 2,
+              title: 'Panel 2',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [
+                    {
+                      kind: 'PanelQuery',
+                      spec: {
+                        query: {
+                          kind: 'DataQuery',
+                          group: '__expr__',
+                          datasource: { name: '__expr__' },
+                          spec: { type: 'sql' },
+                        },
+                        refId: 'A',
+                      },
+                    },
+                    {
+                      kind: 'PanelQuery',
+                      spec: {
+                        query: {
+                          kind: 'DataQuery',
+                          group: '__expr__',
+                          datasource: { name: '__expr__' },
+                          spec: { type: 'math' },
+                        },
+                        refId: 'B',
+                      },
+                    },
+                  ],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+        },
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ math: 1, sql: 2 });
+    });
+
+    it('should return object with correct structure for multiple expression types', () => {
+      const scene = buildTestScene();
+      const saveModel = createV1DashboardWithExpressions(['reduce', 'math', 'sql']);
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ math: 1, reduce: 1, sql: 1 });
+    });
+
+    it('should skip non-expression datasources in V1 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard',
+        schemaVersion: 30,
+        panels: [
+          {
+            id: 1,
+            type: 'timeseries',
+            targets: [
+              {
+                refId: 'A',
+                datasource: { type: 'prometheus', uid: 'prometheus-uid' },
+                type: 'instant',
+              },
+              {
+                refId: 'B',
+                datasource: { type: '__expr__', uid: '__expr__' },
+                type: 'sql',
+              },
+            ],
+          },
+        ],
+      } as unknown as Dashboard;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ sql: 1 });
+    });
+
+    it('should skip non-expression datasources in V2 dashboards', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard V2',
+        elements: {
+          'panel-1': {
+            kind: 'Panel',
+            spec: {
+              id: 1,
+              title: 'Panel 1',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [
+                    {
+                      kind: 'PanelQuery',
+                      spec: {
+                        query: {
+                          kind: 'DataQuery',
+                          group: 'prometheus',
+                          datasource: { name: 'prometheus-uid' },
+                          spec: { expr: 'up' },
+                        },
+                        refId: 'A',
+                      },
+                    },
+                    {
+                      kind: 'PanelQuery',
+                      spec: {
+                        query: {
+                          kind: 'DataQuery',
+                          group: '__expr__',
+                          datasource: { name: '__expr__' },
+                          spec: { type: 'math' },
+                        },
+                        refId: 'B',
+                      },
+                    },
+                  ],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+        },
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ math: 1 });
+    });
+
+    it('should skip LibraryPanel elements in V2', () => {
+      const scene = buildTestScene();
+      const saveModel = {
+        title: 'Test Dashboard V2',
+        elements: {
+          'panel-1': {
+            kind: 'Panel',
+            spec: {
+              id: 1,
+              title: 'Panel 1',
+              data: {
+                kind: 'QueryGroup',
+                spec: {
+                  queries: [
+                    {
+                      kind: 'PanelQuery',
+                      spec: {
+                        query: {
+                          kind: 'DataQuery',
+                          group: '__expr__',
+                          datasource: { name: '__expr__' },
+                          spec: { type: 'sql' },
+                        },
+                        refId: 'A',
+                      },
+                    },
+                  ],
+                  queryOptions: {},
+                },
+              },
+            },
+          },
+          'library-panel-1': {
+            kind: 'LibraryPanel',
+            spec: {
+              uid: 'library-uid',
+              name: 'Library Panel',
+            },
+          },
+        },
+      } as unknown as DashboardV2Spec;
+
+      const result = scene.getExpressionCounts(saveModel);
+
+      expect(result).toEqual({ sql: 1 });
+    });
+  });
+
+  describe('setDefaultVariables', () => {
+    it('should prepend default variables to existing variables', () => {
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [] }) });
+
+      const defaultVariables = [
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'defaultVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[];
+
+      const existingVarCount = sceneGraph.getVariables(scene).state.variables.length;
+      scene.setDefaultVariables(defaultVariables);
+
+      const variables = sceneGraph.getVariables(scene).state.variables;
+      expect(variables.length).toBe(existingVarCount + 1);
+      expect(variables[0].state.name).toBe('defaultVar');
+    });
+
+    it('should replace previous defaults on subsequent calls', () => {
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [] }) });
+      const existingVarCount = sceneGraph.getVariables(scene).state.variables.length;
+
+      scene.setDefaultVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'varFromDs1',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[]);
+
+      // Second call should replace, not append
+      scene.setDefaultVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'varFromDs2',
+            current: { text: 'x', value: 'x' },
+            query: 'x,y,z',
+            origin: { type: 'datasource' as const, group: 'loki' },
+          },
+        },
+      ] as VariableKind[]);
+
+      const variables = sceneGraph.getVariables(scene).state.variables;
+      // Only 1 default + existing user vars (not 2 defaults)
+      expect(variables.length).toBe(existingVarCount + 1);
+      expect(variables[0].state.name).toBe('varFromDs2');
+    });
+
+    it('should preserve predefined-origin variables while replacing datasource defaults', () => {
+      const predefinedVar = new TestVariable({
+        name: 'globalVar',
+        origin: toControlSourceRef({ type: 'global' }),
+      });
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [predefinedVar] }) });
+
+      scene.setDefaultVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'varFromDs',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[]);
+
+      const names = sceneGraph
+        .getVariables(scene)
+        .state.variables.map((v) => v.state.name)
+        .filter((name) => name === 'globalVar' || name === 'varFromDs');
+      expect(names).toEqual(['varFromDs', 'globalVar']);
+
+      scene.clearDefaultControls();
+
+      const remaining = sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name);
+      expect(remaining).toContain('globalVar');
+      expect(remaining).not.toContain('varFromDs');
+    });
+
+    it('should skip default variables shadowed by an existing variable of the same name', () => {
+      const userVar = new TestVariable({ name: 'shadowed' });
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [userVar] }) });
+
+      scene.setDefaultVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'shadowed',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[]);
+
+      const shadowed = sceneGraph.getVariables(scene).state.variables.filter((v) => v.state.name === 'shadowed');
+      expect(shadowed).toHaveLength(1);
+      expect(shadowed[0].state.origin).toBeUndefined();
+    });
+  });
+
+  describe('refreshPredefinedVariables', () => {
+    beforeEach(() => {
+      setTestFlags({ 'grafana.dashboardGlobalVariables': true });
+      mockFetchPredefinedVariables.mockReset();
+    });
+
+    afterEach(() => {
+      setTestFlags({});
+    });
+
+    it('should ignore stale fetch results when a newer refresh has started', async () => {
+      const globalVar = {
+        kind: 'CustomVariable' as const,
+        spec: {
+          name: 'globalVar',
+          current: { text: 'a', value: 'a' },
+          query: 'a,b,c',
+          origin: toControlSourceRef({ type: 'global' }),
+        },
+      } as VariableKind;
+
+      let resolveFirstFetch!: (value: VariableKind[]) => void;
+      const firstFetch = new Promise<VariableKind[]>((resolve) => {
+        resolveFirstFetch = resolve;
+      });
+      mockFetchPredefinedVariables.mockReturnValueOnce(firstFetch).mockResolvedValueOnce([globalVar]);
+
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [] }),
+        meta: {
+          folderUid: 'folder-1',
+          k8s: {
+            annotations: {
+              [AnnoKeyUseCrossDashboardVariables]: '{"global":"all","folder":"all"}',
+            },
+          },
+        },
+      });
+
+      // First refresh: inject all. Fetch stays pending.
+      const staleRefresh = scene.refreshPredefinedVariables();
+
+      // Second refresh: inject none — applies immediately and invalidates the in-flight fetch.
+      scene.setState({
+        meta: {
+          ...scene.state.meta,
+          k8s: {
+            annotations: {},
+          },
+        },
+      });
+      await scene.refreshPredefinedVariables();
+
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).not.toContain('globalVar');
+
+      // Stale fetch completes after the newer selection; must not re-inject variables.
+      resolveFirstFetch([globalVar]);
+      await staleRefresh;
+
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).not.toContain('globalVar');
+    });
+
+    it('should apply the latest denylist when overlapping fetches finish out of order', async () => {
+      const globalVar = {
+        kind: 'CustomVariable' as const,
+        spec: {
+          name: 'globalVar',
+          current: { text: 'a', value: 'a' },
+          query: 'a,b,c',
+          origin: toControlSourceRef({ type: 'global' }),
+        },
+      } as VariableKind;
+      const folderVar = {
+        kind: 'CustomVariable' as const,
+        spec: {
+          name: 'folderVar',
+          current: { text: 'x', value: 'x' },
+          query: 'x,y',
+          origin: toControlSourceRef({ type: 'folder', folderUid: 'folder-1' }),
+        },
+      } as VariableKind;
+
+      let resolveFirstFetch!: (value: VariableKind[]) => void;
+      let resolveSecondFetch!: (value: VariableKind[]) => void;
+      const firstFetch = new Promise<VariableKind[]>((resolve) => {
+        resolveFirstFetch = resolve;
+      });
+      const secondFetch = new Promise<VariableKind[]>((resolve) => {
+        resolveSecondFetch = resolve;
+      });
+      mockFetchPredefinedVariables.mockReturnValueOnce(firstFetch).mockReturnValueOnce(secondFetch);
+
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [] }),
+        meta: {
+          folderUid: 'folder-1',
+          k8s: {
+            annotations: {
+              [AnnoKeyUseCrossDashboardVariables]: '{"global":"all","folder":"all"}',
+            },
+          },
+        },
+      });
+
+      // First: All
+      const firstRefresh = scene.refreshPredefinedVariables();
+
+      // Second: Folder only — starts while first fetch is still pending.
+      scene.setState({
+        meta: {
+          ...scene.state.meta,
+          k8s: {
+            annotations: {
+              [AnnoKeyUseCrossDashboardVariables]: '{"global":"none","folder":"all"}',
+            },
+          },
+        },
+      });
+      const secondRefresh = scene.refreshPredefinedVariables();
+
+      // Newer fetch finishes first with the folder-only denylist applied.
+      resolveSecondFetch([globalVar, folderVar]);
+      await secondRefresh;
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).toEqual(['folderVar']);
+
+      // Older fetch finishes later; must not overwrite with the stale "all" resolution.
+      resolveFirstFetch([globalVar, folderVar]);
+      await firstRefresh;
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).toEqual(['folderVar']);
+    });
+
+    it('should keep existing predefined variables when the fetch fails', async () => {
+      const globalVar = {
+        kind: 'CustomVariable' as const,
+        spec: {
+          name: 'globalVar',
+          current: { text: 'a', value: 'a' },
+          query: 'a,b,c',
+          origin: toControlSourceRef({ type: 'global' }),
+        },
+      } as VariableKind;
+
+      mockFetchPredefinedVariables.mockResolvedValueOnce([globalVar]).mockResolvedValueOnce(null);
+
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [] }),
+        meta: {
+          folderUid: 'folder-1',
+          k8s: {
+            annotations: {
+              [AnnoKeyUseCrossDashboardVariables]: '{"global":"all","folder":"all"}',
+            },
+          },
+        },
+      });
+
+      await scene.refreshPredefinedVariables();
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).toContain('globalVar');
+
+      await scene.refreshPredefinedVariables();
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).toContain('globalVar');
+    });
+
+    it('should ignore in-flight refresh results after discard restores the selection', async () => {
+      const globalVar = {
+        kind: 'CustomVariable' as const,
+        spec: {
+          name: 'globalVar',
+          current: { text: 'a', value: 'a' },
+          query: 'a,b,c',
+          origin: toControlSourceRef({ type: 'global' }),
+        },
+      } as VariableKind;
+
+      let resolveFetch!: (value: VariableKind[]) => void;
+      const pendingFetch = new Promise<VariableKind[]>((resolve) => {
+        resolveFetch = resolve;
+      });
+      mockFetchPredefinedVariables.mockReturnValueOnce(pendingFetch);
+
+      const scene = buildTestScene({
+        $variables: new SceneVariableSet({ variables: [] }),
+        meta: {
+          folderUid: 'folder-1',
+          // Baseline: not opted in (annotation absent).
+          k8s: {
+            annotations: {},
+          },
+        },
+      });
+      // Skip activate(): this path only needs edit/discard, and activation calls
+      // getDashboardSrv().setCurrent which earlier suite spies may leave incomplete.
+      scene.onEnterEditMode();
+
+      // User opts into All — refresh starts but stays in flight.
+      scene.setState({
+        meta: {
+          ...scene.state.meta,
+          k8s: {
+            annotations: {
+              [AnnoKeyUseCrossDashboardVariables]: '{"global":"all","folder":"all"}',
+            },
+          },
+        },
+      });
+      const staleRefresh = scene.refreshPredefinedVariables();
+
+      // Discard restores the not-opted-in baseline (and serializer annotations).
+      scene.exitEditMode({ skipConfirm: true });
+      expect(scene.state.meta.k8s?.annotations?.[AnnoKeyUseCrossDashboardVariables]).toBeUndefined();
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).not.toContain('globalVar');
+
+      // Stale All fetch must not re-inject after discard.
+      resolveFetch([globalVar]);
+      await staleRefresh;
+      expect(sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name)).not.toContain('globalVar');
+    });
+  });
+
+  describe('setPredefinedVariables', () => {
+    it('should replace previous predefined variables on subsequent calls', () => {
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [] }) });
+      const existingVarCount = sceneGraph.getVariables(scene).state.variables.length;
+
+      scene.setPredefinedVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'globalVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: toControlSourceRef({ type: 'global' }),
+          },
+        },
+      ] as VariableKind[]);
+
+      scene.setPredefinedVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'globalVar',
+            current: { text: 'x', value: 'x' },
+            query: 'x,y,z',
+            origin: toControlSourceRef({ type: 'global' }),
+          },
+        },
+      ] as VariableKind[]);
+
+      const variables = sceneGraph.getVariables(scene).state.variables;
+      expect(variables.length).toBe(existingVarCount + 1);
+      expect(variables[0].state.name).toBe('globalVar');
+      expect(variables[0].state).toMatchObject({ query: 'x,y,z' });
+    });
+
+    it('should preserve the current selection when refreshing a predefined variable', () => {
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [] }) });
+
+      scene.setPredefinedVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'globalVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: toControlSourceRef({ type: 'global' }),
+          },
+        },
+      ] as VariableKind[]);
+
+      const existing = sceneGraph.getVariables(scene).state.variables.find((v) => v.state.name === 'globalVar');
+      expect(existing).toBeInstanceOf(MultiValueVariable);
+      (existing as MultiValueVariable).setState({ value: 'b', text: 'b' });
+
+      scene.setPredefinedVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'globalVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c,d',
+            origin: toControlSourceRef({ type: 'global' }),
+          },
+        },
+      ] as VariableKind[]);
+
+      const refreshed = sceneGraph.getVariables(scene).state.variables.find((v) => v.state.name === 'globalVar');
+      expect(refreshed?.state).toMatchObject({ query: 'a,b,c,d', value: 'b', text: 'b' });
+    });
+
+    it('should keep datasource defaults and local variables while replacing predefined ones', () => {
+      const localVar = new TestVariable({ name: 'localVar' });
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [localVar] }) });
+
+      scene.setDefaultVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'dsVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[]);
+
+      scene.setPredefinedVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'globalVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: toControlSourceRef({ type: 'global' }),
+          },
+        },
+      ] as VariableKind[]);
+
+      const names = sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name);
+      expect(names).toEqual(expect.arrayContaining(['globalVar', 'dsVar', 'localVar']));
+
+      scene.setPredefinedVariables([]);
+
+      const remaining = sceneGraph.getVariables(scene).state.variables.map((v) => v.state.name);
+      expect(remaining).toContain('dsVar');
+      expect(remaining).toContain('localVar');
+      expect(remaining).not.toContain('globalVar');
+    });
+  });
+
+  describe('setDefaultLinks', () => {
+    it('should prepend default links to existing links', () => {
+      const scene = buildTestScene();
+      const existingLinkCount = scene.state.links.length;
+
+      const defaultLinks = [
+        {
+          title: 'Default Link',
+          url: 'http://example.com',
+          type: 'link' as const,
+          asDropdown: false,
+          icon: '',
+          includeVars: false,
+          keepTime: false,
+          tags: [],
+          targetBlank: false,
+          tooltip: '',
+          origin: { type: 'datasource' as const, group: 'prometheus' },
+        },
+      ];
+
+      scene.setDefaultLinks(defaultLinks);
+
+      expect(scene.state.links.length).toBe(existingLinkCount + 1);
+      expect(scene.state.links[0].title).toBe('Default Link');
+    });
+
+    it('should preserve user links when no default links are provided', () => {
+      const scene = buildTestScene();
+      const originalLinkTitles = scene.state.links.map((l) => l.title);
+
+      scene.setDefaultLinks([]);
+
+      const linkTitles = scene.state.links.map((l) => l.title);
+      expect(linkTitles).toEqual(originalLinkTitles);
+    });
+
+    it('should replace previous defaults on subsequent calls', () => {
+      const scene = buildTestScene();
+      const existingLinkCount = scene.state.links.length;
+
+      scene.setDefaultLinks([
+        {
+          title: 'Link from DS1',
+          url: 'http://ds1.com',
+          type: 'link' as const,
+          asDropdown: false,
+          icon: '',
+          includeVars: false,
+          keepTime: false,
+          tags: [],
+          targetBlank: false,
+          tooltip: '',
+          origin: { type: 'datasource' as const, group: 'prometheus' },
+        },
+      ]);
+
+      // Second call should replace, not append
+      scene.setDefaultLinks([
+        {
+          title: 'Link from DS2',
+          url: 'http://ds2.com',
+          type: 'link' as const,
+          asDropdown: false,
+          icon: '',
+          includeVars: false,
+          keepTime: false,
+          tags: [],
+          targetBlank: false,
+          tooltip: '',
+          origin: { type: 'datasource' as const, group: 'loki' },
+        },
+      ]);
+
+      // Only 1 default + existing user links (not 2 defaults)
+      expect(scene.state.links.length).toBe(existingLinkCount + 1);
+      expect(scene.state.links[0].title).toBe('Link from DS2');
+    });
+  });
+
+  describe('clearDefaultControls', () => {
+    it('should remove only origin-bearing variables and links', () => {
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [] }) });
+
+      // Add default variables (with origin)
+      scene.setDefaultVariables([
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'dsVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[]);
+
+      // Add default links (with origin)
+      scene.setDefaultLinks([
+        {
+          title: 'DS Link',
+          url: 'http://example.com',
+          type: 'link' as const,
+          asDropdown: false,
+          icon: '',
+          includeVars: false,
+          keepTime: false,
+          tags: [],
+          targetBlank: false,
+          tooltip: '',
+          origin: { type: 'datasource' as const, group: 'prometheus' },
+        },
+      ]);
+
+      const userDefinedVarCount = sceneGraph.getVariables(scene).state.variables.filter((v) => !v.state.origin).length;
+      const userDefinedLinkCount = scene.state.links.filter((l) => !l.origin).length;
+
+      scene.clearDefaultControls();
+
+      const remainingVars = sceneGraph.getVariables(scene).state.variables;
+      const remainingLinks = scene.state.links;
+
+      expect(remainingVars.length).toBe(userDefinedVarCount);
+      expect(remainingLinks.length).toBe(userDefinedLinkCount);
+      expect(remainingVars.every((v) => !v.state.origin)).toBe(true);
+      expect(remainingLinks.every((l) => !l.origin)).toBe(true);
+    });
+
+    it('should prevent accumulation when called before re-adding defaults', () => {
+      const scene = buildTestScene({ $variables: new SceneVariableSet({ variables: [] }) });
+      const existingVarCount = sceneGraph.getVariables(scene).state.variables.length;
+      const existingLinkCount = scene.state.links.length;
+
+      const defaultVars = [
+        {
+          kind: 'CustomVariable' as const,
+          spec: {
+            name: 'dsVar',
+            current: { text: 'a', value: 'a' },
+            query: 'a,b,c',
+            origin: { type: 'datasource' as const, group: 'prometheus' },
+          },
+        },
+      ] as VariableKind[];
+
+      const defaultLinks = [
+        {
+          title: 'DS Link',
+          url: 'http://example.com',
+          type: 'link' as const,
+          asDropdown: false,
+          icon: '',
+          includeVars: false,
+          keepTime: false,
+          tags: [],
+          targetBlank: false,
+          tooltip: '',
+          origin: { type: 'datasource' as const, group: 'prometheus' },
+        },
+      ];
+
+      // First load
+      scene.setDefaultVariables(defaultVars);
+      scene.setDefaultLinks(defaultLinks);
+
+      // Simulate re-navigation: clear then reload
+      scene.clearDefaultControls();
+      scene.setDefaultVariables(defaultVars);
+      scene.setDefaultLinks(defaultLinks);
+
+      expect(sceneGraph.getVariables(scene).state.variables.length).toBe(existingVarCount + 1);
+      expect(scene.state.links.length).toBe(existingLinkCount + 1);
+    });
+  });
+
+  describe('getPageNav', () => {
+    describe('provisioning preview', () => {
+      // Regression test: when previewing a provisioned dashboard, meta.url and meta.slug are unset,
+      // which makes getDashboardUrl treat the dashboard as the home dashboard and return "/".
+      // buildBreadcrumbs then suppresses both the title and the "Dashboards" section crumb
+      // (only "View panel" was rendered). The parent crumb must point back to the preview path instead.
+      it('uses the preview pathname as the parent crumb url when viewing a panel, preserving the ref query param', () => {
+        const scene = buildTestScene({ meta: {}, viewPanel: '2' });
+        const location = {
+          pathname: '/dashboard/provisioning/my-repo/preview/path/to/dash.json',
+          search: '?ref=feature&viewPanel=2',
+          hash: '',
+          state: null,
+          key: '',
+        };
+
+        const pageNav = scene.getPageNav(location, {} as NavIndex);
+
+        expect(pageNav.text).toBe('View panel');
+        expect(pageNav.parentItem?.text).toBe('hello');
+        expect(pageNav.parentItem?.url).toBe(
+          '/subUrl/dashboard/provisioning/my-repo/preview/path/to/dash.json?ref=feature'
+        );
+      });
+
+      it('does not fabricate a ref query param when none is present', () => {
+        const scene = buildTestScene({ meta: {}, viewPanel: '2' });
+        const location = {
+          pathname: '/dashboard/provisioning/my-repo/preview/path/to/dash.json',
+          search: '?viewPanel=2',
+          hash: '',
+          state: null,
+          key: '',
+        };
+
+        const pageNav = scene.getPageNav(location, {} as NavIndex);
+
+        expect(pageNav.parentItem?.url).toBe('/subUrl/dashboard/provisioning/my-repo/preview/path/to/dash.json');
+      });
+    });
+
+    it('prefixes the dashboard crumb url with the app sub url', () => {
+      const scene = buildTestScene({ meta: { slug: 'dash-1-slug' } });
+      const location = { pathname: '/d/dash-1/dash-1-slug', search: '', hash: '', state: null, key: '' };
+
+      const pageNav = scene.getPageNav(location, {} as NavIndex);
+
+      expect(pageNav.url).toBe('/subUrl/d/dash-1/dash-1-slug');
+    });
+
+    it('prefixes the dashboard parent crumb url with the app sub url when editing a panel', () => {
+      const scene = buildTestScene({ meta: { slug: 'dash-1-slug' } });
+      const panel = findVizPanelByKey(scene, 'panel-1')!;
+      scene.setState({ editPanel: buildPanelEditScene(panel) });
+      const location = { pathname: '/d/dash-1/dash-1-slug', search: '?editPanel=1', hash: '', state: null, key: '' };
+
+      const pageNav = scene.getPageNav(location, {} as NavIndex);
+
+      expect(pageNav.text).toBe('Edit panel');
+      expect(pageNav.parentItem?.url).toBe('/subUrl/d/dash-1/dash-1-slug');
+    });
+  });
+
+  describe('getDefaultLayout', () => {
+    afterEach(() => {
+      setTestFlags({});
+    });
+
+    it('returns a clone of the persisted layout preference regardless of the auto grid flag', () => {
+      setTestFlags({ 'grafana.dashboardAutoGridDefault': true });
+      const defaultLayoutTemplate = DefaultGridLayoutManager.createEmpty();
+      const scene = buildTestScene({ preferences: { defaultLayoutTemplate } });
+
+      const layout = scene.getDefaultLayout();
+
+      expect(layout).toBeInstanceOf(DefaultGridLayoutManager);
+      expect(layout).not.toBe(defaultLayoutTemplate);
+      expect(scene.getDefaultLayoutType()).toBe(DefaultGridLayoutManager.descriptor.id);
+    });
+
+    it('falls back to auto grid when no preference is persisted and the auto grid flag is enabled', () => {
+      setTestFlags({ 'grafana.dashboardAutoGridDefault': true });
+      const scene = buildTestScene();
+
+      expect(scene.getDefaultLayout()).toBeInstanceOf(AutoGridLayoutManager);
+      expect(scene.getDefaultLayoutType()).toBe(AutoGridLayoutManager.descriptor.id);
+    });
+
+    it('falls back to custom grid when no preference is persisted and the auto grid flag is disabled', () => {
+      setTestFlags({ 'grafana.dashboardAutoGridDefault': false });
+      const scene = buildTestScene();
+
+      expect(scene.getDefaultLayout()).toBeInstanceOf(DefaultGridLayoutManager);
+      expect(scene.getDefaultLayoutType()).toBe(DefaultGridLayoutManager.descriptor.id);
+    });
+  });
+
+  describe('deactivating a scene that is still previewing a plan', () => {
+    it('reports the plan as closed and clears planning state, without a Build/Dismiss decision', () => {
+      const scene = buildTestScene();
+      const deactivate = scene.activate();
+      const onBuild = jest.fn();
+      const onDismiss = jest.fn();
+      scene.setState({
+        planning: { planId: 'plan-1', planTitle: 'Kafka overview', onBuild, onDismiss },
+      });
+      const events: unknown[] = [];
+      const sub = appEvents.subscribe(DashboardPlanningEvent, (event) => events.push(event.payload));
+
+      deactivate();
+
+      expect(events).toEqual([{ planId: 'plan-1', action: 'closed' }]);
+      expect(scene.state.planning).toBeUndefined();
+      expect(onBuild).not.toHaveBeenCalled();
+      expect(onDismiss).not.toHaveBeenCalled();
+      sub.unsubscribe();
+    });
+
+    it('does nothing when no plan is being previewed', () => {
+      const scene = buildTestScene();
+      const deactivate = scene.activate();
+      const events: unknown[] = [];
+      const sub = appEvents.subscribe(DashboardPlanningEvent, (event) => events.push(event.payload));
+
+      deactivate();
+
+      expect(events).toEqual([]);
+      sub.unsubscribe();
+    });
+  });
+});
+
+function createV1DashboardWithExpressions(expressionTypes: string[]): Dashboard {
+  return {
+    title: 'Test Dashboard',
+    schemaVersion: 30,
+    panels: [
+      {
+        id: 1,
+        type: 'timeseries',
+        targets: [
+          {
+            refId: 'A',
+            datasource: { type: 'prometheus', uid: 'prometheus-uid' },
+          },
+          ...expressionTypes.map((type, i) => ({
+            refId: String.fromCharCode(66 + i), // B, C, D...
+            datasource: { type: '__expr__', uid: '__expr__' },
+            type,
+          })),
+        ],
+      },
+    ],
+  };
+}
+
+function createV1DashboardWithTransformations(transformationIds: string[]): Dashboard {
+  return {
+    title: 'Test Dashboard',
+    schemaVersion: 30,
+    panels: [
+      {
+        id: 1,
+        type: 'timeseries',
+        targets: [
+          {
+            refId: 'A',
+            datasource: { type: 'prometheus', uid: 'prometheus-uid' },
+          },
+        ],
+        transformations: transformationIds.map((id) => ({
+          id,
+          options: {},
+        })),
+      },
+    ],
+  };
+}
+
+function createV2DashboardWithExpressions(expressionTypes: string[]): DashboardV2Spec {
+  return {
+    title: 'Test Dashboard V2',
+    annotations: [],
+    cursorSync: 'Off',
+    editable: true,
+    links: [],
+    preload: false,
+    tags: [],
+    timeSettings: {
+      timezone: 'browser',
+      from: 'now-6h',
+      to: 'now',
+      autoRefresh: '',
+      autoRefreshIntervals: ['5s', '10s', '30s', '1m', '5m', '15m', '30m', '1h', '2h', '1d'],
+      hideTimepicker: false,
+      fiscalYearStartMonth: 0,
+    },
+    variables: [],
+    layout: {
+      kind: 'GridLayout',
+      spec: {
+        items: [],
+      },
+    },
+    elements: {
+      'panel-1': {
+        kind: 'Panel',
+        spec: {
+          id: 1,
+          title: 'Panel',
+          description: '',
+          links: [],
+          data: {
+            kind: 'QueryGroup',
+            spec: {
+              queries: [
+                {
+                  kind: 'PanelQuery',
+                  spec: {
+                    hidden: false,
+                    query: {
+                      kind: 'DataQuery',
+                      group: 'prometheus',
+                      version: 'v0',
+                      datasource: {
+                        name: 'prometheus-uid',
+                      },
+                      spec: {},
+                    },
+                    refId: 'A',
+                  },
+                },
+                ...expressionTypes.map((type, i) => ({
+                  kind: 'PanelQuery' as const,
+                  spec: {
+                    hidden: false,
+                    query: {
+                      kind: 'DataQuery' as const,
+                      group: '__expr__',
+                      version: 'v0' as const,
+                      datasource: {
+                        name: '__expr__',
+                      },
+                      spec: {
+                        type,
+                      },
+                    },
+                    refId: String.fromCharCode(66 + i), // B, C, D...
+                  },
+                })),
+              ],
+              queryOptions: {},
+              transformations: [],
+            },
+          },
+          vizConfig: {
+            kind: 'VizConfig',
+            version: '1.0.0',
+            group: 'timeseries',
+            spec: {
+              options: {},
+              fieldConfig: {
+                defaults: {},
+                overrides: [],
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+function createV2DashboardWithTransformations(transformationIds: string[]): DashboardV2Spec {
+  return {
+    title: 'Test Dashboard V2',
+    annotations: [],
+    cursorSync: 'Off',
+    editable: true,
+    links: [],
+    preload: false,
+    tags: [],
+    timeSettings: {
+      timezone: 'browser',
+      from: 'now-6h',
+      to: 'now',
+      autoRefresh: '',
+      autoRefreshIntervals: ['5s', '10s', '30s', '1m', '5m', '15m', '30m', '1h', '2h', '1d'],
+      hideTimepicker: false,
+      fiscalYearStartMonth: 0,
+    },
+    variables: [],
+    layout: {
+      kind: 'GridLayout',
+      spec: {
+        items: [],
+      },
+    },
+    elements: {
+      'panel-1': {
+        kind: 'Panel',
+        spec: {
+          id: 1,
+          title: 'Panel',
+          description: '',
+          links: [],
+          data: {
+            kind: 'QueryGroup',
+            spec: {
+              queries: [
+                {
+                  kind: 'PanelQuery',
+                  spec: {
+                    hidden: false,
+                    query: {
+                      kind: 'DataQuery',
+                      group: 'prometheus',
+                      version: 'v0',
+                      datasource: {
+                        name: 'prometheus-uid',
+                      },
+                      spec: {},
+                    },
+                    refId: 'A',
+                  },
+                },
+              ],
+              queryOptions: {},
+              transformations: transformationIds.map((id) => ({
+                kind: 'Transformation' as const,
+                group: id,
+                spec: {
+                  options: {},
+                },
+              })),
+            },
+          },
+          vizConfig: {
+            kind: 'VizConfig',
+            version: '1.0.0',
+            group: 'timeseries',
+            spec: {
+              options: {},
+              fieldConfig: {
+                defaults: {},
+                overrides: [],
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+// Compiler-only assertions: invalid calls must be checked by TypeScript, never executed by Jest.
+void ((scene: DashboardScene, snapshot: DashboardSceneState, panel: VizPanel) => {
+  scene.setState(snapshot);
+  scene.setState({ title: 'Renamed', isEditing: true });
+  const consumer: DashboardSceneLike = scene;
+  consumer.setState(snapshot);
+
+  scene.loadView(dashboardViews.editPanel(panel, true));
+  scene.loadView(dashboardViews.overlay.filters());
+  // @ts-expect-error Unregistered fields cannot own a view request.
+  scene.loadView({ key: 'title', load: async () => 'Renamed' });
+  // @ts-expect-error Loading bookkeeping cannot own a view request.
+  scene.loadView({ key: 'loadingView', load: async () => true });
+  // @ts-expect-error The result must match the registered target field.
+  scene.loadView({ key: 'editPanel', load: async () => 'not a panel editor' });
+  // @ts-expect-error Registered loaders retain their argument types.
+  dashboardViews.editPanel('not a panel');
+  // @ts-expect-error Synchronous state keys are not exposed as loaders.
+  dashboardViews.body();
+});
+
+function buildTestScene(overrides?: Partial<DashboardSceneState>) {
+  const scene = new DashboardScene({
+    title: 'hello',
+    uid: 'dash-1',
+    description: 'hello description',
+    tags: ['tag1', 'tag2'],
+    editable: true,
+    $timeRange: new SceneTimeRange({
+      timeZone: 'browser',
+    }),
+    controls: new DashboardControls({}),
+    $behaviors: [new behaviors.CursorSync({}), new behaviors.LiveNowTimer({})],
+    body: new DefaultGridLayoutManager({
+      grid: new SceneGridLayout({
+        children: [
+          new DashboardGridItem({
+            key: 'griditem-1',
+            x: 0,
+            body: new VizPanel({
+              title: 'Panel A',
+              key: 'panel-1',
+              pluginId: 'table',
+              $timeRange: new PanelTimeRange({
+                from: 'now-12h',
+                to: 'now',
+                timeZone: 'browser',
+              }),
+              $data: new SceneDataTransformer({
+                transformations: [],
+                $data: new SceneQueryRunner({ key: 'data-query-runner', queries: [{ refId: 'A' }] }),
+              }),
+            }),
+          }),
+          new DashboardGridItem({
+            key: 'griditem-2',
+            body: new VizPanel({
+              title: 'Panel B',
+              key: 'panel-2',
+              pluginId: 'table',
+            }),
+          }),
+          new SceneGridRow({
+            key: 'panel-3',
+            actions: new RowActions({}),
+            children: [
+              new DashboardGridItem({
+                body: new VizPanel({
+                  title: 'Panel C',
+                  key: 'panel-4',
+                  pluginId: 'table',
+                }),
+              }),
+              new DashboardGridItem({
+                body: new VizPanel({
+                  title: 'Library Panel',
+                  pluginId: 'table',
+                  key: 'panel-5',
+                  $behaviors: [new LibraryPanelBehavior({ name: 'libraryPanel', uid: 'uid' })],
+                }),
+              }),
+            ],
+          }),
+          new DashboardGridItem({
+            body: new VizPanel({
+              title: 'Panel B',
+              key: getCloneKey('panel-2', 1),
+              repeatSourceKey: 'panel-2',
+              $variables: new SceneVariableSet({
+                variables: [new LocalValueVariable({ name: 'a', value: 'A' })],
+              }),
+              pluginId: 'table',
+              $data: new SceneQueryRunner({ key: 'data-query-runner2', queries: [{ refId: 'A' }] }),
+            }),
+          }),
+          new DashboardGridItem({
+            body: new VizPanel({
+              title: 'Library Panel',
+              pluginId: 'table',
+              key: 'panel-6',
+              $behaviors: [new LibraryPanelBehavior({ name: 'libraryPanel', uid: 'uid' })],
+            }),
+          }),
+        ],
+      }),
+    }),
+    ...overrides,
+  });
+
+  return scene;
+}
+
+function mockResultsOfDetectChangesWorker({ hasChanges = true }) {
+  jest.mocked(worker.postMessage).mockImplementationOnce(() => {
+    worker.onmessage?.({
+      data: {
+        hasChanges,
+      },
+    } as unknown as MessageEvent);
+  });
+}
+
+function getVersionMock(): DecoratedRevisionModel {
+  const dash: Dashboard = {
+    title: 'new name',
+    id: 5,
+    schemaVersion: 30,
+  };
+
+  return {
+    id: 2,
+    checked: false,
+    uid: 'uid',
+    version: 2,
+    created: new Date().toISOString(),
+    createdBy: 'admin',
+    message: '',
+    data: dash,
+    createdDateString: '2017-02-22 20:43:01',
+    ageString: '7 years ago',
+  };
+}

@@ -1,0 +1,874 @@
+// Copyright (c) 2017 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { fireEvent, getByText, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+import {
+  CoreApp,
+  type IconName,
+  type LinkModel,
+  MutableDataFrame,
+  type PluginExtensionLink,
+  PluginExtensionPoints,
+  PluginExtensionTypes,
+  type TraceSearchProps,
+} from '@grafana/data';
+import { selectors } from '@grafana/e2e-selectors';
+import { usePluginLinks, usePluginComponents, config, reportInteraction } from '@grafana/runtime';
+import { useAppNotification } from 'app/core/copy/appNotification';
+import { DEFAULT_SPAN_FILTERS } from 'app/features/explore/state/constants';
+
+import { type TraceViewPluginExtensionContext } from '../types/trace';
+
+import { TracePageHeader } from './TracePageHeader';
+import { trace } from './mocks';
+
+// Mock @grafana/runtime
+jest.mock('@grafana/runtime', () => ({
+  ...jest.requireActual('@grafana/runtime'),
+  usePluginLinks: jest.fn(),
+  usePluginComponents: jest.fn(),
+  reportInteraction: jest.fn(),
+}));
+
+jest.mock('../TraceTimelineViewer/SpanDetail/LogsLink', () => ({
+  LogsLinkButton: ({ linkModel }: { linkModel: LinkModel }) => <button type="button">{linkModel.title}</button>,
+}));
+
+// Mock useAppNotification
+jest.mock('app/core/copy/appNotification', () => ({
+  useAppNotification: jest.fn(() => ({
+    success: jest.fn(),
+    warning: jest.fn(),
+    error: jest.fn(),
+    info: jest.fn(),
+  })),
+}));
+
+// Mock navigator.clipboard
+Object.assign(navigator, {
+  clipboard: {
+    writeText: jest.fn().mockResolvedValue(undefined),
+  },
+});
+
+// Mock window.open
+const mockWindowOpen = jest.fn();
+Object.defineProperty(window, 'open', {
+  value: mockWindowOpen,
+  writable: true,
+});
+
+// Helper function to create properly typed mock plugin extension links
+const createMockExtension = (
+  id: string,
+  title: string,
+  description = '',
+  options: {
+    icon?: string;
+    path?: string;
+    onClick?: () => void;
+  } = {}
+): PluginExtensionLink => ({
+  id,
+  type: PluginExtensionTypes.link,
+  title,
+  description,
+  pluginId: 'test-plugin',
+  icon: options.icon as IconName,
+  path: options.path,
+  onClick: options.onClick,
+});
+
+const setup = (
+  pluginLinks: { links: PluginExtensionLink[]; isLoading: boolean } = { links: [], isLoading: false },
+  hideHeaderDetails = false,
+  logsLinkModel?: LinkModel,
+  traceOverride = trace,
+  overrides: { search?: TraceSearchProps; spanFilterMatches?: Set<string> } = {}
+) => {
+  const mockUsePluginLinks = usePluginLinks as jest.MockedFunction<typeof usePluginLinks>;
+  mockUsePluginLinks.mockReturnValue(pluginLinks);
+
+  const mockUsePluginComponents = usePluginComponents as jest.MockedFunction<typeof usePluginComponents>;
+  mockUsePluginComponents.mockReturnValue({ components: [], isLoading: false });
+
+  const viewRangeTime: [number, number] = [0, 0];
+  const defaultProps = {
+    app: CoreApp.Unknown,
+    trace: traceOverride,
+    timeZone: '',
+    search: overrides.search ?? DEFAULT_SPAN_FILTERS,
+    setSearch: jest.fn(),
+    showSpanFilters: true,
+    setShowSpanFilters: jest.fn(),
+    spanFilterMatches: overrides.spanFilterMatches,
+    setFocusedSpanIdForSearch: jest.fn(),
+    onGoToSpan: jest.fn(),
+    datasourceType: 'tempo',
+    setHeaderHeight: jest.fn(),
+    data: new MutableDataFrame(),
+    datasourceName: 'test-datasource',
+    datasourceUid: 'test-datasource-uid',
+    updateNextViewRangeTime: jest.fn(),
+    updateViewRangeTime: jest.fn(),
+    viewRange: { time: { current: viewRangeTime } },
+    hideHeaderDetails,
+    logsLinkModel,
+  };
+
+  return {
+    ...render(<TracePageHeader {...defaultProps} />),
+    mockUsePluginLinks,
+    mockUsePluginComponents,
+    setFocusedSpanIdForSearch: defaultProps.setFocusedSpanIdForSearch,
+    onGoToSpan: defaultProps.onGoToSpan,
+    setSearch: defaultProps.setSearch,
+  };
+};
+
+describe('TracePageHeader test', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockWindowOpen.mockClear();
+    config.feedbackLinksEnabled = false; // Default to false to avoid interference with tests
+  });
+
+  it('shows the span count next to the other header metadata', () => {
+    const singleSpanTraceId = 'single-span-trace-id';
+    const singleSpanTrace = {
+      ...trace,
+      traceID: singleSpanTraceId,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: singleSpanTraceId,
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, singleSpanTrace);
+
+    expect(screen.getByText('Spans').nextElementSibling).toHaveTextContent('1');
+    expect(
+      screen.getByText('Services').compareDocumentPosition(screen.getByText('Spans')) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('should render the new trace header', () => {
+    setup();
+
+    const header = document.querySelector('header');
+    expect(getByText(header!, 'POST')).toBeInTheDocument();
+    expect(getByText(header!, '200')).toBeInTheDocument();
+    expect(getByText(header!, '/v2/gamma/792edh2w897y2huehd2h89')).toBeInTheDocument();
+    expect(screen.getAllByText('2.36s')[0]).toBeInTheDocument();
+    expect(getByText(header!, '2023-02-05 08:50:56.289')).toBeInTheDocument();
+  });
+
+  it('renders the root service name and operation name separately next to method and status badges', () => {
+    setup();
+
+    const heading = screen.getByRole('heading', { level: 1 });
+    expect(heading).toHaveTextContent('lb HTTP Client');
+    expect(heading).not.toHaveTextContent('lb: HTTP Client');
+    expect(screen.getByLabelText('Trace succeeded')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace has errors')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace has client errors')).not.toBeInTheDocument();
+  });
+
+  it('shows a green check when the root request has a 2xx status', () => {
+    setup();
+
+    expect(screen.getByLabelText('Trace succeeded')).toBeInTheDocument();
+    expect(screen.getByText('200')).toBeInTheDocument();
+  });
+
+  it('shows an error indicator when the root request has a 5xx status', () => {
+    const errorTraceId = 'error-trace-id';
+    const errorTrace = {
+      ...trace,
+      traceID: errorTraceId,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: errorTraceId,
+          tags: [
+            { key: 'http.method', type: 'String', value: 'POST' },
+            { key: 'http.status_code', type: 'String', value: '500' },
+          ],
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, errorTrace);
+
+    expect(screen.getByLabelText('Trace has errors')).toHaveAttribute('data-testid', 'icon-exclamation-circle');
+    expect(screen.queryByLabelText('Trace has client errors')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace succeeded')).not.toBeInTheDocument();
+    expect(screen.getByText('POST')).toBeInTheDocument();
+    expect(screen.getByText('500')).toBeInTheDocument();
+    expect(screen.queryByText('200')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Trace error banner')).toBeInTheDocument();
+  });
+
+  it('shows an orange warning indicator when the root request has a 4xx status', () => {
+    const warningTraceId = 'warning-trace-id';
+    const warningTrace = {
+      ...trace,
+      traceID: warningTraceId,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: warningTraceId,
+          tags: [
+            { key: 'http.method', type: 'String', value: 'POST' },
+            { key: 'http.status_code', type: 'String', value: '404' },
+          ],
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, warningTrace);
+
+    expect(screen.getByLabelText('Trace has client errors')).toHaveAttribute(
+      'data-testid',
+      'icon-exclamation-triangle'
+    );
+    expect(screen.queryByLabelText('Trace has errors')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace succeeded')).not.toBeInTheDocument();
+    expect(screen.getByText('404')).toBeInTheDocument();
+    expect(screen.getByLabelText('Trace warning banner')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace error banner')).not.toBeInTheDocument();
+  });
+
+  it('does not show a trace banner when the trace has no errors or client errors', () => {
+    setup();
+
+    expect(screen.queryByLabelText('Trace error banner')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace warning banner')).not.toBeInTheDocument();
+  });
+
+  it('shows a warning icon when a child span is 4xx even if the root request succeeded', () => {
+    const warningTraceId = 'child-warning-trace-id';
+    const warningTrace = {
+      ...trace,
+      traceID: warningTraceId,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: warningTraceId,
+          spanID: 'root-ok',
+          depth: 0,
+          tags: [
+            { key: 'http.method', type: 'String', value: 'POST' },
+            { key: 'http.status_code', type: 'String', value: '200' },
+          ],
+        },
+        {
+          ...trace.spans[1],
+          traceID: warningTraceId,
+          spanID: 'child-404',
+          depth: 1,
+          tags: [{ key: 'http.status_code', type: 'String', value: '404' }],
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, warningTrace);
+
+    expect(screen.getByLabelText('Trace has client errors')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace succeeded')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace has errors')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Trace warning banner')).toBeInTheDocument();
+  });
+
+  it('shows an error icon when a child span failed even if the root request succeeded', () => {
+    const errorTraceId = 'child-error-trace-id';
+    const errorTrace = {
+      ...trace,
+      traceID: errorTraceId,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: errorTraceId,
+          spanID: 'root-ok',
+          depth: 0,
+          tags: [
+            { key: 'http.method', type: 'String', value: 'POST' },
+            { key: 'http.status_code', type: 'String', value: '200' },
+          ],
+        },
+        {
+          ...trace.spans[1],
+          traceID: errorTraceId,
+          spanID: 'child-error',
+          depth: 1,
+          tags: [{ key: 'error', type: 'String', value: 'true' }],
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, errorTrace);
+
+    expect(screen.getByLabelText('Trace has errors')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace succeeded')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Trace has client errors')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Trace error banner')).toBeInTheDocument();
+  });
+
+  it('highlights the deepest error span and does not list the other error spans', () => {
+    const errorTraceId = 'multi-error-trace-id';
+    const errorTrace = {
+      ...trace,
+      traceID: errorTraceId,
+      duration: 2_410_000,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: errorTraceId,
+          spanID: 'root-error',
+          depth: 0,
+          duration: 2_410_000,
+          process: { ...trace.spans[0].process, serviceName: 'checkout-service' },
+          tags: [{ key: 'http.status_code', type: 'String', value: '500' }],
+        },
+        {
+          ...trace.spans[1],
+          traceID: errorTraceId,
+          spanID: 'payment-error',
+          depth: 2,
+          duration: 1_420_000,
+          operationName: 'authorize',
+          process: { ...trace.spans[1].process, serviceName: 'payment-service' },
+          tags: [
+            { key: 'http.method', type: 'String', value: 'POST' },
+            { key: 'http.route', type: 'String', value: '/payments/authorize' },
+            { key: 'error', type: 'String', value: 'true' },
+          ],
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, errorTrace);
+
+    const banner = screen.getByLabelText('Trace error banner');
+    expect(within(banner).getByText('payment-service')).toBeInTheDocument();
+    expect(within(banner).getByText('POST /payments/authorize')).toBeInTheDocument();
+    expect(within(banner).getByText('1.42s · 58.9% of trace')).toBeInTheDocument();
+    expect(within(banner).getByRole('button', { name: 'Go to span' })).toBeInTheDocument();
+    expect(within(banner).queryByText('checkout-service')).not.toBeInTheDocument();
+  });
+
+  it('shows a span too short to round to 0.1% as an unescaped "<0.1%"', () => {
+    const errorTraceId = 'tiny-span-trace-id';
+    const errorTrace = {
+      ...trace,
+      traceID: errorTraceId,
+      duration: 5_000_000,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: errorTraceId,
+          spanID: 'root-error',
+          depth: 0,
+          duration: 5_000_000,
+          tags: [{ key: 'http.status_code', type: 'String', value: '500' }],
+        },
+        {
+          ...trace.spans[1],
+          traceID: errorTraceId,
+          spanID: 'tiny-error',
+          depth: 1,
+          duration: 811,
+          tags: [{ key: 'error', type: 'String', value: 'true' }],
+        },
+      ],
+    };
+
+    setup({ links: [], isLoading: false }, false, undefined, errorTrace);
+
+    const banner = screen.getByLabelText('Trace error banner');
+    expect(within(banner).getByText('811μs · <0.1% of trace')).toBeInTheDocument();
+  });
+
+  it('asks to go to the highlighted span and reports the click on every Go to span click, including repeats', async () => {
+    const errorTraceId = 'go-to-span-trace-id';
+    const errorTrace = {
+      ...trace,
+      traceID: errorTraceId,
+      duration: 2_410_000,
+      spans: [
+        {
+          ...trace.spans[0],
+          traceID: errorTraceId,
+          spanID: 'root-error',
+          depth: 0,
+          duration: 2_410_000,
+          tags: [{ key: 'http.status_code', type: 'String', value: '500' }],
+        },
+        {
+          ...trace.spans[1],
+          traceID: errorTraceId,
+          spanID: 'payment-error',
+          depth: 2,
+          duration: 1_420_000,
+          operationName: 'authorize',
+          process: { ...trace.spans[1].process, serviceName: 'payment-service' },
+          tags: [
+            { key: 'http.method', type: 'String', value: 'POST' },
+            { key: 'http.route', type: 'String', value: '/payments/authorize' },
+            { key: 'error', type: 'String', value: 'true' },
+          ],
+        },
+      ],
+    };
+
+    const { onGoToSpan } = setup({ links: [], isLoading: false }, false, undefined, errorTrace);
+    const goToSpan = screen.getByRole('button', { name: 'Go to span' });
+
+    await userEvent.click(goToSpan);
+    await userEvent.click(goToSpan);
+
+    expect(onGoToSpan).toHaveBeenCalledTimes(2);
+    expect(onGoToSpan).toHaveBeenCalledWith('payment-error');
+    expect(jest.mocked(reportInteraction)).toHaveBeenCalledTimes(2);
+    expect(jest.mocked(reportInteraction)).toHaveBeenCalledWith('grafana_traces_trace_view_go_to_span_clicked', {
+      app: CoreApp.Unknown,
+      datasourceType: 'tempo',
+      grafana_version: config.buildInfo.version,
+      location: 'trace-banner',
+    });
+  });
+
+  it('should render the trace-level logs link when provided', () => {
+    setup({ links: [], isLoading: false }, false, {
+      href: '/explore?logs',
+      title: 'Logs for this trace',
+      target: '_blank',
+      origin: {},
+    });
+
+    expect(screen.getByRole('button', { name: /Logs for this trace/i })).toBeInTheDocument();
+  });
+
+  it('should not render the logs link when logsLinkModel is absent', () => {
+    setup();
+
+    expect(screen.queryByRole('button', { name: /Logs for this trace/i })).not.toBeInTheDocument();
+  });
+
+  describe('Plugin Extensions', () => {
+    it('should call usePluginLinks with correct parameters including datasource context', () => {
+      const { mockUsePluginLinks } = setup();
+
+      expect(mockUsePluginLinks).toHaveBeenCalledWith({
+        extensionPointId: PluginExtensionPoints.TraceViewHeaderActions,
+        context: {
+          ...trace,
+          datasource: {
+            name: 'test-datasource',
+            uid: 'test-datasource-uid',
+            type: 'tempo',
+          },
+        },
+        limitPerPlugin: 2,
+      });
+    });
+
+    it('should not render plugin extension buttons when no extensions are available', () => {
+      setup({ links: [], isLoading: false });
+
+      const extensionButtons = screen.queryByTestId('plugin-extension-button');
+      expect(extensionButtons).not.toBeInTheDocument();
+    });
+
+    it('should render plugin extension buttons when extensions are available', () => {
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension 1', 'Test extension description', {
+          icon: 'external-link-alt',
+          path: 'https://example.com',
+          onClick: jest.fn(),
+        }),
+        createMockExtension('test-extension-2', 'Test Extension 2', 'Another test extension', {
+          icon: 'cloud',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      expect(screen.getByText('Test Extension 1')).toBeInTheDocument();
+      expect(screen.getByText('Test Extension 2')).toBeInTheDocument();
+    });
+
+    it('should display tooltips for extension buttons', async () => {
+      const user = userEvent.setup();
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'This is a test extension description', {
+          icon: 'external-link-alt',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByText('Test Extension');
+      await user.hover(button);
+
+      await waitFor(() => {
+        expect(screen.getByRole('tooltip')).toBeInTheDocument();
+        expect(screen.getByText('This is a test extension description')).toBeInTheDocument();
+      });
+    });
+
+    it('should use title as tooltip when description is not provided', async () => {
+      const user = userEvent.setup();
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension Title', 'Test Extension Title', {
+          icon: 'external-link-alt',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByRole('button', { name: /Test Extension Title/i });
+      await user.hover(button);
+
+      await waitFor(() => {
+        expect(screen.getByRole('tooltip')).toBeInTheDocument();
+        expect(screen.getByRole('tooltip')).toHaveTextContent('Test Extension Title');
+      });
+    });
+
+    it('should handle extension button clicks with onClick handler', async () => {
+      const user = userEvent.setup();
+      const mockOnClick = jest.fn();
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'Test extension', {
+          icon: 'external-link-alt',
+          onClick: mockOnClick,
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByText('Test Extension');
+      await user.click(button);
+
+      expect(mockOnClick).toHaveBeenCalledTimes(1);
+      expect(mockOnClick).toHaveBeenCalledWith(expect.any(Object));
+    });
+
+    it('should handle extension button clicks with path navigation', async () => {
+      const user = userEvent.setup();
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'Test extension', {
+          icon: 'external-link-alt',
+          path: 'https://example.com/trace-details',
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByText('Test Extension');
+      await user.click(button);
+
+      expect(mockWindowOpen).toHaveBeenCalledTimes(1);
+      expect(mockWindowOpen).toHaveBeenCalledWith('https://example.com/trace-details', '_blank');
+    });
+
+    it('should handle extension with both path and onClick', async () => {
+      const user = userEvent.setup();
+      const mockOnClick = jest.fn();
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'Test extension', {
+          icon: 'external-link-alt',
+          path: 'https://example.com/trace-details',
+          onClick: mockOnClick,
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByText('Test Extension');
+      await user.click(button);
+
+      expect(mockWindowOpen).toHaveBeenCalledTimes(1);
+      expect(mockWindowOpen).toHaveBeenCalledWith('https://example.com/trace-details', '_blank');
+      expect(mockOnClick).toHaveBeenCalledTimes(1);
+    });
+
+    it('should render extension buttons with correct styling', () => {
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'Test extension', {
+          icon: 'external-link-alt',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByRole('button', { name: /Test Extension/i });
+      expect(button).toBeInTheDocument();
+    });
+
+    it('should render extension icons when provided', () => {
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'Test extension', {
+          icon: 'external-link-alt',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByRole('button', { name: /Test Extension/i });
+      const iconElement = button.querySelector('svg');
+      expect(iconElement).toBeInTheDocument();
+    });
+
+    it('should handle multiple extensions correctly', () => {
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Extension 1', 'First extension', {
+          icon: 'external-link-alt',
+          onClick: jest.fn(),
+        }),
+        createMockExtension('test-extension-2', 'Extension 2', 'Second extension', {
+          icon: 'cloud',
+          path: 'https://example.com',
+        }),
+        createMockExtension('test-extension-3', 'Extension 3', 'Third extension', {
+          icon: 'apps',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      expect(screen.getByText('Extension 1')).toBeInTheDocument();
+      expect(screen.getByText('Extension 2')).toBeInTheDocument();
+      expect(screen.getByText('Extension 3')).toBeInTheDocument();
+    });
+
+    it('should maintain extension context with trace data and datasource information', () => {
+      const { mockUsePluginLinks } = setup();
+
+      const [callArgs] = mockUsePluginLinks.mock.calls;
+      expect(callArgs[0]).toEqual({
+        extensionPointId: PluginExtensionPoints.TraceViewHeaderActions,
+        context: {
+          ...trace,
+          datasource: {
+            name: 'test-datasource',
+            uid: 'test-datasource-uid',
+            type: 'tempo',
+          },
+        },
+        limitPerPlugin: 2,
+      });
+
+      // Verify the context contains the expected trace properties
+      expect(callArgs[0].context).toHaveProperty('traceID', trace.traceID);
+      expect(callArgs[0].context).toHaveProperty('spans');
+      expect(callArgs[0].context).toHaveProperty('duration', trace.duration);
+      expect(callArgs[0].context).toHaveProperty('startTime', trace.startTime);
+
+      // Verify the context contains the datasource information
+      expect(callArgs[0].context).toHaveProperty('datasource');
+      const contextWithDatasource = callArgs[0].context as TraceViewPluginExtensionContext;
+      expect(contextWithDatasource.datasource).toEqual({
+        name: 'test-datasource',
+        uid: 'test-datasource-uid',
+        type: 'tempo',
+      });
+    });
+
+    it('should handle loading state gracefully', () => {
+      setup({ links: [], isLoading: true });
+
+      // Should not crash when loading and should not show any extension buttons
+      const extensionButtons = screen.queryByTestId('plugin-extension-button');
+      expect(extensionButtons).not.toBeInTheDocument();
+    });
+
+    it('should handle extensions without icons', () => {
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Extension Without Icon', 'Extension without icon', {
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByText('Extension Without Icon');
+      expect(button).toBeInTheDocument();
+      // Should render the button even without an icon
+    });
+
+    it('should handle extension click without event parameter', async () => {
+      const mockOnClick = jest.fn();
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension', 'Test extension', {
+          onClick: mockOnClick,
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false });
+
+      const button = screen.getByText('Test Extension');
+
+      // Simulate a click that might not pass event
+      fireEvent.click(button);
+
+      expect(mockOnClick).toHaveBeenCalledTimes(1);
+    });
+
+    it('should provide datasource context to plugin extensions', () => {
+      const { mockUsePluginLinks } = setup();
+
+      const contextArg = mockUsePluginLinks.mock.calls[0][0].context as TraceViewPluginExtensionContext;
+
+      // Verify that plugin extensions receive datasource information in context
+      expect(contextArg.datasource).toBeDefined();
+      expect(contextArg.datasource.name).toBe('test-datasource');
+      expect(contextArg.datasource.uid).toBe('test-datasource-uid');
+      expect(contextArg.datasource.type).toBe('tempo');
+
+      // Verify that trace data is still available
+      expect(contextArg.traceID).toBe(trace.traceID);
+      expect(contextArg.spans).toBe(trace.spans);
+    });
+  });
+
+  describe('Share menu', () => {
+    const openShareMenu = async () => {
+      const user = userEvent.setup();
+      await user.click(screen.getByTestId(selectors.components.TraceViewer.shareMenu.triggerButton));
+      return user;
+    };
+
+    it('should show share actions when the menu is opened', async () => {
+      setup();
+
+      expect(screen.queryByText('Copy link')).not.toBeInTheDocument();
+
+      await openShareMenu();
+
+      expect(screen.getByTestId(selectors.components.TraceViewer.shareMenu.copyLinkButton)).toBeInTheDocument();
+      expect(screen.getByTestId(selectors.components.TraceViewer.shareMenu.exportJsonButton)).toBeInTheDocument();
+    });
+
+    it('should copy the current URL when Copy link is clicked', async () => {
+      Object.assign(window, { isSecureContext: true });
+      const writeText = jest.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+      const notifyApp = {
+        success: jest.fn(),
+        warning: jest.fn(),
+        error: jest.fn(),
+        info: jest.fn(),
+      };
+      jest.mocked(useAppNotification).mockReturnValue(notifyApp);
+
+      const user = userEvent.setup();
+      setup();
+      await user.click(screen.getByTestId(selectors.components.TraceViewer.shareMenu.triggerButton));
+      await user.click(screen.getByTestId(selectors.components.TraceViewer.shareMenu.copyLinkButton));
+
+      expect(writeText).toHaveBeenCalledWith(window.location.href);
+      expect(notifyApp.success).toHaveBeenCalledWith('Link copied to clipboard');
+    });
+
+    it('should not show the feedback section when feedbackLinksEnabled is false', async () => {
+      setup();
+      await openShareMenu();
+
+      expect(screen.queryByText('Feedback')).not.toBeInTheDocument();
+      expect(screen.queryByTestId(selectors.components.TraceViewer.shareMenu.feedbackLink)).not.toBeInTheDocument();
+    });
+
+    it('should show the feedback section when feedbackLinksEnabled is true', async () => {
+      config.feedbackLinksEnabled = true;
+      setup();
+      await openShareMenu();
+
+      expect(screen.getByText('Feedback')).toBeInTheDocument();
+      const feedbackLink = screen.getByTestId(selectors.components.TraceViewer.shareMenu.feedbackLink);
+      expect(feedbackLink).toHaveAttribute('href', 'https://forms.gle/RZDEx8ScyZNguDoC8');
+      expect(feedbackLink).toHaveAttribute('target', '_blank');
+    });
+  });
+
+  describe('hideHeaderDetails', () => {
+    it('should render all header details by default when hideHeaderDetails is false', () => {
+      config.feedbackLinksEnabled = true;
+      setup({ links: [], isLoading: false }, false);
+
+      expect(screen.getByText('Trace ID')).toBeInTheDocument();
+      expect(screen.getByText('Start time')).toBeInTheDocument();
+      expect(screen.getByText('Duration')).toBeInTheDocument();
+      expect(screen.getByText('Services')).toBeInTheDocument();
+      expect(screen.getByText('Spans')).toBeInTheDocument();
+      expect(screen.getByText('Spans').nextElementSibling).toHaveTextContent('3');
+      expect(screen.getByText('URL')).toBeInTheDocument();
+
+      expect(screen.getByTestId(selectors.components.TraceViewer.shareMenu.triggerButton)).toBeInTheDocument();
+      expect(screen.getByText('Overview')).toBeInTheDocument();
+    });
+
+    it('should still render trace name and badges when hideHeaderDetails is true', () => {
+      setup({ links: [], isLoading: false }, true);
+
+      const header = document.querySelector('header');
+      expect(getByText(header!, 'POST')).toBeInTheDocument();
+      expect(getByText(header!, '200')).toBeInTheDocument();
+    });
+
+    it('should hide filters section when hideHeaderDetails is true', () => {
+      setup({ links: [], isLoading: false }, true);
+
+      expect(screen.queryByText('Filters')).not.toBeInTheDocument();
+    });
+
+    it('should hide the trace banner when hideHeaderDetails is true', () => {
+      const errorTrace = {
+        ...trace,
+        spans: [
+          {
+            ...trace.spans[0],
+            tags: [{ key: 'http.status_code', type: 'String', value: '500' }],
+          },
+        ],
+      };
+
+      setup({ links: [], isLoading: false }, true, undefined, errorTrace);
+
+      expect(screen.queryByLabelText('Trace error banner')).not.toBeInTheDocument();
+    });
+
+    it('should hide plugin extension buttons when hideHeaderDetails is true', () => {
+      const mockExtensions: PluginExtensionLink[] = [
+        createMockExtension('test-extension-1', 'Test Extension 1', 'Test extension description', {
+          icon: 'external-link-alt',
+          onClick: jest.fn(),
+        }),
+      ];
+
+      setup({ links: mockExtensions, isLoading: false }, true);
+      expect(screen.queryByText('Test Extension 1')).not.toBeInTheDocument();
+    });
+  });
+});

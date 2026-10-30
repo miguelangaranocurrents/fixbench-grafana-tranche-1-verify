@@ -1,0 +1,412 @@
+package sql
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"sync/atomic"
+	"testing"
+
+	badger "github.com/dgraph-io/badger/v4"
+	authnlib "github.com/grafana/authlib/authn"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/services/grpcserver"
+	"github.com/grafana/grafana/pkg/services/grpcserver/interceptors"
+	"github.com/grafana/grafana/pkg/setting"
+	"github.com/grafana/grafana/pkg/storage/unified/resource"
+	"github.com/grafana/grafana/pkg/storage/unified/resource/kv"
+	"github.com/grafana/grafana/pkg/storage/unified/resource/lease"
+	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+)
+
+// mockSearchServer is a no-op implementation of resource.SearchServer for testing.
+type mockSearchServer struct {
+	resourcepb.UnimplementedResourceIndexServer
+	resourcepb.UnimplementedManagedObjectIndexServer
+	resourcepb.UnimplementedDiagnosticsServer
+}
+
+func (m *mockSearchServer) Init(context.Context) error { return nil }
+func (m *mockSearchServer) Stop(context.Context) error { return nil }
+func (m *mockSearchServer) IsHealthy(_ context.Context, _ *resourcepb.HealthCheckRequest) (*resourcepb.HealthCheckResponse, error) {
+	return &resourcepb.HealthCheckResponse{Status: resourcepb.HealthCheckResponse_SERVING}, nil
+}
+
+var _ resource.SearchServer = (*mockSearchServer)(nil)
+
+// mockResourceServer is a no-op implementation of resource.ResourceServer for testing.
+type mockResourceServer struct {
+	mockSearchServer
+	resourcepb.UnimplementedResourceStoreServer
+	resourcepb.UnimplementedResourceStatsServer
+	resourcepb.UnimplementedBulkStoreServer
+	resourcepb.UnimplementedBlobStoreServer
+	resourcepb.UnimplementedBlobStoreStreamingServer
+	resourcepb.UnimplementedQuotasServer
+}
+
+var _ resource.ResourceServer = (*mockResourceServer)(nil)
+
+type embeddedErrorServer struct {
+	mockResourceServer
+	failure *resourcepb.ErrorResult
+}
+
+func (s *embeddedErrorServer) Read(context.Context, *resourcepb.ReadRequest) (*resourcepb.ReadResponse, error) {
+	return &resourcepb.ReadResponse{Error: s.failure}, nil
+}
+
+func (s *embeddedErrorServer) Search(context.Context, *resourcepb.ResourceSearchRequest) (*resourcepb.ResourceSearchResponse, error) {
+	return &resourcepb.ResourceSearchResponse{Error: s.failure}, nil
+}
+
+func (s *embeddedErrorServer) PutBlobStream(stream resourcepb.BlobStoreStreaming_PutBlobStreamServer) error {
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	return stream.SendAndClose(&resourcepb.PutBlobResponse{Error: s.failure})
+}
+
+func (s *embeddedErrorServer) GetBlobStream(_ *resourcepb.GetBlobRequest, stream resourcepb.BlobStoreStreaming_GetBlobStreamServer) error {
+	return stream.Send(&resourcepb.GetBlobResponse{Error: s.failure})
+}
+
+func TestEmbeddedErrorConversionOnRemoteServers(t *testing.T) {
+	failure := &resourcepb.ErrorResult{Code: http.StatusNotFound, Reason: string(metav1.StatusReasonNotFound), Message: "missing", Details: &resourcepb.ErrorDetails{Name: "item"}}
+	for _, enabled := range []bool{false, true} {
+		for _, standalone := range []bool{false, true} {
+			t.Run(fmt.Sprintf("enabled=%t/standalone=%t", enabled, standalone), func(t *testing.T) {
+				s := &service{
+					cfg:           &setting.Cfg{UnifiedStorageGRPCErrorResultToStatus: enabled},
+					authenticator: func(ctx context.Context) (context.Context, error) { return ctx, nil },
+				}
+				provider := newDenyAllProvider(t)
+				server := &embeddedErrorServer{failure: failure}
+				if standalone {
+					require.NoError(t, s.registerSearchServer(provider, server))
+				} else {
+					s.registerUnifiedResourceServer(provider, server, nil)
+				}
+				conn := startAndConnect(t, provider.GetServer())
+				check := func(respError *resourcepb.ErrorResult, err error) {
+					if !enabled {
+						require.NoError(t, err)
+						require.True(t, proto.Equal(failure, respError))
+						return
+					}
+					require.Equal(t, codes.NotFound, status.Code(err))
+					details := status.Convert(err).Details()
+					require.Len(t, details, 1)
+					require.True(t, proto.Equal(failure, details[0].(*resourcepb.ErrorResult)))
+				}
+				searchResp, err := resourcepb.NewResourceIndexClient(conn).Search(t.Context(), &resourcepb.ResourceSearchRequest{})
+				check(searchResp.GetError(), err)
+				if !standalone {
+					readResp, err := resourcepb.NewResourceStoreClient(conn).Read(t.Context(), &resourcepb.ReadRequest{})
+					check(readResp.GetError(), err)
+
+					blobs := resourcepb.NewBlobStoreStreamingClient(conn)
+					put, err := blobs.PutBlobStream(t.Context())
+					require.NoError(t, err)
+					require.NoError(t, put.Send(&resourcepb.PutBlobRequest{}))
+					putResp, err := put.CloseAndRecv()
+					check(putResp.GetError(), err)
+
+					get, err := blobs.GetBlobStream(t.Context(), &resourcepb.GetBlobRequest{})
+					require.NoError(t, err)
+					getResp, err := get.Recv()
+					check(getResp.GetError(), err)
+				}
+			})
+		}
+	}
+}
+
+// requireAuthPassed asserts the error is NOT codes.Unauthenticated, meaning
+// the request got past the auth interceptor and reached the (unimplemented) handler.
+func requireAuthPassed(t *testing.T, err error, msgAndArgs ...interface{}) {
+	t.Helper()
+	require.Error(t, err, "mock handler returns Unimplemented")
+	assert.Equal(t, codes.Unimplemented, status.Code(err), msgAndArgs...)
+}
+
+// newDenyAllProvider creates a grpcserver.Provider with a global "deny all"
+// authenticator. Services must be registered on the returned server before
+// calling startAndConnect.
+func newDenyAllProvider(t *testing.T) grpcserver.Provider {
+	t.Helper()
+	denyAll := interceptors.AuthenticatorFunc(func(context.Context) (context.Context, error) {
+		return nil, status.Error(codes.Unauthenticated, "denied by global auth")
+	})
+	cfg := setting.NewCfg()
+	cfg.GRPCServer.Enabled = true
+	provider, err := grpcserver.ProvideService(
+		cfg,
+		denyAll,
+		noop.NewTracerProvider().Tracer(""),
+		prometheus.NewRegistry(),
+	)
+	require.NoError(t, err)
+	return provider
+}
+
+// startAndConnect starts the gRPC server and returns a client connection.
+func startAndConnect(t *testing.T, srv *grpc.Server) *grpc.ClientConn {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// TestRegisterSearchServerWithAuth verifies that registerSearchServer wraps
+// all registered services (ResourceIndex, ManagedObjectIndex, Diagnostics)
+// with per-service auth that overrides the global auth interceptor.
+func TestRegisterSearchServerWithAuth(t *testing.T) {
+	var authCalled atomic.Int32
+	testAuth := interceptors.AuthenticatorFunc(func(ctx context.Context) (context.Context, error) {
+		authCalled.Add(1)
+		return ctx, nil
+	})
+
+	s := &service{authenticator: testAuth}
+	provider := newDenyAllProvider(t)
+
+	err := s.registerSearchServer(provider, &mockSearchServer{})
+	require.NoError(t, err)
+
+	conn := startAndConnect(t, provider.GetServer())
+	ctx := context.Background()
+
+	t.Run("ResourceIndex/Search", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewResourceIndexClient(conn)
+		_, err := client.Search(ctx, &resourcepb.ResourceSearchRequest{})
+		requireAuthPassed(t, err, "Search should pass per-service auth, not be blocked by global deny-all")
+		require.Greater(t, authCalled.Load(), int32(0), "authenticator should have been called")
+	})
+
+	t.Run("ResourceIndex/GetStats", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewResourceIndexClient(conn)
+		_, err := client.GetStats(ctx, &resourcepb.ResourceStatsRequest{})
+		requireAuthPassed(t, err, "GetStats should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("ManagedObjectIndex/CountManagedObjects", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewManagedObjectIndexClient(conn)
+		_, err := client.CountManagedObjects(ctx, &resourcepb.CountManagedObjectsRequest{})
+		requireAuthPassed(t, err, "CountManagedObjects should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("Diagnostics/IsHealthy", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewDiagnosticsClient(conn)                      //nolint:staticcheck
+		resp, err := client.IsHealthy(ctx, &resourcepb.HealthCheckRequest{}) //nolint:staticcheck
+		require.NoError(t, err, "IsHealthy should pass per-service auth")
+		require.Equal(t, resourcepb.HealthCheckResponse_SERVING, resp.Status)
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+}
+
+// TestRegisterUnifiedResourceServerWithAuth verifies that registerUnifiedResourceServer
+// wraps all registered services (ResourceStore, ResourceStats, BulkStore, BlobStore,
+// Quotas, ResourceIndex, ManagedObjectIndex, Diagnostics, VectorStore) with per-service auth.
+func TestRegisterUnifiedResourceServerWithAuth(t *testing.T) {
+	var authCalled atomic.Int32
+	testAuth := interceptors.AuthenticatorFunc(func(ctx context.Context) (context.Context, error) {
+		authCalled.Add(1)
+		return ctx, nil
+	})
+
+	s := &service{authenticator: testAuth}
+	provider := newDenyAllProvider(t)
+
+	vs := resource.NewVectorStoreServer(nil, nil, nil, nil, nil)
+	s.registerUnifiedResourceServer(provider, &mockResourceServer{}, vs)
+
+	conn := startAndConnect(t, provider.GetServer())
+	ctx := context.Background()
+
+	t.Run("ResourceStore/Read", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewResourceStoreClient(conn)
+		_, err := client.Read(ctx, &resourcepb.ReadRequest{})
+		requireAuthPassed(t, err, "Read should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("ResourceStats/RecordEvent", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewResourceStatsClient(conn)
+		_, err := client.RecordEvent(ctx, &resourcepb.RecordEventRequest{})
+		requireAuthPassed(t, err, "RecordEvent should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("BlobStore/PutBlob", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewBlobStoreClient(conn)
+		_, err := client.PutBlob(ctx, &resourcepb.PutBlobRequest{})
+		requireAuthPassed(t, err, "PutBlob should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("ResourceIndex/Search", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewResourceIndexClient(conn)
+		_, err := client.Search(ctx, &resourcepb.ResourceSearchRequest{})
+		requireAuthPassed(t, err, "Search should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("ManagedObjectIndex/CountManagedObjects", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewManagedObjectIndexClient(conn)
+		_, err := client.CountManagedObjects(ctx, &resourcepb.CountManagedObjectsRequest{})
+		requireAuthPassed(t, err, "CountManagedObjects should pass per-service auth")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("Diagnostics/IsHealthy", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewDiagnosticsClient(conn)                      //nolint:staticcheck
+		resp, err := client.IsHealthy(ctx, &resourcepb.HealthCheckRequest{}) //nolint:staticcheck
+		require.NoError(t, err, "IsHealthy should pass per-service auth")
+		require.Equal(t, resourcepb.HealthCheckResponse_SERVING, resp.Status)
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+
+	t.Run("VectorStore/Upsert", func(t *testing.T) {
+		authCalled.Store(0)
+		client := resourcepb.NewVectorStoreClient(conn)
+		// Empty request: the real handler fails request validation (InvalidArgument)
+		// before touching identity or storage, which is enough to prove the call
+		// reached the handler instead of being blocked by the global deny-all auth.
+		_, err := client.Upsert(ctx, &resourcepb.VectorUpsertRequest{})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err), "Upsert should pass per-service auth and reach handler validation")
+		require.Greater(t, authCalled.Load(), int32(0))
+	})
+}
+
+func TestNewGrpcAuthenticator(t *testing.T) {
+	tracer := noop.NewTracerProvider().Tracer("")
+
+	// Mint a token using the same in-proc exchanger that clients use for local
+	// multi-process dev. This is what NewAuthnGrpcClientInterceptor sends when
+	// TokenExchangeURL is empty.
+	tokenResp, err := resource.ProvideInProcExchanger().Exchange(context.Background(), authnlib.TokenExchangeRequest{
+		Namespace: "*",
+		Audiences: []string{"resourceStore"},
+	})
+	require.NoError(t, err)
+
+	// authlib reads the access token from this metadata key on inbound calls.
+	ctxWithToken := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs("X-Access-Token", tokenResp.Token),
+	)
+
+	t.Run("unsafe=true in dev accepts in-proc token", func(t *testing.T) {
+		cfg := setting.NewCfg()
+		cfg.Env = setting.Dev
+		cfg.Raw.Section("grpc_server_authentication").Key("unsafe").SetValue("true")
+
+		authn := newGrpcAuthenticator(cfg, tracer)
+		gotCtx, err := authn(ctxWithToken)
+		require.NoError(t, err)
+		require.NotNil(t, gotCtx)
+	})
+
+	t.Run("unsafe=true outside dev does not enable unsafe authenticator", func(t *testing.T) {
+		cfg := setting.NewCfg()
+		cfg.Env = "production"
+		cfg.Raw.Section("grpc_server_authentication").Key("unsafe").SetValue("true")
+
+		authn := newGrpcAuthenticator(cfg, tracer)
+		_, err := authn(ctxWithToken)
+		require.Error(t, err, "unsafe must not bypass real auth outside dev mode")
+	})
+
+	t.Run("unsafe=false rejects token with no signing keys configured", func(t *testing.T) {
+		cfg := setting.NewCfg()
+		cfg.Env = setting.Dev
+
+		authn := newGrpcAuthenticator(cfg, tracer)
+		_, err := authn(ctxWithToken)
+		require.Error(t, err)
+	})
+}
+
+// nonKVBackend embeds StorageBackend (a nil interface) so it satisfies
+// StorageBackend at compile time without implementing KVBackend. Used to
+// exercise the "backend doesn't expose KV / lease manager" branch.
+type nonKVBackend struct {
+	resource.StorageBackend
+}
+
+// stubKVBackend embeds KVBackend (a nil interface) so unrelated methods
+// are forwarded to the nil interface but never called. KV() and
+// LeaseManager() return the values the test wires in.
+type stubKVBackend struct {
+	resource.KVBackend
+	kv  resource.KV
+	mgr *lease.Manager
+}
+
+func (s *stubKVBackend) KV() resource.KV              { return s.kv }
+func (s *stubKVBackend) LeaseManager() *lease.Manager { return s.mgr }
+
+func TestBuildKVSnapshotStore(t *testing.T) {
+	logger := log.NewNopLogger()
+
+	t.Run("rejects when backend is not a KVBackend", func(t *testing.T) {
+		cfg := &setting.Cfg{}
+		_, err := BuildKVSnapshotStore(cfg, &nonKVBackend{}, logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "requires a KV-backed storage backend")
+	})
+
+	t.Run("constructs store when everything is wired", func(t *testing.T) {
+		cfg := &setting.Cfg{}
+		store := newTestKV(t)
+		mgr := lease.NewManager(store, "test-holder", "test", nil)
+		t.Cleanup(mgr.Stop)
+		backend := &stubKVBackend{kv: store, mgr: mgr}
+
+		got, err := BuildKVSnapshotStore(cfg, backend, logger)
+		require.NoError(t, err)
+		assert.NotNil(t, got)
+	})
+}
+
+func newTestKV(t *testing.T) resource.KV {
+	t.Helper()
+	opts := badger.DefaultOptions("").WithInMemory(true).WithLogger(nil)
+	db, err := badger.Open(opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return kv.NewBadgerKV(db)
+}

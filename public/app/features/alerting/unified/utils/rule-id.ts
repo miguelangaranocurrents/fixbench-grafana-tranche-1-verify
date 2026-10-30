@@ -1,0 +1,513 @@
+import { nth } from 'lodash';
+
+import { locationService } from '@grafana/runtime';
+import { getDataSourceInstanceSettings } from '@grafana/runtime/unstable';
+import {
+  type CloudRuleIdentifier,
+  type CombinedRule,
+  type EditableRuleIdentifier,
+  type PrometheusRuleIdentifier,
+  type Rule,
+  type RuleGroupIdentifier,
+  type RuleGroupIdentifierV2,
+  type RuleIdentifier,
+  type RuleWithLocation,
+} from 'app/types/unified-alerting';
+import {
+  type Annotations,
+  type Labels,
+  PromRuleType,
+  type RulerCloudRuleDTO,
+  type RulerRuleDTO,
+} from 'app/types/unified-alerting-dto';
+
+import { logError } from '../Analytics';
+import { shouldUsePrometheusRulesPrimary } from '../featureToggles';
+
+import { GRAFANA_RULES_SOURCE_NAME } from './datasource';
+import {
+  getRuleName,
+  isCloudRuleIdentifier,
+  isGrafanaRuleIdentifier,
+  isPrometheusRuleIdentifier,
+  prometheusRuleType,
+  rulerRuleType,
+} from './rules';
+import { parsePrometheusDuration } from './time';
+
+const collator = new Intl.Collator();
+
+export function fromRulerRule(
+  ruleSourceName: string,
+  namespace: string,
+  groupName: string,
+  rule: RulerRuleDTO
+): EditableRuleIdentifier {
+  if (rulerRuleType.grafana.rule(rule)) {
+    return { uid: rule.grafana_alert.uid!, ruleSourceName: 'grafana' };
+  }
+  return {
+    ruleSourceName,
+    namespace,
+    groupName,
+    ruleName: getRuleName(rule),
+    rulerRuleHash: hashRulerRule(rule),
+  } satisfies CloudRuleIdentifier;
+}
+
+export function fromRulerRuleAndGroupIdentifierV2(
+  ruleGroup: RuleGroupIdentifierV2,
+  rule: RulerRuleDTO
+): EditableRuleIdentifier {
+  if (ruleGroup.groupOrigin === 'grafana') {
+    if (rulerRuleType.grafana.rule(rule)) {
+      return { uid: rule.grafana_alert.uid, ruleSourceName: 'grafana' };
+    }
+    logError(new Error('Rule is not a Grafana Ruler rule'));
+    throw new Error('Rule is not a Grafana Ruler rule');
+  }
+
+  return fromRulerRule(ruleGroup.rulesSource.name, ruleGroup.namespace.name, ruleGroup.groupName, rule);
+}
+
+export function fromRulerRuleAndRuleGroupIdentifier(
+  ruleGroup: RuleGroupIdentifier,
+  rule: RulerRuleDTO
+): EditableRuleIdentifier {
+  const { dataSourceName, namespaceName, groupName } = ruleGroup;
+  return fromRulerRule(dataSourceName, namespaceName, groupName, rule);
+}
+
+export function fromRule(ruleSourceName: string, namespace: string, groupName: string, rule: Rule): RuleIdentifier {
+  return {
+    ruleSourceName,
+    namespace,
+    groupName,
+    ruleName: rule.name,
+    ruleHash: hashRule(rule),
+  };
+}
+
+export function fromCombinedRule(ruleSourceName: string, rule: CombinedRule): RuleIdentifier {
+  const namespaceName = rule.namespace.name;
+  const groupName = rule.group.name;
+
+  if (rule.rulerRule) {
+    return fromRulerRule(ruleSourceName, namespaceName, groupName, rule.rulerRule);
+  }
+
+  if (rule.promRule) {
+    return fromRule(ruleSourceName, namespaceName, groupName, rule.promRule);
+  }
+
+  throw new Error('Could not create an id for a rule that is missing both `rulerRule` and `promRule`.');
+}
+
+export function fromRuleWithLocation(rule: RuleWithLocation): RuleIdentifier {
+  return fromRulerRule(rule.ruleSourceName, rule.namespace, rule.group.name, rule.rule);
+}
+
+export function equal(a: RuleIdentifier, b: RuleIdentifier) {
+  if (isGrafanaRuleIdentifier(a) && isGrafanaRuleIdentifier(b)) {
+    return a.uid === b.uid;
+  }
+
+  if (isCloudRuleIdentifier(a) && isCloudRuleIdentifier(b)) {
+    return (
+      a.groupName === b.groupName &&
+      a.namespace === b.namespace &&
+      a.ruleName === b.ruleName &&
+      a.rulerRuleHash === b.rulerRuleHash &&
+      a.ruleSourceName === b.ruleSourceName
+    );
+  }
+
+  if (isPrometheusRuleIdentifier(a) && isPrometheusRuleIdentifier(b)) {
+    return (
+      a.groupName === b.groupName &&
+      a.namespace === b.namespace &&
+      a.ruleName === b.ruleName &&
+      a.ruleHash === b.ruleHash &&
+      a.ruleSourceName === b.ruleSourceName
+    );
+  }
+
+  // It might happen to compare Cloud and Prometheus identifiers for datasources with available Ruler API
+  // It happends when the Ruler API timeouts and the UI cannot create Cloud identifiers, so it creates a Prometheus identifier instead.
+  if (isCloudRuleIdentifier(a) && isPrometheusRuleIdentifier(b)) {
+    return (
+      a.groupName === b.groupName &&
+      a.namespace === b.namespace &&
+      a.ruleName === b.ruleName &&
+      a.rulerRuleHash === b.ruleHash &&
+      a.ruleSourceName === b.ruleSourceName
+    );
+  }
+
+  if (isPrometheusRuleIdentifier(a) && isCloudRuleIdentifier(b)) {
+    return (
+      a.groupName === b.groupName &&
+      a.namespace === b.namespace &&
+      a.ruleName === b.ruleName &&
+      a.ruleHash === b.rulerRuleHash &&
+      a.ruleSourceName === b.ruleSourceName
+    );
+  }
+
+  return false;
+}
+
+const cloudRuleIdentifierPrefix = 'cri';
+const prometheusRuleIdentifierPrefix = 'pri';
+
+function escapeDollars(value: string): string {
+  return value.replace(/\$/g, '_DOLLAR_');
+}
+
+function unescapeDollars(value: string): string {
+  return value.replace(/\_DOLLAR\_/g, '$');
+}
+
+/**
+ * deal with Unix-style path separators "/" (replaced with \x1f – unit separator)
+ * and Windows-style path separators "\" (replaced with \x1e – record separator)
+ * we need this to side-step proxies that automatically decode %2F to prevent path traversal attacks
+ * we'll use some non-printable characters from the ASCII table that will get encoded properly but very unlikely
+ * to ever be used in a rule name or namespace
+ */
+export function escapePathSeparators(value: string): string {
+  return value.replace(/\//g, '\x1f').replace(/\\/g, '\x1e');
+}
+
+export function unescapePathSeparators(value: string): string {
+  return value.replace(/\x1f/g, '/').replace(/\x1e/g, '\\');
+}
+
+export function parse(value: string, decodeFromUri = false): RuleIdentifier {
+  const source = decodeFromUri ? decodeURIComponent(value) : value;
+  const parts = source.split('$');
+
+  if (parts.length === 1) {
+    return { uid: value, ruleSourceName: 'grafana' };
+  }
+
+  if (parts.length === 6) {
+    const [prefix, ruleSourceName, namespace, groupName, ruleName, hash] = parts
+      .map(unescapeDollars)
+      .map(unescapePathSeparators);
+
+    if (prefix === cloudRuleIdentifierPrefix) {
+      return { ruleSourceName, namespace, groupName, ruleName, rulerRuleHash: hash };
+    }
+
+    if (prefix === prometheusRuleIdentifierPrefix) {
+      return { ruleSourceName, namespace, groupName, ruleName, ruleHash: hash };
+    }
+  }
+
+  throw new Error(`Failed to parse rule location: ${value}`);
+}
+
+export function tryParse(value: string | undefined, decodeFromUri = false): RuleIdentifier | undefined {
+  if (!value) {
+    return;
+  }
+
+  try {
+    return parse(value, decodeFromUri);
+  } catch (error) {
+    return;
+  }
+}
+
+export function stringifyIdentifier(identifier: RuleIdentifier): string {
+  if (isGrafanaRuleIdentifier(identifier)) {
+    return identifier.uid;
+  }
+
+  return stringifyDataSourceIdentifier(identifier, identifier.ruleSourceName);
+}
+
+/**
+ * Serialise a data source managed identifier, using `rulesSourceId` to say which rules source the
+ * rule came from.
+ *
+ * Grafana's own URLs name the data source, which is what `stringifyIdentifier` gives you. The
+ * grafana-prometheusalerting-app plugin puts the data source's UID in that same slot, so handing a
+ * rule over to it means re-serialising with the UID instead.
+ */
+export function stringifyDataSourceIdentifier(
+  identifier: CloudRuleIdentifier | PrometheusRuleIdentifier,
+  rulesSourceId: string
+): string {
+  const [prefix, ruleHash] = isCloudRuleIdentifier(identifier)
+    ? [cloudRuleIdentifierPrefix, identifier.rulerRuleHash]
+    : [prometheusRuleIdentifierPrefix, identifier.ruleHash];
+
+  return [prefix, rulesSourceId, identifier.namespace, identifier.groupName, identifier.ruleName, ruleHash]
+    .map(String)
+    .map(escapeDollars)
+    .map(escapePathSeparators)
+    .join('$');
+}
+
+/** `decodeURIComponent`, but a stray '%' gives the raw value back instead of throwing. */
+export function tryDecodeUriComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Takes an identifier straight out of a URL and hands it back only if it belongs to a data source
+ * managed rule. Grafana-managed rules (a bare UID) and anything that won't parse give undefined.
+ *
+ * Everything that needs to know "is this rule data source managed, and what are its parts?" goes
+ * through here, so the answer can't differ between the route matcher and the code that acts on it.
+ */
+function parseDataSourceManagedIdentifier(
+  identifier: string | undefined
+): CloudRuleIdentifier | PrometheusRuleIdentifier | undefined {
+  if (!identifier) {
+    return undefined;
+  }
+
+  // Decoded out here rather than inside `parse`, so a stray '%' falls back to the raw value instead
+  // of being read as "this doesn't parse". Rule names are allowed to contain one.
+  const parsed = tryParse(tryDecodeUriComponent(identifier));
+  if (!parsed || !(isCloudRuleIdentifier(parsed) || isPrometheusRuleIdentifier(parsed))) {
+    return undefined;
+  }
+
+  return parsed;
+}
+
+/**
+ * Grafana-managed rules are identified by a bare UID. Data source managed ones carry a prefix and
+ * `$`-separated parts, so the identifier alone says who owns the rule without any lookup.
+ *
+ * This asks `parse` rather than just checking the prefix, so it only says yes to identifiers that
+ * can actually be taken apart again. Anything that merely looks the part — `cri$` with the wrong
+ * number of fields, say — is treated as not data source managed, which sends the page down the
+ * ordinary Grafana route instead of making it wait on work that was always going to fail.
+ */
+export function isDataSourceManagedIdentifier(identifier: string | undefined): boolean {
+  return parseDataSourceManagedIdentifier(identifier) !== undefined;
+}
+
+/**
+ * Grafana and the plugin use the same identifier shape but not the same contents: Grafana puts the
+ * data source *name* in the second slot, the plugin puts its *UID*. Passing one straight to the
+ * other sends the plugin looking for a data source that doesn't exist, so swap that field over.
+ *
+ * Returns undefined for Grafana-managed rules (a bare UID, nothing to translate) and for names we
+ * can't resolve to a data source — in both cases we leave the page on Grafana's side.
+ */
+export async function toPluginRuleIdentifier(rawIdentifier: string | undefined): Promise<string | undefined> {
+  const identifier = parseDataSourceManagedIdentifier(rawIdentifier);
+  if (!identifier) {
+    return undefined;
+  }
+
+  const uid = (await getDataSourceInstanceSettings(identifier.ruleSourceName))?.uid;
+  if (!uid) {
+    return undefined;
+  }
+
+  return encodeURIComponent(stringifyDataSourceIdentifier(identifier, uid));
+}
+
+function hash(value: string): number {
+  let hash = 0;
+  if (value.length === 0) {
+    return hash;
+  }
+  for (let i = 0; i < value.length; i++) {
+    const char = value.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash;
+}
+
+// this is used to identify rules, mimir / loki rules do not have a unique identifier
+export function hashRulerRule(rule: RulerRuleDTO): string {
+  if (rulerRuleType.grafana.rule(rule)) {
+    return rule.grafana_alert.uid;
+  }
+
+  const prometheusRulesPrimary = shouldUsePrometheusRulesPrimary();
+  // If the prometheusRulesPrimary feature toggle is enabled, we don't need to hash the query
+  // We need to make fingerprint compatibility between Prometheus and Ruler rules
+  // Query often differs between the two, so we can't use it to generate a fingerprint
+  const includeQuery = !prometheusRulesPrimary;
+  const fingerprint = getRulerRuleFingerprint(rule, includeQuery);
+  return hash(JSON.stringify(fingerprint)).toString();
+}
+
+export function getRulerRuleFingerprint(rule: RulerCloudRuleDTO, includeQuery: boolean) {
+  const queryHash = includeQuery ? hashQuery(rule.expr) : '';
+  const labelsHash = hashLabelsOrAnnotations(rule.labels);
+
+  if (rulerRuleType.dataSource.recordingRule(rule)) {
+    return [rule.record, PromRuleType.Recording, queryHash, labelsHash];
+  }
+  if (rulerRuleType.dataSource.alertingRule(rule)) {
+    return [rule.alert, PromRuleType.Alerting, queryHash, hashLabelsOrAnnotations(rule.annotations), labelsHash];
+  }
+  throw new Error('Only recording and alerting ruler rules can be hashed');
+}
+
+export function hashRule(rule: Rule): string {
+  const prometheusRulesPrimary = shouldUsePrometheusRulesPrimary();
+  const includeQuery = !prometheusRulesPrimary;
+
+  const fingerprint = getPromRuleFingerprint(rule, includeQuery);
+  return hash(JSON.stringify(fingerprint)).toString();
+}
+
+export function getPromRuleFingerprint(rule: Rule, includeQuery: boolean) {
+  const queryHash = includeQuery ? hashQuery(rule.query) : '';
+  const labelsHash = hashLabelsOrAnnotations(rule.labels);
+
+  if (prometheusRuleType.recordingRule(rule)) {
+    return [rule.name, PromRuleType.Recording, queryHash, labelsHash];
+  }
+  if (prometheusRuleType.alertingRule(rule)) {
+    return [rule.name, PromRuleType.Alerting, queryHash, hashLabelsOrAnnotations(rule.annotations), labelsHash];
+  }
+  throw new Error('Only recording and alerting rules can be hashed');
+}
+
+/**
+ * Strips PromQL comments from a query string.
+ * Handles both full-line comments (lines starting with #) and inline comments
+ * (# appearing after code on the same line, e.g. `or # fallback condition`).
+ * Mimir normalizes expressions by stripping comments before storing them in
+ * Prometheus state, so the ruler expression and the Prometheus query must be
+ * processed identically before comparison.
+ */
+export function stripPromQLComments(query: string): string {
+  return query
+    .replace(/#[^\n]*/g, '') // strip from # to end of line (inline and full-line comments)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => Boolean(line))
+    .join('\n');
+}
+
+/**
+ * A PromQL string literal, in any of the three syntaxes PromQL allows. A backslash escapes the next
+ * character in a quoted string, so `"{{\"FOO\"}}"` is one string and not two – but not in a backtick
+ * raw string, where a backslash is just a backslash.
+ */
+const PROMQL_STRING = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`/;
+
+/**
+ * A PromQL duration literal – one or more `<number><unit>` parts, e.g. `5m`, `1h30m`, `500ms`.
+ *
+ * The lookbehind and lookahead keep us from matching a duration-looking tail inside an identifier,
+ * so a recording rule named `job:latency:rate5m` is left alone. They also have to exclude a dot:
+ * plain `\b` would find a boundary in the middle of `1.5h` and match just the `5h`.
+ *
+ * The interval patterns elsewhere in Grafana can't stand in for this one – they either anchor to the
+ * whole string, or they accept the units of a Grafana interval rather than a PromQL duration.
+ */
+const PROMQL_DURATION = /(?<![\w.])(?:\d+(?:ms|[smhdwy]))+(?![\w.])/;
+
+/**
+ * Strings come first, and the scan runs left to right, so an opening quote swallows the whole literal
+ * before anything inside it can be read as a duration.
+ */
+const PROMQL_STRING_OR_DURATION = new RegExp(`${PROMQL_STRING.source}|${PROMQL_DURATION.source}`, 'g');
+
+const QUOTE_CHARACTERS = ['"', "'", '`'];
+
+/**
+ * Rewrites every duration in a query to a plain number of milliseconds.
+ *
+ * Mimir parses the expression and prints it back out when it exposes the rule via the Prometheus
+ * rules API, and printing picks the largest unit that fits. A hand-written `[60m:]` in the ruler
+ * YAML therefore comes back as `[1h:]`, which would otherwise fingerprint differently.
+ *
+ * Durations inside a string are left alone. `window="60m"` and `window="1h"` select different series,
+ * so rewriting them would make two genuinely different rules look like one – as happens in the
+ * multi-window burn rate pattern, where each rule carries its own window as a label.
+ */
+export function normalizePromQLDurations(query: string): string {
+  return query.replace(PROMQL_STRING_OR_DURATION, (match) => {
+    if (QUOTE_CHARACTERS.includes(match[0])) {
+      return match;
+    }
+
+    try {
+      return `${parsePrometheusDuration(match)}ms`;
+    } catch {
+      // the two patterns could drift apart, so leave anything we can't parse exactly as we found it
+      // rather than collapsing it to a value that would make unrelated durations look identical
+      return match;
+    }
+  });
+}
+
+// there can be slight differences in how prom & ruler render a query, this will hash them accounting for the differences
+export function hashQuery(query: string) {
+  // remove comments (full-line and inline)
+  query = stripPromQLComments(query);
+
+  // `60m` and `1h` mean the same thing but don't look the same
+  query = normalizePromQLDurations(query);
+
+  // one of them might be wrapped in parens
+  if (query.length > 1 && query[0] === '(' && query[query.length - 1] === ')') {
+    query = query.slice(1, -1);
+  }
+
+  // whitespace could be added or removed
+  query = query.replace(/\s|\n/g, '');
+
+  // normalize escaped quotes in template strings like {{\"REQ_SENT\"}} -> {{"REQ_SENT"}}
+  query = query.replace(/\\"/g, '"');
+
+  // normalize backtick template strings to double quotes for consistency
+  // Convert `{{.field}}` to "{{.field}}"
+  query = query.replace(/`([^`]*)`/g, '"$1"');
+
+  // Mimir re-serializes the expression when exposing it via the Prometheus rules API, which drops
+  // trailing commas and empty label selectors that are legal in hand-written ruler YAML. Both have
+  // to go before hashing, or a ruler `expr` and its Prometheus `query` fingerprint differently.
+  // Convert `metric{foo="bar",}` to `metric{foo="bar"}`
+  query = query.replace(/,(?=})/g, '');
+  // Convert `metric{}` to `metric`
+  query = query.replace(/{}/g, '');
+
+  // remove quotes, brackets, parentheses, backslashes, and backticks
+  query = query.replace(/['"()\[\]\\`]/g, '');
+
+  // labels matchers can be reordered, so sort the entire string, essentially comparing just the character counts
+  return query.split('').sort().join('');
+}
+
+function hashLabelsOrAnnotations(item: Labels | Annotations | undefined): string {
+  return JSON.stringify(Object.entries(item || {}).sort((a, b) => collator.compare(a[0], b[0])));
+}
+
+export function ruleIdentifierToRuleSourceName(identifier: RuleIdentifier): string {
+  return isGrafanaRuleIdentifier(identifier) ? GRAFANA_RULES_SOURCE_NAME : identifier.ruleSourceName;
+}
+
+// DO NOT USE REACT-ROUTER HOOKS FOR THIS CODE
+// React-router's useLocation/useParams/props.match are broken and don't preserve original param values when parsing location
+// so, they cannot be used to parse name and sourceName path params
+// React-router messes the pathname up resulting in a string that is neither encoded nor decoded
+// Relevant issue: https://github.com/remix-run/history/issues/505#issuecomment-453175833
+// It was probably fixed in React-Router v6
+type PathWithOptionalID = { id?: string };
+export function getRuleIdFromPathname(params: PathWithOptionalID): string | undefined {
+  const { pathname = '' } = locationService.getLocation();
+  const { id } = params;
+
+  return id ? nth(pathname.split('/'), -2) : undefined;
+}

@@ -1,0 +1,2183 @@
+import clsx from 'clsx';
+import memoize from 'micro-memoize';
+import { type CSSProperties } from 'react';
+import tinycolor from 'tinycolor2';
+import { type Count, type uWrap, varPreLine } from 'uwrap';
+
+import {
+  FieldType,
+  type Field,
+  fieldReducers,
+  formattedValueToString,
+  type GrafanaTheme2,
+  type DisplayValue,
+  type DisplayValueAlignmentFactors,
+  type DataFrame,
+  type DisplayProcessor,
+  isDataFrame,
+  reduceField,
+  ReducerID,
+  type FieldSparkline,
+  type DecimalCount,
+} from '@grafana/data';
+import type { ColumnWidth, ColumnWidths, SortColumn } from '@grafana/react-data-grid';
+import {
+  BarGaugeDisplayMode,
+  type FieldTextAlignment,
+  TableCellBackgroundDisplayMode,
+  TableCellDisplayMode,
+  TableCellHeight,
+} from '@grafana/schema';
+
+import { getTextColorForAlphaBackground } from '../../../utils/colors';
+import { TableCellInspectorMode } from '../TableCellInspector';
+import { type OpenLayersContextValue, isGeometry } from '../geo';
+import { type TableCellOptions } from '../types';
+
+import { AutoCellRenderer, getAutoRendererDisplayMode, getCellRenderer } from './Cells/renderers';
+import { getCellLinks } from './cellLinks';
+import {
+  CELL_HORIZONTAL_CHROME,
+  COLUMN,
+  FIRST_COLUMN_CLASS,
+  FIRST_COLUMN_EXTRA_PADDING,
+  HEADER_ICON_SPACE,
+  HEADER_MENU_SPACE,
+  HEADER_TOOLTIP_SPACE,
+  LAST_COLUMN_CLASS,
+  NESTED_ROW_CLASS,
+  STRIPED_ROW_CLASS,
+  TABLE,
+} from './constants';
+import type { TextAlign } from './styles';
+import type {
+  TableRow,
+  ColumnTypes,
+  FrameToRowsConverter,
+  Comparator,
+  TypographyCtx,
+  MeasureCellHeight,
+  MeasureCellHeightEntry,
+  FilterType,
+  GetActionsFunctionLocal,
+  TableColumn,
+  FromFieldsResult,
+  TextWrapFallback,
+} from './types';
+
+// inferPills lives here rather than in PillCell.tsx to avoid a circular dependency:
+// styles.ts → utils.tsx → renderers.tsx → PillCell.tsx → styles.ts
+/* ---------------------------- Pill inference ----------------------------- */
+const SPLIT_RE = /\s*,\s*/;
+
+function inferPillsImpl(rawValue: unknown): unknown[] {
+  if (rawValue === '' || rawValue == null) {
+    return [];
+  }
+
+  if (Array.isArray(rawValue)) {
+    return rawValue.filter((v) => v != null).map((v) => String(v).trim());
+  }
+
+  const value = String(rawValue);
+
+  if (value[0] === '[') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value.trim().split(SPLIT_RE);
+    }
+  }
+
+  return value.trim().split(SPLIT_RE);
+}
+
+/**
+ * @internal
+ * A bounded cache with O(1) inserts and no per-insert eviction scan. It keeps two generations:
+ * writes go to `primary`; when `primary` fills, it becomes `secondary` (whatever was in the old
+ * `secondary` is dropped) and a fresh `primary` starts. Reads check both generations and promote a
+ * survivor back into `primary`, which approximates LRU. Total live entries stay within ~2x maxSize.
+ */
+export function createBoundedCache<K, V>(maxSize: number) {
+  let primary = new Map<K, V>();
+  let secondary = new Map<K, V>();
+
+  // Every write to `primary` — whether a fresh `set` or a promotion from `secondary` in `get` — goes
+  // through here so the rotation check runs on all growth paths. (Rotating only in `set` let `get`'s
+  // promotions grow `primary` past `maxSize` between writes, breaking the ~2x bound.)
+  const put = (key: K, value: V): void => {
+    primary.set(key, value);
+    if (primary.size >= maxSize) {
+      secondary = primary;
+      primary = new Map<K, V>();
+    }
+  };
+
+  return {
+    get(key: K): V | undefined {
+      const fromPrimary = primary.get(key);
+      if (fromPrimary !== undefined) {
+        return fromPrimary;
+      }
+      const fromSecondary = secondary.get(key);
+      if (fromSecondary !== undefined) {
+        put(key, fromSecondary); // promote into the current generation, keeping the size bound
+      }
+      return fromSecondary;
+    },
+    set: put,
+  };
+}
+
+// inferPills is pure and its inputs are stable across resizes, so we cache results. Array/object
+// values are cached by reference in a WeakMap (unbounded-safe, auto-GC'd). Primitive (string) values
+// persist for the whole app lifetime across every table, so they use a generational bounded cache
+// (see createBoundedCache) sized generously enough that a large table mostly hits.
+const arrayPillCache = new WeakMap<object, unknown[]>();
+const primitivePillCache = createBoundedCache<string, unknown[]>(15000);
+
+// Accepts an arbitrary raw cell value: pill columns hold string arrays (not in TableCellValue), and
+// values can be null, so this is deliberately typed `unknown` and narrowed at runtime.
+export function inferPills(rawValue: unknown): unknown[] {
+  if (rawValue == null || rawValue === '') {
+    return [];
+  }
+
+  if (typeof rawValue === 'object') {
+    let cached = arrayPillCache.get(rawValue);
+    if (cached === undefined) {
+      cached = inferPillsImpl(rawValue);
+      arrayPillCache.set(rawValue, cached);
+    }
+    return cached;
+  }
+
+  const key = String(rawValue);
+  let cached = primitivePillCache.get(key);
+  if (cached === undefined) {
+    cached = inferPillsImpl(rawValue);
+    primitivePillCache.set(key, cached);
+  }
+  return cached;
+}
+
+/* ---------------------------- Cell calculations --------------------------- */
+/**
+ * @internal
+ * Returns the default row height based on the theme and cell height setting.
+ */
+export function getDefaultRowHeight(
+  theme: GrafanaTheme2,
+  fields?: Field[],
+  cellHeight?: TableCellHeight
+): NonNullable<CSSProperties['height']> {
+  if (fields?.some((field) => field.config?.custom?.cellOptions?.dynamicHeight)) {
+    return 'min-content';
+  }
+
+  switch (cellHeight) {
+    case TableCellHeight.Sm:
+      return 36;
+    case TableCellHeight.Md:
+      return 42;
+    case TableCellHeight.Lg:
+      return TABLE.MAX_CELL_HEIGHT;
+  }
+
+  return TABLE.CELL_PADDING * 2 + theme.typography.fontSize * theme.typography.body.lineHeight;
+}
+
+/**
+ * @internal
+ * Returns true if cell inspection (hover to see full content) is enabled for the field.
+ */
+export function isCellInspectEnabled(field: Field): boolean {
+  return field.config?.custom?.inspect ?? false;
+}
+
+/**
+ * @internal
+ * Returns true if text wrapping should be applied to the cell.
+ */
+export function shouldTextWrap(field: Field): boolean {
+  return Boolean(field.config.custom?.wrapText);
+}
+
+/**
+ * @internal
+ * Returns true if the field's cells pretty-print their value as JSON. An `other` field only does so
+ * when no explicit cell type was chosen — one set to Pill or Markdown should render as that instead.
+ */
+export function rendersAsJson(field: Field, cellType = getCellOptions(field).type): boolean {
+  return (
+    cellType === TableCellDisplayMode.JSONView ||
+    ((cellType == null || cellType === TableCellDisplayMode.Auto) &&
+      getAutoRendererDisplayMode(field) === TableCellDisplayMode.JSONView)
+  );
+}
+
+/**
+ * @internal wrap a cell height measurer to clamp its output to the maxHeight defined in the field, if any.
+ */
+function clampByMaxHeight(measurer: MeasureCellHeight, maxHeight = Infinity): MeasureCellHeight {
+  return (value, width, field, rowIdx, lineHeight) => {
+    const rawHeight = measurer(value, width, field, rowIdx, lineHeight);
+    return Math.min(rawHeight, maxHeight);
+  };
+}
+
+/**
+ * @internal creates a typography context based on a font size and family. used to measure text
+ * and estimate size of text in cells.
+ */
+export function createTypographyContext(
+  fontSize: number,
+  fontFamily: string,
+  letterSpacing = 0.15,
+  fontWeight?: number
+): TypographyCtx {
+  const weightPrefix = fontWeight != null ? `${fontWeight} ` : '';
+  const font = `${weightPrefix}${fontSize}px ${fontFamily}`;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.letterSpacing = `${letterSpacing}px`;
+  ctx.font = font;
+  // 1/6 of the characters in this string are capitalized. Since the avgCharWidth is used for estimation, it's
+  // better that the estimation over-estimates the width than if it underestimates it, so we're a little on the
+  // aggressive side here and could even go more aggressive if we get complaints in the future.
+  const txt =
+    "Lorem Ipsum is simply dummy text of the printing and typesetting industry. Lorem Ipsum has been the industry's standard dummy text ever since the 1500s. 1234567890 ALL CAPS TO HELP WITH MEASUREMENT.";
+  const txtWidth = ctx.measureText(txt).width;
+  const avgCharWidth = txtWidth / txt.length + letterSpacing;
+  const uwrap = varPreLine(ctx);
+
+  // The grid applies `font-variant-numeric: tabular-nums`, so every digit renders at the font's
+  // uniform (widest) figure advance. Canvas can't set that feature, so measure each digit and take
+  // the max as a safe over-estimate of the tabular advance.
+  let maxDigitWidth = 0;
+  for (let d = 0; d <= 9; d++) {
+    maxDigitWidth = Math.max(maxDigitWidth, ctx.measureText(String(d)).width);
+  }
+  const numericCharWidth = maxDigitWidth + letterSpacing;
+
+  // JSON/Geo cells render in a monospace font; measure one character there (all are equal-width).
+  ctx.font = `${weightPrefix}${fontSize}px monospace`;
+  const monoCharWidth = ctx.measureText('0').width + letterSpacing;
+  ctx.font = font; // restore the primary font on the shared context
+
+  return {
+    ctx,
+    fontFamily,
+    letterSpacing,
+    avgCharWidth,
+    numericCharWidth,
+    monoCharWidth,
+    estimateHeight: getTextHeightEstimator(avgCharWidth),
+    measureHeight: getTextHeightMeasurerFromUwrapCount(uwrap.count),
+    measureWidth: createFitWidthMeasurer(ctx, uwrap),
+  };
+}
+
+/**
+ * @internal The narrowest width at which the line counter agrees the text fits on one line.
+ *
+ * Not `measureText(text).width`: that is kerned end to end, while uwrap sums its own per-character
+ * widths and so reads most strings ~1px wider. Size a column to the kerned number and uwrap wraps
+ * the label anyway. uwrap doesn't export its width table, so it arbitrates instead: start from the
+ * kerned width, which never over-shoots, and nudge up until `test` agrees. Cheap enough for the
+ * handful of labels a header has, but it is work per call — not for every cell.
+ */
+export function createFitWidthMeasurer(ctx: CanvasRenderingContext2D, { test }: uWrap): (text: string) => number {
+  return (text: string) => {
+    let widest = 0;
+    // A `pre-line` newline is a hard break, so uwrap calls a string that contains one wrapped at
+    // *any* width and the nudging below would never terminate. Each hard-broken segment is a line
+    // regardless, so measure them separately: the widest is what the whole string needs.
+    for (const segment of text.slice(0, TABLE.MAX_WRAP_TEXT_LENGTH).split('\n')) {
+      let width = Math.ceil(ctx.measureText(segment).width);
+      while (test(segment, width)) {
+        width++;
+      }
+      widest = Math.max(widest, width);
+    }
+    return widest;
+  };
+}
+
+/**
+ * @internal wraps the uwrap count function to ensure that it is given a string.
+ */
+export function getTextHeightMeasurerFromUwrapCount(count: Count): MeasureCellHeight {
+  return (value, width, _field, _rowIdx, lineHeight) => {
+    if (value == null) {
+      return lineHeight;
+    }
+
+    const lines = count(String(value).slice(0, TABLE.MAX_WRAP_TEXT_LENGTH), width);
+    return lines * lineHeight;
+  };
+}
+
+/**
+ * @internal returns a measurer which guesstimates a number of lines in a text cell based on the typography context's avgCharWidth.
+ */
+export function getTextHeightEstimator(avgCharWidth: number): MeasureCellHeight {
+  return (value, width, _field, _rowIdx, lineHeight) => {
+    if (!value) {
+      return -1;
+    }
+
+    // we don't have string breaking enabled in the table,
+    // so an unbroken string is by definition a single line.
+    const strValue = String(value);
+    if (!spaceRegex.test(strValue)) {
+      return -1;
+    }
+
+    const charsPerLine = width / avgCharWidth;
+    // A pretty-printed JSON value (and any other multi-line string) carries real newlines that the
+    // renderer preserves (`pre-wrap`/`pre-line`), so each one forces a line break regardless of width.
+    // Estimating off the total string length alone ignores those breaks and badly undercounts a value
+    // with many short lines. Sum the wrapped-line estimate per newline-delimited segment instead,
+    // matching how the precise uwrap measurer already treats embedded newlines.
+    const lines = strValue
+      .split('\n')
+      .reduce((total, line) => total + Math.max(1, Math.ceil(line.length / charsPerLine)), 0);
+    return lines * lineHeight;
+  };
+}
+
+/**
+ * @internal
+ */
+export function getDataLinksHeightMeasurer(): MeasureCellHeight {
+  const linksCountCache: Record<string, number> = {};
+
+  // when we render links, we need to filter out the invalid links. since the call to `getLinks` is expensive,
+  // we'll cache the result and reuse it for every row in the table. this cache is cleared when line counts are
+  // rebuilt anytime from the `useRowHeight` hook, and that includes adding and removing data links.
+  return (_value, _width, field, _rowIdx, lineHeight) => {
+    const cacheKey = getDisplayName(field);
+    if (linksCountCache[cacheKey] === undefined) {
+      let count = 0;
+      for (const l of field.config?.links ?? []) {
+        if (l.onClick || l.url) {
+          count += 1;
+        }
+      }
+      linksCountCache[cacheKey] = count;
+    }
+
+    return linksCountCache[cacheKey] * lineHeight;
+  };
+}
+
+const getPillMetrics = (theme?: GrafanaTheme2) => {
+  if (!theme) {
+    throw new Error('A theme is required to measure pill cells');
+  }
+
+  const refreshed = theme.flags.visualDesignRefresh;
+  const fontSize = refreshed ? theme.typography.size.xs : theme.typography.size.sm;
+  const horizontalPadding = refreshed ? theme.spacing.x1 : theme.spacing(0.75);
+
+  return {
+    fontSize: extractPixelValue(fontSize),
+    spacing: 2 * extractPixelValue(horizontalPadding),
+    gap: extractPixelValue(theme.spacing(0.5)),
+  };
+};
+
+// Fuzzy chrome estimates for the other inline-run cell types (see measureInlineRunWidth). Used only
+// for auto-width sizing, so approximate values that slightly over-reserve are fine.
+const LINK_SPACING = 8; // paddingInline (~4px each side) when data links sit inline
+const LINK_GAP = 2; // separator border between inline data links
+const ACTION_SPACING = 20; // horizontal padding of a small action Button
+const ACTION_GAP = 6; // theme.spacing(0.75) gap between action buttons
+
+export function getPillCellHeightMeasurer(
+  measureWidth: (value: string) => number,
+  spacing: number,
+  gap: number
+): MeasureCellHeight {
+  // Per-pill intrinsic width, keyed by the pill string — shared across values (e.g. an actor who
+  // appears in many rows) and across column widths, so a resize never re-measures pill text.
+  const pillWidthCache: Record<string, number> = {};
+  // Per-value laid-out pill widths (intrinsic width + chip padding), keyed by the cell value and
+  // therefore width-independent: on a resize we reuse these and skip both inferPills and text
+  // measurement, redoing only the cheap wrap arithmetic below. Neither cache needs eviction: the
+  // whole closure is rebuilt when fields/typography/maxHeight change, so they live only as long as
+  // the current table structure and are bounded by its distinct values.
+  const pillWidthsByValue = new Map<string, number[]>();
+
+  return (value, width, _field, _rowIdx, lineHeight) => {
+    if (value == null) {
+      return 0;
+    }
+
+    const strValue = String(value);
+    let pillWidths = pillWidthsByValue.get(strValue);
+    if (pillWidths === undefined) {
+      pillWidths = inferPills(strValue).map((pill) => {
+        const strPill = String(pill);
+        let rawWidth = pillWidthCache[strPill];
+        if (rawWidth === undefined) {
+          rawWidth = measureWidth(strPill);
+          pillWidthCache[strPill] = rawWidth;
+        }
+        return rawWidth + spacing;
+      });
+      pillWidthsByValue.set(strValue, pillWidths);
+    }
+
+    if (pillWidths.length === 0) {
+      return 0;
+    }
+
+    // wrap arithmetic over the (cached) pill widths. This is cheap enough to run per cell; the
+    // expensive parts — parsing and text measurement — are what the caches above eliminate.
+    let lines = 0;
+    let currentLineUse = width;
+    for (const pillWidth of pillWidths) {
+      if (currentLineUse + pillWidth + gap > width) {
+        lines++;
+        currentLineUse = pillWidth;
+      } else {
+        currentLineUse += pillWidth + gap;
+      }
+    }
+
+    // default line height happens to be the height of a pill, but maybe we need a custom
+    // const here to make sure this doesn't get out of sync with the actual pill height.
+    return lines * lineHeight + (lines - 1) * gap;
+  };
+}
+
+/**
+ * @internal return a text measurer for every field which has wrapHeaderText enabled.
+ */
+export function buildHeaderHeightMeasurers(
+  fields: Field[],
+  typographyCtx: TypographyCtx
+): MeasureCellHeightEntry[] | undefined {
+  const wrappedColIdxs = fields.reduce((acc: number[], field, idx) => {
+    if (field.config?.custom?.wrapHeaderText) {
+      acc.push(idx);
+    }
+    return acc;
+  }, []);
+
+  if (wrappedColIdxs.length === 0) {
+    return undefined;
+  }
+
+  // don't bother with estimating the line counts for the headers, because it's punishing
+  // when we get it wrong and there won't be that many compared to how many rows a table might contain.
+  return [{ measure: typographyCtx.measureHeight, fieldIdxs: wrappedColIdxs }];
+}
+
+const spaceRegex = /[\s-]/;
+
+/**
+ * @internal return a text height measurer for every field which has wrapHeaderText enabled. we do this once as we're rendering
+ * the table, and then getRowHeight uses the output of this to caluclate the height of each row.
+ */
+export function buildCellHeightMeasurers(
+  fields: Field[],
+  typographyCtx: TypographyCtx,
+  theme: GrafanaTheme2,
+  maxHeight?: number,
+  wrapFallback?: TextWrapFallback
+): MeasureCellHeightEntry[] | undefined {
+  const result: Record<string, MeasureCellHeightEntry> = {};
+  let wrappedFields = 0;
+
+  const measurerFactory: Record<
+    TableCellDisplayMode.Auto | TableCellDisplayMode.DataLinks | TableCellDisplayMode.Pill,
+    () => [MeasureCellHeight, MeasureCellHeight?]
+  > = {
+    // for string fields, we estimate the length of a line using `avgCharWidth` to limit expensive calls `count`.
+    [TableCellDisplayMode.Auto]: () => [typographyCtx.measureHeight, typographyCtx.estimateHeight],
+    [TableCellDisplayMode.DataLinks]: () => [getDataLinksHeightMeasurer(), undefined],
+    // pills use a different font size, so they require their own typography context.
+    [TableCellDisplayMode.Pill]: () => {
+      const { fontSize, spacing, gap } = getPillMetrics(theme);
+      const pillTypographyCtx = createTypographyContext(
+        fontSize,
+        typographyCtx.fontFamily,
+        typographyCtx.letterSpacing
+      );
+      return [
+        getPillCellHeightMeasurer((value) => pillTypographyCtx.ctx.measureText(value).width, spacing, gap),
+        undefined,
+      ];
+    },
+  } as const;
+
+  const setupMeasurerForIdx = (measurerFactoryKey: keyof typeof measurerFactory, fieldIdx: number) => {
+    if (!result[measurerFactoryKey]) {
+      const [measure, estimate] = measurerFactory[measurerFactoryKey]();
+      const guard = (measurer: MeasureCellHeight): MeasureCellHeight => {
+        if (measurerFactoryKey !== TableCellDisplayMode.Auto || wrapFallback == null) {
+          return measurer;
+        }
+        return (value, width, field, rowIdx, lineHeight) =>
+          wrapFallback.shouldDisable(field, value) ? -1 : measurer(value, width, field, rowIdx, lineHeight);
+      };
+      result[measurerFactoryKey] = {
+        measure: guard(clampByMaxHeight(measure, maxHeight)),
+        estimate: estimate != null ? guard(clampByMaxHeight(estimate, maxHeight)) : undefined,
+        fieldIdxs: [],
+      };
+    }
+    result[measurerFactoryKey].fieldIdxs.push(fieldIdx);
+  };
+
+  for (let fieldIdx = 0; fieldIdx < fields.length; fieldIdx++) {
+    const field = fields[fieldIdx];
+    if (shouldTextWrap(field) && !wrapFallback?.disabledFields.has(getDisplayName(field))) {
+      wrappedFields++;
+
+      const cellType = getCellOptions(field).type;
+      if (cellType === TableCellDisplayMode.DataLinks) {
+        setupMeasurerForIdx(TableCellDisplayMode.DataLinks, fieldIdx);
+      } else if (cellType === TableCellDisplayMode.Pill) {
+        setupMeasurerForIdx(TableCellDisplayMode.Pill, fieldIdx);
+      } else if (rendersAsJson(field) || getCellRenderer(field, getCellOptions(field)) === AutoCellRenderer) {
+        // JSON and Auto cells can produce multiline formatted strings, so both need measurement.
+        setupMeasurerForIdx(TableCellDisplayMode.Auto, fieldIdx);
+      } else {
+        // no measurer was configured for this cell type
+        wrappedFields--;
+      }
+    }
+  }
+
+  if (wrappedFields === 0) {
+    return undefined;
+  }
+
+  return Object.values(result);
+}
+
+// in some cases, the estimator might return a value that is less than 1, but when calculated by the measurer, it actually
+// realizes that it's a multi-line cell. to avoid this, we want to give a little buffer away from 1 before we fully trust
+// the estimator to have told us that a cell is single-line.
+export const SINGLE_LINE_ESTIMATE_THRESHOLD = 18.5;
+
+/**
+ * @internal
+ * loop through the fields and their values, determine which cell is going to determine the height of the row based
+ * on its content and width, and return the height in pixels of that row, with vertial padding applied.
+ */
+export function getRowHeight(
+  fields: Field[],
+  row: TableRow,
+  columnWidths: number[],
+  defaultHeight: number,
+  measurers?: MeasureCellHeightEntry[],
+  lineHeight = TABLE.LINE_HEIGHT,
+  verticalPadding = TABLE.CELL_PADDING * 2
+): number {
+  if (!measurers?.length) {
+    return defaultHeight;
+  }
+
+  let maxHeight = -1;
+  let maxValue: unknown = '';
+  let maxWidth = 0;
+  let maxField: Field | undefined;
+  let preciseMeasurer: MeasureCellHeight | undefined;
+  // Tallest height from measurers that already ran precisely (pills, data links). The estimated
+  // winner is remeasured below and can shrink beneath one of these, so we clamp back up to it —
+  // otherwise an over-estimating Auto column could beat a precise pill height and then discard it,
+  // sizing the row too short and clipping the pills.
+  let maxPreciseHeight = -1;
+
+  for (const { estimate, measure, fieldIdxs } of measurers) {
+    // for some of the cell height measurers, getting the precise height is expensive. those entries set
+    // both "estimate" and "measure" functions. if the cell we find to be the max was estimated, we will
+    // get the "true" value right before calculating the row height by keeping a reference to the measure fn.
+    const measurer = (estimate ?? measure) satisfies MeasureCellHeight;
+    const isEstimating = estimate !== undefined;
+
+    for (const fieldIdx of fieldIdxs) {
+      const field = fields[fieldIdx];
+      const displayName = getDisplayName(field);
+      // special case: for the header, provide `-1` as the row index.
+      const cellValueRaw = row.__index === -1 ? displayName : row[displayName];
+      if (cellValueRaw != null) {
+        // For non-string fields (e.g. Time, Number), the raw value is a number/epoch that
+        // AutoCell formats via field.display() before rendering. A JSON cell reformats strings too,
+        // expanding compact source into an indented block. Measure the rendered string either way
+        // so the height matches what is actually displayed in the cell.
+        const needsFormatting = field.type !== FieldType.string || rendersAsJson(field);
+        const cellValueForMeasuring =
+          needsFormatting && row.__index !== -1 && field.display != null
+            ? formattedValueToString(field.display(cellValueRaw))
+            : cellValueRaw;
+        const colWidth = columnWidths[fieldIdx];
+        const estimatedHeight = measurer(cellValueForMeasuring, colWidth, field, row.__index, lineHeight);
+        if (!isEstimating && estimatedHeight > maxPreciseHeight) {
+          maxPreciseHeight = estimatedHeight;
+        }
+        if (estimatedHeight > maxHeight) {
+          maxHeight = estimatedHeight;
+          maxValue = cellValueForMeasuring;
+          maxWidth = colWidth;
+          maxField = field;
+          preciseMeasurer = isEstimating ? measure : undefined;
+        }
+      }
+    }
+  }
+
+  // if the value is -1 or the estimate for the max cell was less than the SINGLE_LINE_ESTIMATE_THRESHOLD, we trust
+  // that the estimator correctly identified that no text wrapping is needed for this row, skipping the preciseMeasurer.
+  if (maxField === undefined || maxHeight < SINGLE_LINE_ESTIMATE_THRESHOLD) {
+    return defaultHeight;
+  }
+
+  // if we finished this row height loop with an estimate, we need to call
+  // the `preciseMeasurer` method to get the exact line count. the remeasured winner can come back
+  // shorter than a column we already measured precisely, so never drop below that height.
+  if (preciseMeasurer !== undefined) {
+    maxHeight = Math.max(preciseMeasurer(maxValue, maxWidth, maxField, row.__index, lineHeight), maxPreciseHeight);
+  }
+
+  // adjust for vertical padding, and clamp to a minimum default height
+  return Math.max(maxHeight + verticalPadding, defaultHeight);
+}
+
+/**
+ * @internal
+ * Returns true if text overflow handling should be applied to the cell.
+ */
+export function shouldTextOverflow(field: Field): boolean {
+  const cellOptions = getCellOptions(field);
+  const eligibleCellType =
+    // Tech debt: Technically image cells are of type string, which is misleading (kinda?)
+    // so we need to ensurefield.type === FieldType.string we don't apply overflow hover states for type image
+    (field.type === FieldType.string && cellOptions.type !== TableCellDisplayMode.Image) ||
+    // regardless of the underlying cell type, data links cells have text overflow.
+    cellOptions.type === TableCellDisplayMode.DataLinks ||
+    // an unwrapped JSON cell collapses its pretty-printed block to a single truncated line, so
+    // expanding on hover is the only way to read the value short of opening the inspector.
+    rendersAsJson(field, cellOptions.type);
+
+  return eligibleCellType && !shouldTextWrap(field) && !isCellInspectEnabled(field);
+}
+
+// we only want to infer justifyContent and textAlign for these cellTypes
+const TEXT_CELL_TYPES = new Set<TableCellDisplayMode>([
+  TableCellDisplayMode.Auto,
+  TableCellDisplayMode.ColorText,
+  TableCellDisplayMode.ColorBackground,
+]);
+
+/**
+ * @internal
+ * Returns the text-align value for inline-displayed cells for a field based on its type and configuration.
+ */
+export function getAlignment(field: Field): TextAlign {
+  const align: FieldTextAlignment | undefined = field.config.custom?.align;
+
+  if (!align || align === 'auto') {
+    if (TEXT_CELL_TYPES.has(getCellOptions(field).type) && field.type === FieldType.number) {
+      return 'right';
+    }
+    return 'left';
+  }
+
+  return align;
+}
+
+const DEFAULT_CELL_OPTIONS = { type: TableCellDisplayMode.Auto } as const;
+
+/**
+ * @internal
+ * Returns the cell options for a field, migrating from legacy displayMode if necessary.
+ * TODO: remove live migration in favor of doing it in dashboard or panel migrator
+ */
+export function getCellOptions(field: Field): TableCellOptions {
+  if (field.config.custom?.displayMode) {
+    return migrateTableDisplayModeToCellOptions(field.config.custom?.displayMode);
+  }
+
+  return field.config.custom?.cellOptions ?? DEFAULT_CELL_OPTIONS;
+}
+
+/**
+ * @internal
+ * Getting gauge or sparkline values to align is very tricky without looking at all values and passing them through display processor.
+ * For very large tables that could pretty expensive. So this is kind of a compromise. We look at the first 1000 rows and cache the longest value.
+ * If we have a cached value we just check if the current value is longer and update the alignmentFactor. This can obviously still lead to
+ * unaligned gauges but it should a lot less common.
+ **/
+export function getAlignmentFactor(
+  field: Field,
+  displayValue: DisplayValue,
+  rowIndex: number
+): DisplayValueAlignmentFactors {
+  let alignmentFactor = field.state?.alignmentFactors;
+
+  if (alignmentFactor) {
+    // check if current alignmentFactor is still the longest
+    if (formattedValueToString(alignmentFactor).length < formattedValueToString(displayValue).length) {
+      alignmentFactor = { ...displayValue };
+      field.state!.alignmentFactors = alignmentFactor;
+    }
+    return alignmentFactor;
+  } else {
+    // look at the next 1000 rows
+    alignmentFactor = { ...displayValue };
+    const maxIndex = Math.min(field.values.length, rowIndex + 1000);
+
+    for (let i = rowIndex + 1; i < maxIndex; i++) {
+      const nextDisplayValue = field.display?.(field.values[i]) ?? field.values[i];
+      if (formattedValueToString(alignmentFactor).length > formattedValueToString(nextDisplayValue).length) {
+        alignmentFactor.text = displayValue.text;
+      }
+    }
+
+    if (field.state) {
+      field.state.alignmentFactors = alignmentFactor;
+    } else {
+      field.state = { alignmentFactors: alignmentFactor };
+    }
+
+    return alignmentFactor;
+  }
+}
+
+/* ------------------------- Cell color calculation ------------------------- */
+const CELL_COLOR_DARKENING_MULTIPLIER = 10;
+const CELL_GRADIENT_HUE_ROTATION_DEGREES = 5;
+
+/**
+ * @internal
+ * Returns the text and background colors for a table cell based on its options and display value.
+ */
+export function getCellColorInlineStylesFactory(theme: GrafanaTheme2) {
+  const bgCellTextColor = memoize((color: string) => getTextColorForAlphaBackground(color, theme.isDark), {
+    maxSize: 1000,
+  });
+  const darkeningFactor = theme.isDark ? 1 : -0.7; // How much to darken elements depends upon if we're in dark mode
+  const gradientBg = memoize(
+    (color: string) =>
+      tinycolor(color)
+        .darken(CELL_COLOR_DARKENING_MULTIPLIER * darkeningFactor)
+        .spin(CELL_GRADIENT_HUE_ROTATION_DEGREES)
+        .toRgbString(),
+    { maxSize: 1000 }
+  );
+  const isTransparent = memoize(
+    (color: string) => {
+      // if hex, do the simple thing.
+      if (color[0] === '#') {
+        return color.length === 9 && color.endsWith('00');
+      }
+      // if not hex, just use tinycolor to avoid extra logic.
+      return tinycolor(color).getAlpha() === 0;
+    },
+    { maxSize: 1000 }
+  );
+
+  return (cellOptions: TableCellOptions, displayValue: DisplayValue, hasApplyToRow: boolean): CSSProperties => {
+    const result: CSSProperties = {};
+    const displayValueColor = displayValue.color;
+
+    if (!displayValueColor) {
+      return result;
+    }
+
+    if (cellOptions.type === TableCellDisplayMode.ColorText) {
+      result.color = displayValueColor;
+    } else if (cellOptions.type === TableCellDisplayMode.ColorBackground) {
+      // return without setting anything if the bg is transparent. this allows
+      // the cell to inherit the row bg color if `applyToRow` is set.
+      if (hasApplyToRow && isTransparent(displayValueColor)) {
+        return result;
+      }
+
+      const mode = cellOptions.mode ?? TableCellBackgroundDisplayMode.Gradient;
+      result.color = bgCellTextColor(displayValueColor);
+      result.background =
+        mode === TableCellBackgroundDisplayMode.Gradient
+          ? `linear-gradient(120deg, ${gradientBg(displayValueColor)}, ${displayValueColor})`
+          : displayValueColor;
+    }
+
+    return result;
+  };
+}
+
+/**
+ * @internal
+ * Extracts numeric pixel value from theme spacing
+ */
+export const extractPixelValue = (spacing: string | number): number => {
+  return typeof spacing === 'number' ? spacing : parseFloat(spacing) || 0;
+};
+
+export { getCellLinks } from './cellLinks';
+
+/**
+ * @internal
+ * Processes nested table rows
+ */
+const processNestedTableRows = (rows: TableRow[], processParents: (parents: TableRow[]) => TableRow[]): TableRow[] => {
+  // Separate parent and child rows
+  // Array for parentRows: enables sorting and maintains order for iteration
+  // Map for childRows: provides O(1) lookup by parent index when reconstructing the result
+  const parentRows: TableRow[] = [];
+  const childRows: Map<number, TableRow> = new Map();
+
+  for (const row of rows) {
+    if (row.__depth === 0) {
+      parentRows.push(row);
+    } else {
+      childRows.set(row.__index, row);
+    }
+  }
+
+  // Process parent rows (filter or sort)
+  const processedParents = processParents(parentRows);
+
+  // Reconstruct the result
+  const result: TableRow[] = [];
+  for (const row of processedParents) {
+    result.push(row);
+    const childRow = childRows.get(row.__index);
+    if (childRow) {
+      result.push(childRow);
+    }
+  }
+
+  return result;
+};
+
+/* ----------------------------- Data grid sorting ---------------------------- */
+/**
+ * @internal
+ * Columns are sortable unless explicitly disabled. Shared by the column definitions, the header
+ * cell, and the width/height measurement, which reserve room for the sort arrow.
+ */
+export function isSortableField(field: Field): boolean {
+  return field.config.custom?.sortable !== false;
+}
+
+/**
+ * @internal
+ */
+export function applySort(
+  rows: TableRow[],
+  fields: Field[],
+  sortColumns: SortColumn[],
+  columnTypes: ColumnTypes,
+  hasNestedFrames?: boolean
+): TableRow[] {
+  if (sortColumns.length === 0) {
+    return rows;
+  }
+
+  const sortNanos = sortColumns.map(
+    (c) => fields.find((f) => f.type === FieldType.time && getDisplayName(f) === c.columnKey)?.nanos
+  );
+
+  const compareRows = (a: TableRow, b: TableRow): number => {
+    let result = 0;
+
+    for (let i = 0; i < sortColumns.length; i++) {
+      const { columnKey, direction } = sortColumns[i];
+      const compare = getComparator(columnTypes[columnKey]);
+      const sortDir = direction === 'ASC' ? 1 : -1;
+
+      result = sortDir * compare(a[columnKey], b[columnKey]);
+
+      if (result === 0) {
+        const nanos = sortNanos[i];
+
+        if (nanos !== undefined) {
+          result = sortDir * (nanos[a.__index] - nanos[b.__index]);
+        }
+      }
+
+      if (result !== 0) {
+        break;
+      }
+    }
+
+    return result;
+  };
+
+  return hasNestedFrames
+    ? processNestedTableRows(rows, (parents) => parents.sort(compareRows))
+    : [...rows].sort(compareRows);
+}
+
+export interface ApplyFilterResult {
+  crossFilterOrder: string[];
+  crossFilterRows: Record<string, TableRow[]>;
+  crossFilterTailRows: TableRow[];
+  filteredRows: TableRow[];
+}
+
+/**
+ * @internal
+ * Applies active filters to `rows` and computes cross-filter metadata for filter popup UIs.
+ *
+ * Filters are chained sequentially so that for each filter key, `crossFilterRows[key]`
+ * holds the rows available *before* that filter was applied (i.e. the rows that passed all
+ * preceding filters in the same scope). `crossFilterTailRows` holds the rows that survive
+ * *all* filters — used for new filters that have not yet been applied.
+ *
+ * `filteredRows` is the display-ready result: equal to `crossFilterTailRows` for flat tables,
+ * or wrapped with `processNestedTableRows` to preserve parent-child structure when
+ * `hasNestedFrames` is true.
+ *
+ * When called for a nested table instance, pass `parentIndex` to scope filters to that level.
+ */
+export function applyFilter(
+  rows: TableRow[],
+  filter: FilterType,
+  fields: Field[],
+  hasNestedFrames?: boolean,
+  parentIndex?: number
+): ApplyFilterResult {
+  // Scope rows to the relevant nesting level
+  const isNested = parentIndex !== undefined;
+  const scopedRows = !isNested ? rows.filter((r) => r.__depth === 0) : rows;
+
+  // Collect filter keys that belong to this scope (preserving JS insertion order)
+  const crossFilterOrder = Object.keys(filter).filter((key) => {
+    const entry = filter[key];
+    return !isNested ? entry.parentIndex == null : entry.parentIndex === parentIndex;
+  });
+
+  const crossFilterRows: Record<string, TableRow[]> = {};
+  let crossFilterTailRows = scopedRows;
+
+  for (const filterKey of crossFilterOrder) {
+    const filterEntry = filter[filterKey];
+    // Store rows available *before* this filter is applied
+    crossFilterRows[filterKey] = crossFilterTailRows;
+    // Advance the chain by applying this filter
+    crossFilterTailRows = crossFilterTailRows.filter((row) => {
+      const field = fields.find((f) => getDisplayName(f) === filterEntry.displayName);
+      if (!field || !field.display) {
+        return true;
+      }
+      const displayedValue = formattedValueToString(field.display(row[filterEntry.displayName]));
+      return filterEntry.filteredSet.has(displayedValue);
+    });
+  }
+
+  // For nested frames, wrap with processNestedTableRows so parent rows that have matching
+  // children are preserved for the expander UI. Use a Set for O(1) membership checks.
+  let filteredRows = crossFilterTailRows;
+  if (hasNestedFrames) {
+    const tailSet = new Set(crossFilterTailRows);
+    filteredRows = processNestedTableRows(rows, (parents) => parents.filter((row) => tailSet.has(row)));
+  }
+
+  return { crossFilterOrder, crossFilterRows, crossFilterTailRows, filteredRows };
+}
+
+/* ----------------------------- Data grid mapping ---------------------------- */
+// Row metadata keys that must never be shadowed by a same-named data column when
+// building rows via prototype getters (a column named e.g. "__index" would otherwise
+// override the metadata that every cell lookup depends on).
+const RESERVED_ROW_KEYS = new Set(['__depth', '__index', '__parentIndex']);
+
+/**
+ * @internal
+ * Builds a converter that maps a DataFrame (struct-of-arrays) into an array of
+ * TableRows (array-of-structs) without eval/`unsafe-eval`.
+ *
+ * Rather than copying every cell value into each row (which forces V8 to use
+ * slow computed-key stores and dominates conversion time on wide frames), each
+ * data row is created from a per-frame prototype that exposes one getter per
+ * column. The getter reads `frame.fields[col].values[this.__index]` on demand,
+ * so construction is O(rows) tiny objects instead of O(rows * cols) writes.
+ *
+ * The `row[displayName]` access contract is preserved for all consumers (sort,
+ * filter, row-height measuring). Note that columns are exposed via the prototype
+ * rather than as own properties, so they do not appear in `Object.keys(row)` /
+ * `JSON.stringify(row)`; no consumer relies on enumerating row own-keys.
+ *
+ * @param displayNames The display names of the frame's fields, in the order they are stored in the frame.
+ * @param nestedFramesFieldName name of the field that contains nested frames. If provided, an expander placeholder row will be emitted for each non-empty nested frame.
+ */
+export function compileFrameToRecords(displayNames: string[], nestedFramesFieldName?: string): FrameToRowsConverter {
+  const nestedColIdx = nestedFramesFieldName ? displayNames.indexOf(nestedFramesFieldName) : -1;
+
+  return (frame: DataFrame, nestedRowIndex?: number): TableRow[] => {
+    const values = frame.fields.map((f) => f.values);
+    const frameLength = frame.length ?? values[0]?.length ?? 0;
+
+    // Build a prototype carrying one getter per column. The nested-frames column
+    // is intentionally not exposed (it is replaced by an expander placeholder row),
+    // and the reserved meta keys are never shadowed by a same-named column so the
+    // true row metadata (notably __index, used to resolve every cell) always wins.
+    const proto = {
+      __depth: -1,
+      __index: -1,
+      __parentIndex: undefined,
+    };
+    const descriptors: PropertyDescriptorMap = {};
+    for (let j = 0; j < displayNames.length; j++) {
+      const name = displayNames[j];
+      if (j === nestedColIdx || RESERVED_ROW_KEYS.has(name)) {
+        continue;
+      }
+      const col = values[j];
+      descriptors[name] = {
+        enumerable: true,
+        get(this: TableRow) {
+          return col[this.__index];
+        },
+      };
+    }
+    Object.defineProperties(proto, descriptors);
+
+    const hasParent = nestedRowIndex != null;
+    const nestedValues = nestedColIdx === -1 ? undefined : values[nestedColIdx];
+
+    const createRow = (index: number, depth: number): TableRow => {
+      const row: TableRow = Object.create(proto);
+      row.__depth = depth;
+      row.__index = index;
+      if (hasParent) {
+        row.__parentIndex = nestedRowIndex;
+      }
+      return row;
+    };
+
+    // Fast path: without a nested-frames column the output is exactly one row
+    // per frame entry, so it can be sized up front and written by index.
+    if (nestedValues === undefined) {
+      const result = Array(frameLength);
+      for (let i = 0; i < frameLength; i++) {
+        result[i] = createRow(i, 0);
+      }
+      return result;
+    }
+
+    // Nested path: each entry may emit an extra expander placeholder row, so the
+    // final length isn't known without inspecting the nested column.
+    const rows: TableRow[] = [];
+    for (let i = 0; i < frameLength; i++) {
+      rows.push(createRow(i, 0));
+      if (nestedValues[i]) {
+        rows.push({ __depth: 1, __index: i });
+      }
+    }
+
+    return rows;
+  };
+}
+
+/* ----------------------------- Data grid comparator ---------------------------- */
+// The numeric: true option is used to sort numbers as strings correctly. It recognizes numeric sequences
+// within strings and sorts numerically instead of lexicographically.
+const compare = new Intl.Collator('en', { sensitivity: 'base', numeric: true }).compare;
+const strCompare: Comparator = (a, b) => compare(String(a ?? ''), String(b ?? ''));
+const numCompare: Comparator = (a, b) => {
+  if (a === b) {
+    return 0;
+  }
+  if (a == null) {
+    return -1;
+  }
+  if (b == null) {
+    return 1;
+  }
+  return Number(a) - Number(b);
+};
+const frameCompare: Comparator = (a, b) => {
+  // @ts-ignore The compared vals are DataFrameWithValue. the value is the rendered stat (first, last, etc.)
+  return (a?.value ?? 0) - (b?.value ?? 0);
+};
+
+/**
+ * @internal
+ */
+export function getComparator(sortColumnType: FieldType): Comparator {
+  switch (sortColumnType) {
+    // Handle sorting for frame type fields (sparklines)
+    case FieldType.frame:
+      return frameCompare;
+    case FieldType.time:
+    case FieldType.number:
+    case FieldType.boolean:
+      return numCompare;
+    case FieldType.string:
+    case FieldType.enum:
+    default:
+      return strCompare;
+  }
+}
+
+type TableCellGaugeDisplayModes =
+  | TableCellDisplayMode.BasicGauge
+  | TableCellDisplayMode.GradientGauge
+  | TableCellDisplayMode.LcdGauge;
+const TABLE_CELL_GAUGE_DISPLAY_MODES_TO_DISPLAY_MODES: Record<TableCellGaugeDisplayModes, BarGaugeDisplayMode> = {
+  [TableCellDisplayMode.BasicGauge]: BarGaugeDisplayMode.Basic,
+  [TableCellDisplayMode.GradientGauge]: BarGaugeDisplayMode.Gradient,
+  [TableCellDisplayMode.LcdGauge]: BarGaugeDisplayMode.Lcd,
+};
+
+type TableCellColorBackgroundDisplayModes =
+  | TableCellDisplayMode.ColorBackground
+  | TableCellDisplayMode.ColorBackgroundSolid;
+const TABLE_CELL_COLOR_BACKGROUND_DISPLAY_MODES_TO_DISPLAY_MODES: Record<
+  TableCellColorBackgroundDisplayModes,
+  TableCellBackgroundDisplayMode
+> = {
+  [TableCellDisplayMode.ColorBackground]: TableCellBackgroundDisplayMode.Gradient,
+  [TableCellDisplayMode.ColorBackgroundSolid]: TableCellBackgroundDisplayMode.Basic,
+};
+
+/* ---------------------------- Miscellaneous ---------------------------- */
+/**
+ * Migrates table cell display mode to new object format.
+ *
+ * @param displayMode The display mode of the cell
+ * @returns TableCellOptions object in the correct format
+ * relative to the old display mode.
+ */
+export function migrateTableDisplayModeToCellOptions(displayMode: TableCellDisplayMode): TableCellOptions {
+  switch (displayMode) {
+    // In the case of the gauge we move to a different option
+    case TableCellDisplayMode.BasicGauge:
+    case TableCellDisplayMode.GradientGauge:
+    case TableCellDisplayMode.LcdGauge:
+      return {
+        type: TableCellDisplayMode.Gauge,
+        mode: TABLE_CELL_GAUGE_DISPLAY_MODES_TO_DISPLAY_MODES[displayMode],
+      };
+    // Also true in the case of the color background
+    case TableCellDisplayMode.ColorBackground:
+    case TableCellDisplayMode.ColorBackgroundSolid:
+      return {
+        type: TableCellDisplayMode.ColorBackground,
+        mode: TABLE_CELL_COLOR_BACKGROUND_DISPLAY_MODES_TO_DISPLAY_MODES[displayMode],
+      };
+    // catching a nonsense case: `displayMode`: 'custom' should pre-date the CustomCell.
+    // if it doesn't, we need to just nope out and return an auto cell.
+    case TableCellDisplayMode.Custom:
+      return {
+        type: TableCellDisplayMode.Auto,
+      };
+    default:
+      return {
+        type: displayMode,
+      };
+  }
+}
+
+/**
+ * @internal
+ * Returns unique key for each row
+ */
+export function rowKeyGetter(row: TableRow): string {
+  return row.__index + '_' + row.__depth;
+}
+
+/**
+ * @internal
+ * Calculate the footer height based on the maximum reducer count
+ */
+export const calculateFooterHeight = (fields: Field[]): number => {
+  let maxReducerCount = 0;
+  for (const field of fields) {
+    maxReducerCount = Math.max(maxReducerCount, field.config.custom?.footer?.reducers?.length ?? 0);
+  }
+
+  // Base height (+ padding) + height per reducer
+  return maxReducerCount > 0 ? maxReducerCount * TABLE.LINE_HEIGHT + TABLE.CELL_PADDING * 2 : 0;
+};
+
+/**
+ * @internal
+ * returns the display name of a field
+ * returns the display name of a field.
+ * We intentionally do not want to use @grafana/data's getFieldDisplayName here,
+ * instead we have a call to cacheFieldDisplayNames up in TablePanel to handle this
+ * before we begin.
+ */
+export const getDisplayName = (field: Field): string => {
+  return field.state?.displayName ?? field.name;
+};
+
+/**
+ * @internal given a field name or display name, returns a predicate function that checks if a field matches that name.
+ */
+export const predicateByName = (name: string) => (f: Field) => f.name === name || getDisplayName(f) === name;
+
+/**
+ * @internal
+ * returns only fields that are not nested tables and not explicitly hidden
+ */
+export function getVisibleFields(fields: Field[]): Field[] {
+  return fields.filter((field) => field.type !== FieldType.nestedFrames && field.config.custom?.hideFrom?.viz !== true);
+}
+
+/**
+ * @internal
+ * returns a map of column types by display name
+ */
+export function getColumnTypes(fields: Field[]): ColumnTypes {
+  return fields.reduce<ColumnTypes>((acc, field) => {
+    switch (field.type) {
+      case FieldType.nestedFrames:
+        return { ...acc, ...getColumnTypes(field.values[0]?.[0]?.fields ?? []) };
+      default:
+        return { ...acc, [getDisplayName(field)]: field.type };
+    }
+  }, {});
+}
+
+/**
+ * @internal
+ * calculates the width of each field, with the following logic:
+ * 1. manual sizing minWidth is hard-coded to 50px, we set this in RDG since it enforces the hard limit correctly
+ * 2. if minWidth is configured in fieldConfig (or defaults to 150), it serves as the bottom of the auto-size clamp
+ */
+export function computeColWidths(fields: Field[], availWidth: number) {
+  let autoCount = 0;
+  let definedWidth = 0;
+
+  return (
+    fields
+      // first pass to add up how many fields have pre-defined widths and what that width totals to.
+      .map((field) => {
+        const width: number = field.config.custom?.width ?? 0;
+
+        if (width === 0) {
+          autoCount++;
+        } else {
+          definedWidth += width;
+        }
+
+        return width;
+      })
+      // second pass once `autoCount` and `definedWidth` are known.
+      .map(
+        (width, i) =>
+          width ||
+          Math.max(fields[i].config.custom?.minWidth ?? COLUMN.DEFAULT_WIDTH, (availWidth - definedWidth) / autoCount)
+      )
+  );
+}
+
+// Bounds the amount of work content-aware sizing does. We sample at most MAX_SAMPLE rows per
+// column and shrink the per-column sample as the column count grows so a very wide frame doesn't
+// blow up the measurement budget. The sample is spread evenly across the whole field (see
+// sampleIndices) rather than taken from the front, so a sorted or clustered column isn't sized from
+// just its first — e.g. smallest — values.
+const TARGET_MEASUREMENTS = 2000;
+const MIN_SAMPLE = 20;
+const MAX_SAMPLE = 100;
+
+/**
+ * Evenly-spaced row indices spanning the whole field, inclusive of the first and last rows. Sizing
+ * from the first N rows biases sorted/clustered columns (an ascending column would be measured from
+ * its shortest values, an alphabetical one from a single letter); spreading the sample across the
+ * field — and always including the last row — captures the extremes wherever the sort puts them.
+ * Deterministic on purpose: true random sampling would make column widths jitter between recomputes.
+ */
+function sampleIndices(totalLen: number, sampleSize: number): number[] {
+  const n = Math.min(sampleSize, totalLen);
+  if (n <= 0) {
+    return [];
+  }
+  if (n === 1) {
+    return [0];
+  }
+  const step = (totalLen - 1) / (n - 1);
+  const indices = new Array<number>(n);
+  for (let k = 0; k < n; k++) {
+    indices[k] = Math.round(k * step);
+  }
+  return indices;
+}
+
+export interface ContentAwareColWidthsOptions {
+  hasAssistantAction?: boolean;
+  typographyCtx: TypographyCtx;
+  /**
+   * Header labels render at `fontWeightMedium`, which is wider than the body text `typographyCtx`
+   * measures, so headers get their own context and a column that hugs its header doesn't
+   * ellipsize the title.
+   */
+  headerTypographyCtx: TypographyCtx;
+  showTypeIcons?: boolean;
+  /**
+   * Whether the table renders a header row. When it doesn't, the header label is not a lower bound on
+   * the column, so it is left out of the measurement entirely. Defaults to true.
+   */
+  hasHeader?: boolean;
+  /** Bound `(field, rowIdx) => actions`, so Actions columns can be sized to their button labels. */
+  getActions?: GetActionsFunctionLocal;
+  /** `table.refresh`: a filterable column reserves the column menu button instead of a filter icon. */
+  tableRefreshEnabled?: boolean;
+  theme?: GrafanaTheme2;
+  /**
+   * Active filters. Under `table.refresh` a filtered column also reserves space for the persistent
+   * filter icon that marks it — unlike the sort arrow, that icon only exists while the state holds.
+   */
+  filter?: FilterType;
+  /** The first column carries extra inline-start padding to line up with the panel title. */
+  noPanelPadding?: boolean;
+  /**
+   * Truncate rather than scroll: auto columns are levelled down to fit `availWidth` even when their
+   * content doesn't wrap, so an embedding layout that has already reserved room for every column
+   * doesn't lose the last of them behind a horizontal scrollbar.
+   */
+  preventHorizontalOverflow?: boolean;
+  /** overridable for testing; otherwise derived from the auto-column count */
+  sampleSize?: number;
+}
+
+/** Formats a raw cell value the way it renders, so we measure what the user actually sees. */
+function formatCellValue(field: Field, value: unknown): string {
+  if (value == null) {
+    return '';
+  }
+  // AutoCell renders field.display(value) for every field type, so measure the same thing.
+  // String fields go through it too: they can carry units, value mappings, or other formatting.
+  if (field.display != null) {
+    return formattedValueToString(field.display(value));
+  }
+  return String(value);
+}
+
+/**
+ * Estimates the pixel width of the longest content in a field from character count. Width is
+ * proportional to length under `avgCharWidth`, so the longest-by-length value is the widest — we
+ * just track the max length and scale it, no per-value canvas measurement. This trades exact
+ * proportional-font width (e.g. "WWW" vs "iiiiii") for a cheap estimate the global cap bounds.
+ */
+function measureLongestContentWidth(field: Field, sampleSize: number, avgCharWidth: number): number {
+  let maxLen = 0;
+  for (const i of sampleIndices(field.values.length, sampleSize)) {
+    maxLen = Math.max(maxLen, formatCellValue(field, field.values[i]).length);
+  }
+  return maxLen * avgCharWidth;
+}
+
+/**
+ * Like {@link measureLongestContentWidth} but measures the longest single line rather than the whole
+ * string. For content that renders as a pre-formatted multi-line block (JSON), the total length is
+ * dominated by newlines and indentation and would wildly over-size the column; the rendered width is
+ * the widest line.
+ */
+function measureLongestLineWidth(field: Field, sampleSize: number, avgCharWidth: number): number {
+  let maxLen = 0;
+  for (const i of sampleIndices(field.values.length, sampleSize)) {
+    for (const line of formatCellValue(field, field.values[i]).split('\n')) {
+      maxLen = Math.max(maxLen, line.length);
+    }
+  }
+  return maxLen * avgCharWidth;
+}
+
+/**
+ * Width for cells holding several chips/links/buttons that flow horizontally and wrap (pills, data
+ * links, actions). Since a cell holds multiple items, we size to an *average row's* combined item
+ * width (per-item `chrome` + inter-item `gap`) rather than the single longest value, so long runs
+ * wrap to a few lines rather than one item per line once the global cap applies. The floor is the
+ * widest single item so none is ever clipped.
+ *
+ * `itemsForRow` returns the display text of each item in a sampled row; `indices` are the sampled
+ * rows (see sampleIndices).
+ */
+function measureInlineRunWidth(
+  indices: number[],
+  itemsForRow: (rowIdx: number) => string[],
+  avgCharWidth: number,
+  chrome: number,
+  gap: number,
+  // When the items stack vertically instead of flowing horizontally (e.g. a wrapped DataLinks cell
+  // lays its links out in a column), the width follows the widest single item, not the row's run.
+  stack = false
+): number {
+  let widestItem = 0;
+  let rowTotalSum = 0;
+  let sampledRows = 0;
+
+  for (const i of indices) {
+    const items = itemsForRow(i);
+    if (items.length === 0) {
+      continue;
+    }
+
+    let rowTotal = 0;
+    for (const text of items) {
+      const itemWidth = text.length * avgCharWidth + chrome;
+      widestItem = Math.max(widestItem, itemWidth);
+      rowTotal += itemWidth;
+    }
+    rowTotal += gap * (items.length - 1);
+    rowTotalSum += rowTotal;
+    sampledRows++;
+  }
+
+  if (sampledRows === 0) {
+    return 0;
+  }
+
+  return stack ? widestItem : Math.max(rowTotalSum / sampledRows, widestItem);
+}
+
+/**
+ * Width the header label needs, including its filter/sort/type-icon affordances.
+ *
+ * Canvas-measured exactly rather than estimated from `avgCharWidth`: this is a hard lower bound on
+ * the column, so an under-estimate truncates the title outright — and it's one short string per
+ * column, not a sample across many rows.
+ *
+ * Sort-arrow space is reserved for every sortable column, whether or not it is currently sorted:
+ * reserving it only for the sorted column would make every auto width a function of the sort state,
+ * so clicking a header would resize the whole table (the sorted column gains the arrow's width, and
+ * that shifts every other column's share of the leftover space).
+ */
+export interface HeaderAffordanceOptions {
+  hasAssistantAction?: boolean;
+  showTypeIcons: boolean;
+  tableRefreshEnabled: boolean;
+  /** Whether a filter is currently active on this column — only the refreshed header marks that. */
+  isFiltered: boolean;
+}
+
+/**
+ * @internal Horizontal space the header's affordances take beside the label.
+ *
+ * The single description of what sits next to a header's text, so the two paths that care can't
+ * drift: `measureHeaderWidth` adds it when sizing an auto column, and `useHeaderHeight` subtracts it
+ * to find the room a wrapped label has.
+ */
+export function getHeaderAffordanceWidth(
+  field: Field,
+  { showTypeIcons, tableRefreshEnabled, isFiltered, hasAssistantAction }: HeaderAffordanceOptions
+): number {
+  const isFilterable = field.config.custom?.filterable ?? false;
+  let width = 0;
+  width += showTypeIcons ? HEADER_ICON_SPACE : 0;
+  // reserved on every sortable column, not just the currently-sorted one, so a wrapped header doesn't
+  // gain a line (shifting the whole grid down) the moment it's sorted.
+  width += isSortableField(field) ? HEADER_ICON_SPACE : 0;
+  // `headerTooltip` renders its info button in both header variants, and like the sort arrow above it
+  // is there for as long as the option is set rather than only while some state holds.
+  width += field.config.custom?.headerTooltip ? HEADER_TOOLTIP_SPACE : 0;
+  if (tableRefreshEnabled) {
+    // the refreshed header replaces the inline filter icon with a hover-revealed column menu, which
+    // stays in flow (opacity-faded, not unmounted) whenever filtering or Assistant is available.
+    width += isFilterable || hasAssistantAction ? HEADER_MENU_SPACE : 0;
+    // an active filter additionally marks itself with a persistent icon. Unlike the arrow, that icon
+    // only exists while the filter holds, so its space is reserved only then (the widths recompute
+    // when the filter changes).
+    width += isFiltered ? HEADER_ICON_SPACE : 0;
+  } else {
+    // the classic header renders its filter icon inline whenever the column is filterable, whether
+    // or not a filter is currently active.
+    width += isFilterable ? HEADER_ICON_SPACE : 0;
+  }
+  return width;
+}
+
+function measureHeaderWidth(field: Field, ctx: TypographyCtx, opts: HeaderAffordanceOptions): number {
+  return ctx.measureWidth(getDisplayName(field)) + CELL_HORIZONTAL_CHROME + getHeaderAffordanceWidth(field, opts);
+}
+
+// gap between a footer reducer's label and its value (theme.spacing(0.5), matches SummaryCell).
+const FOOTER_LABEL_GAP = 4;
+
+// Reducers the footer renders unformatted (raw count), skipping the field's display processor —
+// mirrors SummaryCell so a count on a time/unit column isn't measured as a formatted value.
+const FOOTER_UNFORMATTED_REDUCERS = new Set<string>([ReducerID.count, ReducerID.countAll]);
+
+/**
+ * Width a column's footer/summary cell needs. Each reducer renders label + value inline, so
+ * size to the widest reducer row; returns 0 if no footer. Values computed/formatted as the
+ * footer renders them.
+ *
+ * Label and value are canvas-measured exactly (medium-weight header context), not estimated via
+ * `avgCharWidth` — footer values are digit/symbol/unit-heavy and the label is `flex-shrink: 0`,
+ * so an under-measure would truncate the value. (Label renders slightly smaller than header font
+ * in practice, so this slightly over-reserves — safe direction.)
+ */
+function measureFooterWidth(field: Field, headerCtx: TypographyCtx): number {
+  const reducers = field.config.custom?.footer?.reducers;
+  if (reducers == null || reducers.length === 0) {
+    return 0;
+  }
+  // Reduce over a copy with its own `state` so we never touch the shared `field.state.calcs`:
+  // reduceField reads and writes that cache, and the footer (useReducerEntries) relies on it —
+  // reducing the full, unfiltered values here would otherwise leave the footer showing whole-dataset
+  // stats while the table is filtered.
+  const results = reduceField({ field: { ...field, state: undefined }, reducers });
+  let widest = 0;
+  for (const id of reducers) {
+    // SummaryCell uppercases the label; the value goes through the display processor (except the raw
+    // count reducers, which render unformatted).
+    const label = (fieldReducers.get(id)?.name ?? id).toUpperCase();
+    const value = results[id];
+    let valueText = '';
+    if (value != null) {
+      valueText = FOOTER_UNFORMATTED_REDUCERS.has(id) ? String(value) : formatCellValue(field, value);
+    }
+    // kerned whole-string widths, deliberately: footer text is `nowrap` and never line-counted, so
+    // unlike a header label it wants the width the browser draws, not the width uwrap would assume.
+    const rowWidth =
+      headerCtx.ctx.measureText(label).width + FOOTER_LABEL_GAP + headerCtx.ctx.measureText(valueText).width;
+    widest = Math.max(widest, rowWidth);
+  }
+
+  return widest + CELL_HORIZONTAL_CHROME;
+}
+
+interface ColWidthMeasureCtx {
+  typographyCtx: TypographyCtx;
+  /** Bound `(field, rowIdx) => actions`, used to size Actions columns; absent when not wired. */
+  getActions?: GetActionsFunctionLocal;
+  theme?: GrafanaTheme2;
+}
+
+/**
+ * A cell type's content-width strategy: the width its content wants, including any horizontal
+ * chrome. The caller unions this with the header width and clamps it to `[floor, cap]`.
+ */
+type MeasureColWidth = (field: Field, sampleSize: number, ctx: ColWidthMeasureCtx) => number;
+
+// Graphical cells don't render free text — gauges need bar room, sparklines/geo are pictorial — so
+// they take a fixed default instead of being measured.
+const measureGraphicalColWidth: MeasureColWidth = () => COLUMN.DEFAULT_WIDTH;
+
+// Images scale to the cell (object-fit: contain), so a wide column is mostly whitespace — a small
+// fixed default reads better than the graphical default.
+const measureImageColWidth: MeasureColWidth = () => COLUMN.IMAGE_WIDTH;
+
+const measurePillColWidth: MeasureColWidth = (field, sampleSize, { typographyCtx, theme }) => {
+  const { spacing, gap } = getPillMetrics(theme);
+  return (
+    measureInlineRunWidth(
+      sampleIndices(field.values.length, sampleSize),
+      // PillCell renders formattedValueToString(field.display(pill)); estimate from that same text so
+      // value mappings/units are reflected. formatCellValue falls back to String() with no display.
+      (i) => inferPills(field.values[i]).map((pill) => formatCellValue(field, pill)),
+      typographyCtx.avgCharWidth,
+      spacing,
+      gap
+    ) + CELL_HORIZONTAL_CHROME
+  );
+};
+
+const measureDataLinksColWidth: MeasureColWidth = (field, sampleSize, { typographyCtx }) =>
+  measureInlineRunWidth(
+    sampleIndices(field.values.length, sampleSize),
+    // DataLinksCell renders one <a> per link title; getCellLinks resolves the same links per row.
+    (i) => getCellLinks(field, i)?.map((link) => link.title ?? '') ?? [],
+    typographyCtx.avgCharWidth,
+    LINK_SPACING,
+    LINK_GAP,
+    // when wrapping, DataLinksCell stacks its links vertically, so size to the widest single link.
+    shouldTextWrap(field)
+  ) + CELL_HORIZONTAL_CHROME;
+
+const measureActionsColWidth: MeasureColWidth = (field, sampleSize, { typographyCtx, getActions }) => {
+  if (getActions == null) {
+    return 0; // actions aren't wired in this context; fall back to the header/floor width
+  }
+  return (
+    measureInlineRunWidth(
+      sampleIndices(field.values.length, sampleSize),
+      // ActionsCell renders one Button per action, labelled action.title.
+      (i) => getActions(field, i).map((action) => action.title),
+      typographyCtx.avgCharWidth,
+      ACTION_SPACING,
+      ACTION_GAP
+    ) + CELL_HORIZONTAL_CHROME
+  );
+};
+
+// `avgCharWidth` comes from a prose sample, so it under-estimates digit/symbol-heavy strings like
+// timestamps. String/time columns get a padding's worth of slack to compensate; numeric/boolean
+// columns stay tight on purpose.
+const TEXT_WIDTH_WIGGLE = TABLE.CELL_PADDING;
+
+const measureTextColWidth: MeasureColWidth = (field, sampleSize, { typographyCtx, theme }) => {
+  // Numeric and date/time columns are digit-dominated and render with tabular-nums under
+  // `dataviz.tabularNums`, so estimate them with the (wider, uniform) tabular digit width rather than the
+  // prose average. Without the toggle the grid keeps proportional digits, so fall back to the prose
+  // average and the original wiggle rule (string and time both get slack).
+  if (!theme?.flags.tabularNums) {
+    const width = measureLongestContentWidth(field, sampleSize, typographyCtx.avgCharWidth) + CELL_HORIZONTAL_CHROME;
+    const isText = field.type === FieldType.string || field.type === FieldType.time;
+    return isText ? width + TEXT_WIDTH_WIGGLE : width;
+  }
+
+  const isNumericLike = field.type === FieldType.number || field.type === FieldType.time;
+  const charWidth = isNumericLike ? typographyCtx.numericCharWidth : typographyCtx.avgCharWidth;
+  const width = measureLongestContentWidth(field, sampleSize, charWidth) + CELL_HORIZONTAL_CHROME;
+  // String columns still get slack because the prose average under-measures them; numeric/time now
+  // use the wider tabular width, so they no longer need the extra wiggle.
+  return field.type === FieldType.string ? width + TEXT_WIDTH_WIGGLE : width;
+};
+
+// Markdown always wraps and renders formatted, so its raw source is a poor proxy for rendered width
+// — markup syntax and long link URLs would stretch the column to the cap. Contribute no content
+// width so it sizes to its header and wraps to extra height instead.
+const measureMarkdownColWidth: MeasureColWidth = () => 0;
+
+// JSON pretty-prints to a multi-line block, but its layout depends on wrapping: wrapped renders as
+// `pre`/`pre-line` (newlines preserved), so width is the widest line; unwrapped collapses to a
+// single line, so width is the whole value. Measuring an unwrapped column by its widest line would
+// under-measure and clip it.
+const measureJsonColWidth: MeasureColWidth = (field, sampleSize, { typographyCtx }) => {
+  const measure = shouldTextWrap(field) ? measureLongestLineWidth : measureLongestContentWidth;
+  // JSON renders in a monospace font, so size with the monospace character width.
+  return measure(field, sampleSize, typographyCtx.monoCharWidth) + CELL_HORIZONTAL_CHROME;
+};
+
+// Cell types that size differently from plain text register here; anything absent falls back to
+// measureTextColWidth. Mirrors the buildCellHeightMeasurers factory map.
+const COL_WIDTH_MEASURERS: Partial<Record<TableCellDisplayMode, MeasureColWidth>> = {
+  [TableCellDisplayMode.Sparkline]: measureGraphicalColWidth,
+  [TableCellDisplayMode.Gauge]: measureGraphicalColWidth,
+  [TableCellDisplayMode.BasicGauge]: measureGraphicalColWidth,
+  [TableCellDisplayMode.GradientGauge]: measureGraphicalColWidth,
+  [TableCellDisplayMode.LcdGauge]: measureGraphicalColWidth,
+  [TableCellDisplayMode.Image]: measureImageColWidth,
+  [TableCellDisplayMode.Geo]: measureGraphicalColWidth,
+  [TableCellDisplayMode.Pill]: measurePillColWidth,
+  [TableCellDisplayMode.Actions]: measureActionsColWidth,
+  [TableCellDisplayMode.DataLinks]: measureDataLinksColWidth,
+  [TableCellDisplayMode.Markdown]: measureMarkdownColWidth,
+  [TableCellDisplayMode.JSONView]: measureJsonColWidth,
+};
+
+const DEFAULT_GROWTH_WEIGHT = 1;
+
+// Per-field-type multiplier on a column's share of the panel's leftover space (see the grow step
+// below); types absent here fall back to DEFAULT_GROWTH_WEIGHT. Numeric and boolean values are short
+// and fixed-width, so a smaller weight keeps them tight while strings/dates/pills take most of the
+// slack. A shared weight cancels out, so an all-numeric table still fills the panel.
+const GROWTH_WEIGHTS: Partial<Record<FieldType, number>> = {
+  [FieldType.number]: 0.35,
+  [FieldType.boolean]: 0.35,
+};
+
+function growthWeight(type: FieldType): number {
+  return GROWTH_WEIGHTS[type] ?? DEFAULT_GROWTH_WEIGHT;
+}
+
+// Below half a pixel there's nothing left worth redistributing, and the accumulated float error is
+// the same order as the gain, so the levelling below stops here rather than chasing an exact fit.
+const SHRINK_EPS = 0.5;
+
+// Cell types that reflow their content into extra row height rather than clipping it. Their measured
+// content width is a preference rather than a requirement, so it's the first thing we give back when
+// the table would otherwise overflow the panel.
+function isReflowingCol(field: Field, resolvedType: TableCellDisplayMode): boolean {
+  // Markdown renders wrapped whatever `wrapText` says (see measureMarkdownColWidth).
+  return shouldTextWrap(field) || resolvedType === TableCellDisplayMode.Markdown;
+}
+
+// Cell types whose width is chrome rather than text: a gauge, a sparkline, an image, a row of action
+// buttons. There is nothing in them to ellipsize, so squeezing one clips the control itself — they
+// stay at their measured width even under `preventHorizontalOverflow`.
+const UNSHRINKABLE_CELL_TYPES = new Set<TableCellDisplayMode>([
+  TableCellDisplayMode.Sparkline,
+  TableCellDisplayMode.Gauge,
+  TableCellDisplayMode.BasicGauge,
+  TableCellDisplayMode.GradientGauge,
+  TableCellDisplayMode.LcdGauge,
+  TableCellDisplayMode.Image,
+  TableCellDisplayMode.Geo,
+  TableCellDisplayMode.Actions,
+]);
+
+/**
+ * Reclaims up to `deficit` px from `widths` (mutated in place) by levelling its widest entries down:
+ * the widest column is cut to the next-widest, then the two are cut together, and so on. The columns
+ * responsible for the overflow therefore give the space back before their narrower neighbours give
+ * up any, and a column already narrower than the level we land on is never touched at all. No column
+ * goes below its `floors` entry, so this returns less than `deficit` when the floors are hit first.
+ *
+ * Only columns present in `floors` are candidates.
+ */
+function levelDownColWidths(widths: Map<number, number>, floors: Map<number, number>, deficit: number): number {
+  let pool = Array.from(floors.keys()).filter((i) => widths.get(i)! > floors.get(i)! + SHRINK_EPS);
+  let remaining = deficit;
+
+  while (remaining > SHRINK_EPS && pool.length > 0) {
+    const level = Math.max(...pool.map((i) => widths.get(i)!));
+    const tier: number[] = [];
+    let nextLevel = 0;
+    for (const i of pool) {
+      const width = widths.get(i)!;
+      if (width >= level - SHRINK_EPS) {
+        tier.push(i);
+      } else {
+        nextLevel = Math.max(nextLevel, width);
+      }
+    }
+
+    // How deep the current tier can be cut in one pass: down to the next-widest column, down to the
+    // highest floor in the tier, or just far enough to cover what's left of the deficit — whichever
+    // comes first. Each of those outcomes re-tiers the next pass (a wider tier, a smaller pool, or
+    // done), so the loop always makes progress.
+    const tierFloor = Math.max(...tier.map((i) => floors.get(i)!));
+    const step = Math.min(remaining / tier.length, level - nextLevel, level - tierFloor);
+    for (const i of tier) {
+      widths.set(i, widths.get(i)! - step);
+    }
+    remaining -= step * tier.length;
+    pool = pool.filter((i) => widths.get(i)! > floors.get(i)! + SHRINK_EPS);
+  }
+
+  return deficit - remaining;
+}
+
+/**
+ * @internal
+ * Content-aware variant of {@link computeColWidths}. Columns with a configured `custom.width` keep
+ * that exact width. Every other ("auto") column is sized to fit its content:
+ *   1. its cell content (a sampled, display-formatted, measured max) or a per-type default for
+ *      graphical cells, whichever applies, unioned with its header label width (skipped when the
+ *      header row is hidden);
+ *   2. clamped to `[max(MIN_WIDTH, custom.minWidth), MAX_AUTO_WIDTH]`;
+ *   3. then, if the auto columns overflow the available width, the overflow is taken back out of the
+ *      columns that can absorb it, widest first (see {@link levelDownColWidths}): a wrapped column
+ *      trades the width for extra row height, and under `preventHorizontalOverflow` every
+ *      text-bearing column trades it for an ellipsis, either being preferable to a horizontal
+ *      scrollbar;
+ *   4. or, if the auto columns don't fill the available width, the leftover is distributed by a
+ *      growth share of `growthWeight × √(content width)`, so a column with more content still takes
+ *      more slack (a busy pill column beats a sparse one) while the √ damps the spread enough that
+ *      the widest column doesn't run away from its neighbours; numeric/boolean columns grow only
+ *      modestly (see {@link growthWeight}).
+ * When the overflow survives step 3 — nothing able to absorb it, or the floors reached — the
+ * remaining content widths are kept and the grid scrolls.
+ *
+ * Every input is independent of the sort and filter state (fields hold the full, unsorted values),
+ * so widths stay put when the user sorts or filters. See {@link measureHeaderWidth} for the sort
+ * arrow, the one affordance that would otherwise make them sort-dependent.
+ */
+export function computeContentAwareColWidths(
+  fields: Field[],
+  availWidth: number,
+  {
+    typographyCtx,
+    headerTypographyCtx,
+    showTypeIcons = false,
+    hasAssistantAction = false,
+    hasHeader = true,
+    getActions,
+    tableRefreshEnabled = false,
+    theme,
+    filter,
+    sampleSize,
+    noPanelPadding = false,
+    preventHorizontalOverflow = false,
+  }: ContentAwareColWidthsOptions
+): number[] {
+  const autoIdxs: number[] = [];
+  let definedWidth = 0;
+
+  const widths = fields.map((field, i) => {
+    const configured = field.config.custom?.width ?? 0;
+    if (configured) {
+      definedWidth += configured;
+      return configured;
+    }
+    autoIdxs.push(i);
+    return 0;
+  });
+
+  if (autoIdxs.length === 0) {
+    return widths;
+  }
+
+  const effectiveSampleSize =
+    sampleSize ?? Math.min(MAX_SAMPLE, Math.max(MIN_SAMPLE, Math.floor(TARGET_MEASUREMENTS / autoIdxs.length)));
+
+  // content width per auto column, clamped to [floor, cap]
+  const contentWidths = new Map<number, number>();
+  let contentTotal = 0;
+  // lower bound per shrinkable auto column, for the overflow step below; absent for columns that
+  // can't give width back, or that are already sitting at their bound.
+  const shrinkFloors = new Map<number, number>();
+
+  const measureCtx: ColWidthMeasureCtx = { typographyCtx, getActions, theme };
+  // Filter entries are keyed per parent on nested tables, so match on the display name they carry
+  // rather than the key: nested columns share one width, so any active filter widens the column.
+  const filteredKeys = new Set(
+    Object.values(filter ?? {})
+      .filter((entry) => entry.filtered != null)
+      .map((entry) => entry.displayName)
+  );
+
+  for (const i of autoIdxs) {
+    const field = fields[i];
+    // A hidden header row has no label to fit, so it doesn't bound the column at all.
+    const headerWidth = hasHeader
+      ? measureHeaderWidth(field, headerTypographyCtx, {
+          showTypeIcons,
+          tableRefreshEnabled,
+          isFiltered: filteredKeys.has(getDisplayName(field)),
+          hasAssistantAction,
+        })
+      : 0;
+
+    // Size to content (unioned with header width below), even for wrapped columns — the cap bounds
+    // it, wrapping adds height instead. Registered measurer picks pill/link/action/graphical; default is text.
+    const cellType = getCellOptions(field).type;
+    const resolvedType =
+      cellType == null || cellType === TableCellDisplayMode.Auto ? getAutoRendererDisplayMode(field) : cellType;
+    const measure = COL_WIDTH_MEASURERS[resolvedType] ?? measureTextColWidth;
+    const cellWidth = measure(field, effectiveSampleSize, measureCtx);
+    const footerWidth = measureFooterWidth(field, headerTypographyCtx);
+
+    const floor = Math.max(COLUMN.MIN_WIDTH, field.config.custom?.minWidth ?? 0);
+    const cap = Math.max(COLUMN.MAX_AUTO_WIDTH, floor);
+    const clamped = Math.min(Math.max(Math.max(cellWidth, headerWidth, footerWidth), floor), cap);
+    // The first column's extra padding is chrome, not content, so it's added after the cap rather
+    // than eating into the room the content was measured to need.
+    const extraPadding = noPanelPadding && i === 0 ? FIRST_COLUMN_EXTRA_PADDING : 0;
+
+    contentWidths.set(i, clamped + extraPadding);
+    contentTotal += clamped + extraPadding;
+
+    // Two ways a column can give width back rather than push the table into a horizontal scroll: a
+    // wrapped column reflows the content it gives up into extra row height, and under
+    // `preventHorizontalOverflow` the caller has said it would rather see content ellipsized than
+    // scroll, which puts every text-bearing column in play.
+    const canShrink =
+      !UNSHRINKABLE_CELL_TYPES.has(resolvedType) && (isReflowingCol(field, resolvedType) || preventHorizontalOverflow);
+    if (canShrink) {
+      // Anything the column asked for above its header, footer and configured minimum is width it
+      // gives up first. The header label and footer summary can neither reflow nor ellipsize without
+      // costing the column its identity, so they stay a hard bound however it was measured.
+      const shrinkFloor = Math.min(Math.max(headerWidth, footerWidth, floor), cap) + extraPadding;
+      if (shrinkFloor < clamped + extraPadding) {
+        shrinkFloors.set(i, shrinkFloor);
+      }
+    }
+  }
+
+  // Hand the overflow back to the columns that can absorb it — as height, or as an ellipsis — before
+  // letting the grid scroll sideways.
+  const deficit = definedWidth + contentTotal - availWidth;
+  const reclaimed =
+    deficit > SHRINK_EPS && shrinkFloors.size > 0 ? levelDownColWidths(contentWidths, shrinkFloors, deficit) : 0;
+  contentTotal -= reclaimed;
+
+  // Distribute leftover space by growthWeight × √(content width): a column with more content grows
+  // more, but the √ damps the spread so the widest column doesn't run away from its neighbours. If
+  // the columns still overflow after the level-down above, their widths are kept and the grid
+  // scrolls.
+  const growShare = (i: number) => growthWeight(fields[i].type) * Math.sqrt(contentWidths.get(i)!);
+  const growTotal = autoIdxs.reduce((sum, i) => sum + growShare(i), 0);
+
+  const leftover = availWidth - definedWidth - contentTotal;
+  const shouldGrow = leftover > 0 && growTotal > 0;
+  // A level-down that absorbed the whole deficit leaves the columns summing to availWidth exactly,
+  // so rounding up from there would put them straight back over it. One that ran into the floors
+  // still overflows, and takes the round-up path below like any other overflow.
+  const shrankToFit = reclaimed > 0 && leftover > -SHRINK_EPS;
+  // Round cumulatively so the rounded widths sum to the same total as the exact ones. Rounding each
+  // independently can push the total past availWidth and trigger a spurious horizontal scrollbar.
+  let exactSoFar = 0;
+  let roundedSoFar = 0;
+  for (const i of autoIdxs) {
+    const contentWidth = contentWidths.get(i)!;
+    if (!shouldGrow && !shrankToFit) {
+      // No leftover to distribute — the columns already fill or overflow availWidth, so the grid
+      // scrolls regardless and matching the total exactly no longer matters. Round up instead of
+      // cumulatively: a column sitting exactly at its measured content need (canvas measurement is
+      // fractional) has no slack to give up, and cumulative rounding can shave a column below that
+      // need and truncate its header for no benefit.
+      widths[i] = Math.ceil(contentWidth);
+      continue;
+    }
+    const target = shouldGrow ? contentWidth + leftover * (growShare(i) / growTotal) : contentWidth;
+    exactSoFar += target;
+    const rounded = Math.round(exactSoFar) - roundedSoFar;
+    roundedSoFar += rounded;
+    widths[i] = rounded;
+  }
+
+  return widths;
+}
+
+type CellClass<TRow> = string | null | undefined | ((row: TRow) => string | null | undefined);
+
+const appendCellClass = <TRow>(existing: CellClass<TRow>, edgeClass: string): CellClass<TRow> =>
+  typeof existing === 'function' ? (row: TRow) => clsx(existing(row), edgeClass) : clsx(existing, edgeClass);
+
+// react-data-grid types these fields `readonly` for callers building a column once; here we're
+// intentionally mutating an already-built one in place, so we cast that guard away locally.
+type MutableColumnClasses = {
+  -readonly [K in 'headerCellClass' | 'cellClass' | 'summaryCellClass']?: TableColumn[K];
+};
+
+const addEdgeClass = (column: TableColumn, edgeClass: string): void => {
+  const mutable: MutableColumnClasses = column;
+  mutable.headerCellClass = clsx(column.headerCellClass, edgeClass);
+  mutable.cellClass = appendCellClass(column.cellClass, edgeClass);
+  mutable.summaryCellClass = appendCellClass(column.summaryCellClass, edgeClass);
+};
+
+/**
+ * @internal
+ * Tags the edge columns with {@link FIRST_COLUMN_CLASS}/{@link LAST_COLUMN_CLASS}. Call this on the
+ * finished column list, after any programmatically injected columns (the nested table's row
+ * expander) are in place — a field's own index isn't enough to tell whether it ends up on an edge.
+ *
+ * Mutates `columns` (and the edge column objects) in place rather than copying: the list is always
+ * freshly built by the caller right before this call, so there's nothing else holding a reference
+ * that immutability would protect, and it's the same assumption `result.columns.unshift(...)`
+ * already makes elsewhere for the nested expander column.
+ */
+export function markEdgeColumns(fromFieldsResult: FromFieldsResult): undefined {
+  const { columns } = fromFieldsResult;
+  if (columns.length === 0) {
+    return;
+  }
+  addEdgeClass(columns[0], FIRST_COLUMN_CLASS);
+  addEdgeClass(columns[columns.length - 1], LAST_COLUMN_CLASS);
+}
+
+/**
+ * True when a cell keydown is Shift+Tab on the first cell of the first row — the point where focus
+ * should jump back up into the header. `column`/`row` can be undefined for keydowns that aren't on a
+ * data cell (e.g. header/summary rows), so both are guarded.
+ */
+export function isShiftTabToHeader(
+  column: { key: string } | undefined,
+  row: { __index: number } | undefined,
+  event: Pick<KeyboardEvent, 'shiftKey' | 'key'>,
+  firstColumnKey: string
+): boolean {
+  return column?.key === firstColumnKey && row?.__index === 0 && event.shiftKey && event.key === 'Tab';
+}
+
+export function buildNestedColumnWidthsMap(fields: Field[], widths: number[]): ColumnWidths {
+  return new Map<string, ColumnWidth>(
+    fields.map((field, idx) => [getDisplayName(field), { type: 'resized', width: widths[idx] }])
+  );
+}
+
+/**
+ * @internal
+ * if applyToRow is true in any field, return a function that gets the row background color
+ */
+export function getApplyToRowBgFn(
+  fields: Field[],
+  getCellColorInlineStyles: ReturnType<typeof getCellColorInlineStylesFactory>
+): ((rowIndex: number) => CSSProperties) | void {
+  for (const field of fields) {
+    const cellOptions = getCellOptions(field);
+    const fieldDisplay = field.display;
+    if (
+      fieldDisplay !== undefined &&
+      cellOptions.type === TableCellDisplayMode.ColorBackground &&
+      cellOptions.applyToRow === true
+    ) {
+      return (rowIndex: number) => getCellColorInlineStyles(cellOptions, fieldDisplay(field.values[rowIndex]), true);
+    }
+  }
+}
+
+/** @internal */
+export function canFieldBeColorized(
+  cellType: TableCellDisplayMode,
+  applyToRowBgFn?: (rowIndex: number) => CSSProperties
+) {
+  return (
+    cellType === TableCellDisplayMode.ColorBackground ||
+    cellType === TableCellDisplayMode.ColorText ||
+    Boolean(applyToRowBgFn)
+  );
+}
+
+export const displayJsonValue: (field: Field) => DisplayProcessor = (field: Field, decimals?: DecimalCount) => {
+  const origDisplay = field.display!;
+  return (value: unknown): DisplayValue => {
+    const displayValue = origDisplay(value, decimals);
+
+    let jsonText: string;
+    if (!Array.isArray(value) && !isPlainObject(value)) {
+      const formattedValue = formattedValueToString(displayValue);
+      try {
+        const parsed = JSON.parse(formattedValue);
+        jsonText = JSON.stringify(parsed, null, ' ');
+      } catch {
+        jsonText = formattedValue; // Keep original if not valid JSON
+      }
+    } else {
+      try {
+        jsonText = JSON.stringify(value, null, ' ');
+      } catch {
+        // Frame references can be circular; retain the field formatter's representation.
+        jsonText = formattedValueToString(displayValue);
+      }
+    }
+
+    return { ...displayValue, text: jsonText };
+  };
+};
+
+export function prepareSparklineValue(value: unknown, field: Field): FieldSparkline | undefined {
+  if (Array.isArray(value)) {
+    return {
+      y: {
+        name: `${field.name}-sparkline`,
+        type: FieldType.number,
+        values: value,
+        config: {},
+      },
+    };
+  }
+
+  if (isDataFrame(value)) {
+    const timeField = value.fields.find((x) => x.type === FieldType.time);
+    const numberField = value.fields.find((x) => x.type === FieldType.number);
+
+    if (timeField && numberField) {
+      return { x: timeField, y: numberField };
+    }
+  }
+
+  return;
+}
+
+function isPlainObject(value: unknown): value is object {
+  return typeof value === 'object' && value != null && !Array.isArray(value);
+}
+
+export function buildInspectValue(
+  value: unknown,
+  field: Field,
+  formatGeometry?: OpenLayersContextValue['formatGeometry']
+): [string, TableCellInspectorMode] {
+  const cellOptions = getCellOptions(field);
+
+  let inspectValue: string;
+  let mode = TableCellInspectorMode.text;
+
+  if (field.type === FieldType.geo && isGeometry(value)) {
+    inspectValue = formatGeometry ? formatGeometry(value) : JSON.stringify(value, null, '  ');
+    mode = TableCellInspectorMode.code;
+  } else if (
+    cellOptions.type === TableCellDisplayMode.Sparkline ||
+    getAutoRendererDisplayMode(field) === TableCellDisplayMode.Sparkline
+  ) {
+    // rather than JSON.stringify this, manually format it to make the coordinate tuples more legible to the user.
+    const fieldSparkline = prepareSparklineValue(value, field);
+    inspectValue = '[';
+    if (fieldSparkline != null) {
+      // if an x value exists, render as a tuple [x,y], otherwise just y
+      const buildValString: (idx: number) => string =
+        fieldSparkline.x != null
+          ? (idx) => `[${fieldSparkline.x!.values[idx] ?? 'null'}, ${fieldSparkline.y.values[idx] ?? 'null'}]`
+          : (idx) => `${fieldSparkline.y.values[idx] ?? 'null'}`;
+      for (let i = 0; i < fieldSparkline.y.values.length; i++) {
+        inspectValue += `\n  ${buildValString(i)}${i === fieldSparkline.y.values.length - 1 ? '\n' : ','}`;
+      }
+    }
+    inspectValue += ']';
+    mode = TableCellInspectorMode.code;
+  } else if (cellOptions.type === TableCellDisplayMode.JSONView || Array.isArray(value) || isPlainObject(value)) {
+    let toStringify = value;
+    if (typeof value === 'string') {
+      try {
+        toStringify = JSON.parse(value);
+      } catch {
+        // do nothing, toStringify will stay as the raw string
+      }
+    }
+    inspectValue = JSON.stringify(toStringify, null, '  ');
+    mode = TableCellInspectorMode.code;
+  } else {
+    inspectValue = String(value ?? '');
+  }
+
+  return [inspectValue, mode];
+}
+
+export function getSummaryCellTextAlign(textAlign: TextAlign, cellType: TableCellDisplayMode): TextAlign {
+  // gauge is weird. left-aligned gauge has the viz on the left and its numbers on the right, and vice-versa.
+  // if you center-aligned your gauge... ok.
+  if (cellType === TableCellDisplayMode.Gauge) {
+    return (
+      {
+        left: 'right',
+        right: 'left',
+        center: 'center',
+      } as const
+    )[textAlign];
+  }
+
+  return textAlign;
+}
+
+// we keep this set to avoid spamming the heck out of the console, since it's quite likely that if we fail to parse
+// a value once, it'll happen again and again for many rows in a table, and spamming the console is slow.
+let warnedAboutStyleJsonSet = new Set<string>();
+export function parseStyleJson(rawValue: unknown): CSSProperties | void {
+  // confirms existence of value and serves as a type guard
+  if (typeof rawValue === 'string') {
+    try {
+      const parsedJsonValue = JSON.parse(rawValue);
+      if (parsedJsonValue != null && typeof parsedJsonValue === 'object' && !Array.isArray(parsedJsonValue)) {
+        return parsedJsonValue;
+      }
+    } catch (e) {
+      if (!warnedAboutStyleJsonSet.has(rawValue)) {
+        console.error(`encountered invalid cell style JSON: ${rawValue}`, e);
+        warnedAboutStyleJsonSet.add(rawValue);
+      }
+    }
+  }
+}
+
+export const getStableRowKey = (rowIndex: number, frame?: DataFrame): string => {
+  const key = frame?.meta?.custom?.stableRowKey;
+  return key != null ? String(key) : String(rowIndex);
+};
+
+/**
+ * Builds a `rowClass` that stripes every other row of data.
+ *
+ * react-data-grid's `rdg-row-odd` counts nested container rows, making parent-row parity depend on
+ * which rows have nested data. Count only depth-0 data rows to keep the stripe pattern stable.
+ * Containers get a separate class so hover styles can exclude them.
+ */
+export function makeStripedRowClass(rows: TableRow[]): (row: TableRow) => string | undefined {
+  const striped = new WeakSet<TableRow>();
+  let ordinal = 0;
+  for (const row of rows) {
+    if (row.__depth !== 0) {
+      continue;
+    }
+    if (ordinal % 2 === 1) {
+      striped.add(row);
+    }
+    ordinal++;
+  }
+
+  return (row) => {
+    if (row.__depth !== 0) {
+      return NESTED_ROW_CLASS;
+    }
+    return striped.has(row) ? STRIPED_ROW_CLASS : undefined;
+  };
+}

@@ -1,0 +1,72 @@
+import { t } from '@grafana/i18n';
+import {
+  type SceneComponentProps,
+  SceneObjectBase,
+  type SceneObjectRef,
+  type SceneObjectState,
+  type VizPanel,
+} from '@grafana/scenes';
+import { type LibraryPanel } from '@grafana/schema';
+import { Drawer } from '@grafana/ui';
+import { isDashboardNewLayoutsEnabled } from 'app/features/dashboard/api/utils';
+import { LibraryPanelsSearch } from 'app/features/library-panels/components/LibraryPanelsSearch/LibraryPanelsSearch';
+
+import { replacePanel } from '../actions/panel/replacePanel';
+import { getDashboardSceneFor, getDefaultVizPanel } from '../utils/utils';
+
+import { LibraryPanelBehavior } from './LibraryPanelBehavior';
+import { isDashboardLayoutItem } from './types/DashboardLayoutItem';
+
+export interface AddLibraryPanelDrawerState extends SceneObjectState {
+  panelToReplaceRef?: SceneObjectRef<VizPanel>;
+}
+
+export class AddLibraryPanelDrawer extends SceneObjectBase<AddLibraryPanelDrawerState> {
+  public onClose = () => {
+    getDashboardSceneFor(this).closeModal();
+  };
+
+  public onAddLibraryPanel = async (panelInfo: LibraryPanel) => {
+    const dashboard = getDashboardSceneFor(this);
+    const newPanel = await getDefaultVizPanel();
+
+    newPanel.setState({
+      // Panel title takes precedence over library panel title when resolving the library panel
+      title: panelInfo.model.title,
+      hoverHeader: !panelInfo.model.title,
+      $behaviors: [new LibraryPanelBehavior({ uid: panelInfo.uid, name: panelInfo.name })],
+    });
+
+    const panelToReplace = this.state.panelToReplaceRef?.resolve();
+
+    if (panelToReplace) {
+      const layoutItem = panelToReplace.parent;
+
+      if (layoutItem && isDashboardLayoutItem(layoutItem)) {
+        if (isDashboardNewLayoutsEnabled()) {
+          replacePanel({ source: layoutItem, oldPanel: panelToReplace, newPanel });
+        } else {
+          // This else block is needed only for old architecture which reuses the same component
+          // but has no way to trigger dashboard actions. It can be removed when
+          // the dashboardNewLayouts toggle is removed
+          newPanel.setState({ key: panelToReplace.state.key });
+          layoutItem.setElementBody(newPanel);
+        }
+      }
+    } else {
+      dashboard.addPanel(newPanel);
+    }
+
+    this.onClose();
+  };
+
+  static Component = ({ model }: SceneComponentProps<AddLibraryPanelDrawer>) => {
+    const title = t('library-panel.add-widget.title', 'Add panel from panel library');
+
+    return (
+      <Drawer title={title} onClose={model.onClose}>
+        <LibraryPanelsSearch onClick={model.onAddLibraryPanel} showPanelFilter />
+      </Drawer>
+    );
+  };
+}

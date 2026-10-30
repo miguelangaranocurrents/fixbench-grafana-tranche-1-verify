@@ -1,0 +1,108 @@
+import { type DashboardViewItem } from 'app/features/search/types';
+import { configureStore } from 'app/store/configureStore';
+import { useSelector } from 'app/types/store';
+
+import { fullyLoadedViewItemCollection } from '../fixtures/state.fixtures';
+import { type BrowseDashboardsState } from '../types';
+
+import { useBrowseLoadingStatus, useFlatTreeState } from './hooks';
+
+jest.mock('app/types/store', () => {
+  const original = jest.requireActual('app/types/store');
+  return {
+    ...original,
+    useSelector: jest.fn(),
+  };
+});
+
+function createInitialState(partial: Partial<BrowseDashboardsState>): BrowseDashboardsState {
+  return {
+    rootItems: undefined,
+    childrenByParentUID: {},
+    openFolders: {},
+    selectedItems: {
+      $all: false,
+      dashboard: {},
+      folder: {},
+      panel: {},
+    },
+
+    ...partial,
+  };
+}
+
+describe('browse-dashboards state hooks', () => {
+  const folderUID = 'abc-123';
+
+  function mockState(browseState: BrowseDashboardsState) {
+    const wholeState = configureStore().getState();
+    wholeState.browseDashboards = browseState;
+
+    jest.mocked(useSelector).mockImplementationOnce((callback) => {
+      return callback(wholeState);
+    });
+  }
+
+  describe('useBrowseLoadingStatus', () => {
+    it('returns loading when root view is loading', () => {
+      mockState(createInitialState({ rootItems: undefined }));
+
+      const status = useBrowseLoadingStatus(undefined);
+      expect(status).toEqual('pending');
+    });
+
+    it('returns loading when folder view is loading', () => {
+      mockState(createInitialState({ childrenByParentUID: {} }));
+
+      const status = useBrowseLoadingStatus(folderUID);
+      expect(status).toEqual('pending');
+    });
+
+    it('returns fulfilled when root view is finished loading', () => {
+      mockState(createInitialState({ rootItems: fullyLoadedViewItemCollection([]) }));
+
+      const status = useBrowseLoadingStatus(undefined);
+      expect(status).toEqual('fulfilled');
+    });
+
+    it('returns fulfilled when folder view is finished loading', () => {
+      mockState(
+        createInitialState({
+          childrenByParentUID: {
+            [folderUID]: fullyLoadedViewItemCollection([]),
+          },
+        })
+      );
+
+      const status = useBrowseLoadingStatus(folderUID);
+      expect(status).toEqual('fulfilled');
+    });
+  });
+
+  describe('useFlatTreeState', () => {
+    it('renders a dashboard whose UID matches its parent folder', () => {
+      const folder: DashboardViewItem = { kind: 'folder', uid: 'same-uid', title: 'Folder' };
+      const dashboard: DashboardViewItem = {
+        kind: 'dashboard',
+        uid: 'same-uid',
+        title: 'Dashboard',
+        parentUID: 'same-uid',
+      };
+
+      mockState(
+        createInitialState({
+          rootItems: fullyLoadedViewItemCollection([folder]),
+          childrenByParentUID: { 'same-uid': fullyLoadedViewItemCollection([dashboard]) },
+          openFolders: { 'same-uid': true },
+        })
+      );
+
+      const tree = useFlatTreeState(undefined);
+
+      expect(tree.map(({ item, level }) => `${level}:${item.kind}:${item.uid}`)).toEqual([
+        '0:folder:same-uid',
+        '1:dashboard:same-uid',
+      ]);
+    });
+  });
+});
